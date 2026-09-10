@@ -59,3 +59,9 @@ The real-scanner tests fail if Gitleaks is unavailable; they never silently skip
 `cargo run --locked -- gate` performs the complete repository gate and installs the pinned scanner if missing; CI delegates to this same Rust command.
 
 Release only from gated `main` with a bare annotated version tag. Publish the static Linux binary and `SHA256SUMS`, verify both after downloading them, and verify the GitHub release author is the organization bot before pinning consumers. Build release binaries with Rust source-path remapping and scan them for private provenance. Documentation publication and downstream releases are separate operations.
+
+<!-- b10x-docs:start -->
+## Documentation
+
+[Gates documentation](https://beyond10x.github.io/docs/gates/) · [Start](https://beyond10x.github.io/) · [Ecosystem](https://beyond10x.github.io/ecosystem/) · [Impact](https://beyond10x.github.io/changes/) · [Releases](https://beyond10x.github.io/releases/)
+<!-- b10x-docs:end -->
