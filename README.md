@@ -45,7 +45,7 @@ The policy wire model is strict JSON: `version`, random `nonce`, `forbidden_lite
 
 Every commit after the trusted adoption baseline must have the exact raw Git author `b10x-bot[bot] <316511680+b10x-bot[bot]@users.noreply.github.com>` or `github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>`. Candidate construction enforces this before scanning or receipt reuse, including intermediate commits and merged side branches. Mailmaps, display names, duplicate author headers and other bot names cannot authorize a commit. GitHub merge committers remain admissible to the common author check; direct local delivery still requires the exact organization bot as both author and committer. Git metadata establishes this allowlist, while App-only branch authority establishes who can publish it.
 
-Version 0.1.1 adds the `commit-authorship` result and invalidates earlier receipts through the Gates version and public-policy digest. Historical baseline auditing remains separate.
+Version 0.1.1 added the `commit-authorship` result and invalidated earlier receipts through the Gates version and public-policy digest. Version 0.1.2 changes no check, policy field or receipt format, and invalidates receipts retained under 0.1.1 through the Gates version alone. Historical baseline auditing remains separate.
 
 ## Development and releases
 
