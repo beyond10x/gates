@@ -8,6 +8,8 @@ scope:
 - confidence: cited
   path: .github/workflows/
 - confidence: cited
+  path: .github/workflows/shared-gates.yml
+- confidence: cited
   path: CHANGELOG.md
 - confidence: cited
   path: Cargo.lock
@@ -16,12 +18,14 @@ scope:
 - confidence: cited
   path: README.md
 - confidence: cited
+  path: docs/adoption.md
+- confidence: cited
   path: ess/
 - confidence: cited
   path: src/
 - confidence: cited
   path: tests/
-revision: 4
+revision: 5
 ---
 ## Intent and authority
 
