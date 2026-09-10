@@ -8,7 +8,7 @@ Install the published Linux x86-64 static binary from the [release](https://gith
 
 An administrator supplies the protected policy and enrolls the public key printed by `b10x-gates keygen --output <protected-key-file>`. The policy and signing key stay outside candidate source, owned by the current user and unreadable by other users. `B10X_GATES_POLICY`, `B10X_GATES_KEY` and `B10X_GATES_GITLEAKS` select nondefault paths. Never send a private key to CI.
 
-```console
+```bash
 b10x-gates --repository beyond10x/eventlog install
 b10x-gates bot -- commit -m "fix: describe the change"
 b10x-gates --repository beyond10x/eventlog check --receipt "$HOME/.local/state/b10x/gates/candidate.json"
@@ -45,7 +45,7 @@ The policy wire model is strict JSON: `version`, random `nonce`, `forbidden_lite
 
 ## Development and releases
 
-```console
+```bash
 cargo build --locked
 target/debug/b10x-gates bootstrap --directory "$HOME/.cache/b10x-gates/scanner"
 export B10X_GATES_GITLEAKS="$HOME/.cache/b10x-gates/scanner/gitleaks"
