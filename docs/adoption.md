@@ -1,5 +1,14 @@
 # Initial adoption
 
+## Released workflow binary
+
+[Gates 0.1.2](https://github.com/beyond10x/gates/releases/tag/0.1.2) is the release built from the
+current `main` source. It changes no check: 0.1.1 and 0.1.2 differ only in the version the binary
+reports and the receipts that version invalidates. `.github/workflows/common.yml` on `main` now
+downloads that release and verifies its published checksum. The four adopters below still pin
+workflow commit `547c6bc58d734e679f21bdeeb365f7dcc88059b1`, whose copy of that workflow downloads
+0.1.1; a coordinated repin is a separate operation and needs no source change here.
+
 ## Authorship enforcement
 
 [Gates 0.1.1](https://github.com/beyond10x/gates/releases/tag/0.1.1) adds mandatory raw commit-author
