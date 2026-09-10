@@ -218,14 +218,20 @@ fn filenames_messages_author_and_committer_are_scanned() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     let oid = String::from_utf8(output.stdout).unwrap();
-    let candidate = f.candidate(oid.trim());
-    let report = scan::run(
-        &f.policy,
-        REPOSITORY,
-        &candidate.units,
-        &mut CountScanner::default(),
-    )
-    .unwrap();
+    assert!(
+        Git::new(f.dir.path())
+            .unwrap()
+            .candidate(&f.policy, REPOSITORY, oid.trim(), &[])
+            .is_err()
+    );
+    // Privacy scanning remains independently covered even when identity admission refuses first.
+    let mut units = candidate.units;
+    units.push(Unit {
+        location: format!("commit:{}", oid.trim()),
+        bytes: raw.into_bytes(),
+        workflow: false,
+    });
+    let report = scan::run(&f.policy, REPOSITORY, &units, &mut CountScanner::default()).unwrap();
     assert!(report.results["private-identifiers"].findings >= 4);
 }
 
@@ -663,6 +669,28 @@ fn installed_hooks_preserve_worktree_hooks_and_scan_after_existing_mutations_wit
         "{}",
         String::from_utf8_lossy(&good.stderr)
     );
+    for field in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+        let refused = Command::new("git")
+            .current_dir(f.dir.path())
+            .args(["commit", "--allow-empty", "-m", "safe identity fixture"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", BOT_NAME)
+            .env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
+            .env("GIT_COMMITTER_NAME", BOT_NAME)
+            .env("GIT_COMMITTER_EMAIL", BOT_EMAIL)
+            .env(field, "person@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "local identity guard must refuse"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("exact bot author and committer")
+        );
+        assert!(!String::from_utf8_lossy(&refused.stderr).contains("person@example.invalid"));
+    }
     git(f.dir.path(), &["checkout", "-qb", "fixture-branch"]);
     assert!(f.dir.path().join("preserved-hook-ran").exists());
     let installed = f.dir.path().join(".git/b10x-gates-hooks");
@@ -714,4 +742,118 @@ fn installed_hooks_preserve_worktree_hooks_and_scan_after_existing_mutations_wit
         .unwrap();
     assert!(verified.status.success());
     assert!(String::from_utf8_lossy(&verified.stdout).contains("scanner_invocations=0"));
+}
+
+fn identity_commit(f: &Fixture, parents: &[&str], author: &str, committer: &str) -> String {
+    let tree = git(f.dir.path(), &["rev-parse", "HEAD^{tree}"]);
+    let parents = parents
+        .iter()
+        .map(|p| format!("parent {p}\n"))
+        .collect::<String>();
+    let raw = format!(
+        "tree {tree}\n{parents}author {author} 1 +0000\ncommitter {committer} 1 +0000\n\nfixture\n"
+    );
+    let mut child = Command::new("git")
+        .current_dir(f.dir.path())
+        .args([
+            "hash-object",
+            "--literally",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(raw.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+#[test]
+fn authorship_admits_exact_automation_and_keeps_direct_delivery_strict() {
+    let f = Fixture::new();
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}>");
+    let actions = format!(
+        "{} <{}>",
+        b10x_gates::ACTIONS_NAME,
+        b10x_gates::ACTIONS_EMAIL
+    );
+    for (author, committer) in [
+        (&bot, &bot),
+        (&actions, &actions),
+        (&bot, &"GitHub <noreply@github.com>".into()),
+    ] {
+        let head = identity_commit(&f, &[&f.baseline], author, committer);
+        let candidate = f.candidate(&head);
+        let mut scanner = CountScanner::default();
+        let receipt = evidence::check(&f.policy, &candidate, &f.key, &mut scanner).unwrap();
+        assert_eq!(receipt.payload.results["commit-authorship"].inspected, 1);
+        assert!(
+            evidence::reuse_or_scan(&f.policy, &candidate, Some(&receipt), &mut scanner).unwrap()
+        );
+        assert_eq!(scanner.calls, 1, "receipt reuse does not scan");
+        assert_eq!(
+            Git::new(f.dir.path()).unwrap().verify_bot(&[head]).is_ok(),
+            author == &bot && committer == &bot
+        );
+    }
+}
+
+#[test]
+fn authorship_refuses_human_spoofed_and_duplicate_raw_authors() {
+    let f = Fixture::new();
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}>");
+    for author in [
+        "Fixture Person <person@example.invalid>".to_owned(),
+        format!("Fixture Person <{BOT_EMAIL}>"),
+        format!("{BOT_NAME} <person@example.invalid>"),
+        "github-actions[bot] <actions@example.invalid>".into(),
+        "other[bot] <other@example.invalid>".into(),
+        format!("{bot} 1 +0000\nauthor {bot}"),
+    ] {
+        let head = identity_commit(&f, &[&f.baseline], &author, &bot);
+        fs::write(
+            f.dir.path().join(".mailmap"),
+            format!("{bot} Fixture Person <person@example.invalid>\n"),
+        )
+        .unwrap();
+        assert!(
+            Git::new(f.dir.path())
+                .unwrap()
+                .candidate(&f.policy, REPOSITORY, &head, &[])
+                .is_err(),
+            "raw author must refuse"
+        );
+    }
+}
+
+#[test]
+fn authorship_refuses_bad_intermediate_and_merged_side_commits() {
+    let f = Fixture::new();
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}>");
+    let bad = identity_commit(
+        &f,
+        &[&f.baseline],
+        "Fixture Person <person@example.invalid>",
+        &bot,
+    );
+    let clean = identity_commit(&f, &[&f.baseline], &bot, &bot);
+    for parents in [vec![bad.as_str()], vec![clean.as_str(), bad.as_str()]] {
+        let head = identity_commit(&f, &parents, &bot, &bot);
+        assert!(
+            Git::new(f.dir.path())
+                .unwrap()
+                .candidate(&f.policy, REPOSITORY, &head, &[])
+                .is_err()
+        );
+    }
 }

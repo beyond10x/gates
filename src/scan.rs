@@ -157,7 +157,12 @@ pub fn expected_results(units: &[Unit]) -> BTreeMap<String, RuleResult> {
             (
                 rule.to_owned(),
                 RuleResult {
-                    inspected: if rule.starts_with("workflow-") {
+                    inspected: if rule == "commit-authorship" {
+                        units
+                            .iter()
+                            .filter(|u| u.location.starts_with("commit:"))
+                            .count()
+                    } else if rule.starts_with("workflow-") {
                         units.iter().filter(|u| u.workflow).count()
                     } else {
                         units.len()

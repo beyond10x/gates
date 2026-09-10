@@ -171,9 +171,18 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
         if name == "pre-commit" {
             units = git.staged()?;
             for ident in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+                let bytes = git.read(&["var", ident])?;
+                ensure!(
+                    crate::git::exact_identity(
+                        bytes.trim_ascii(),
+                        crate::BOT_NAME,
+                        crate::BOT_EMAIL
+                    ),
+                    "local commits require the exact bot author and committer; use b10x-gates bot"
+                );
                 units.push(Unit {
                     location: ident.into(),
-                    bytes: git.read(&["var", ident])?,
+                    bytes,
                     workflow: false,
                 });
             }

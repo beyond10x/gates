@@ -11,6 +11,38 @@ use std::{
 const MAX_BLOB: usize = 64 * 1024 * 1024;
 const MAX_TOTAL: usize = 256 * 1024 * 1024;
 
+/// Compare raw Git identity bytes, without mailmap or display-name normalization.
+pub fn exact_identity(value: &[u8], name: &str, email: &str) -> bool {
+    let prefix = format!("{name} <{email}> ");
+    let Some(date) = value.strip_prefix(prefix.as_bytes()) else {
+        return false;
+    };
+    let Some(space) = date.iter().position(|b| *b == b' ') else {
+        return false;
+    };
+    let (timestamp, zone) = (&date[..space], &date[space + 1..]);
+    !timestamp.is_empty()
+        && timestamp.iter().all(u8::is_ascii_digit)
+        && zone.len() == 5
+        && matches!(zone[0], b'+' | b'-')
+        && zone[1..].iter().all(u8::is_ascii_digit)
+}
+
+fn verify_automation_author(raw: &[u8]) -> Result<()> {
+    let mut authors = raw
+        .split(|b| *b == b'\n')
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix(b"author "));
+    let author = authors.next().context("commit author missing")?;
+    ensure!(authors.next().is_none(), "duplicate commit author refused");
+    ensure!(
+        exact_identity(author, crate::BOT_NAME, crate::BOT_EMAIL)
+            || exact_identity(author, crate::ACTIONS_NAME, crate::ACTIONS_EMAIL),
+        "commit author must be the exact organization bot or GitHub Actions identity"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
@@ -217,6 +249,10 @@ impl Git {
         for commit in &commits {
             ensure!(is_oid(commit), "invalid commit coordinate");
             let raw = self.read(&["cat-file", "commit", commit])?;
+            // This admission runs before scans AND before receipt reuse, for every
+            // reachable candidate commit, including merged side branches.
+            verify_automation_author(&raw)
+                .with_context(|| format!("commit {commit} has inadmissible authorship"))?;
             let parent = raw
                 .split(|v| *v == b'\n')
                 .take_while(|v| !v.is_empty())
