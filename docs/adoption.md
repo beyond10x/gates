@@ -1,5 +1,16 @@
 # Initial adoption
 
+## Authorship enforcement
+
+[Gates 0.1.1](https://github.com/beyond10x/gates/releases/tag/0.1.1) adds mandatory raw commit-author
+admission before scanning or receipt reuse. Its exact tag passed correctness and shared checks,
+and the downloaded static binary matched its published checksum. The coordinated update for the
+four existing adopters pins workflow commit `547c6bc58d734e679f21bdeeb365f7dcc88059b1`, which downloads
+that verified release. Local hooks also reject non-bot authors and committers at commit creation.
+The policy baselines below remain unchanged; prior receipts become stale.
+
+## Original rollout
+
 Gates 0.1.0 was published and its tag checks and downloaded release assets verified before
 Eventlog, ESS and AEP pinned reusable workflow commit
 `4317ac7561e7307a6426212f1929b6a8259fc915`.
