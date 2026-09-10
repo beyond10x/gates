@@ -1,0 +1,32 @@
+name: Gates correctness
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gates-correctness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Correctness, format and lint
+        env:
+          B10X_GATES_GITLEAKS: ${{ runner.temp }}/gitleaks/gitleaks
+        run: cargo run --locked -- gate

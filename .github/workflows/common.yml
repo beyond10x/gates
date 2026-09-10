@@ -1,0 +1,34 @@
+name: Common source gates
+
+on:
+  workflow_call:
+    secrets:
+      B10X_GATES_POLICY:
+        required: true
+
+permissions:
+  contents: read
+  checks: read
+
+jobs:
+  check:
+    name: Security and privacy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # This workflow never checks out candidate source or executes a candidate action.
+      - name: Fetch verified Gates release
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/beyond10x/gates/releases/download/0.1.0/b10x-gates-linux-x86_64 \
+            --output "$RUNNER_TEMP/b10x-gates"
+          printf '%s  %s\n' '93a02e46d1126a24618cd0a0c9565d62be2b205723dbfbc7f44da4b1fdeadf2b' "$RUNNER_TEMP/b10x-gates" | sha256sum --check --status
+          chmod 700 "$RUNNER_TEMP/b10x-gates"
+      - name: Fetch pinned published Gitleaks
+        run: '"$RUNNER_TEMP/b10x-gates" bootstrap --directory "$RUNNER_TEMP/gitleaks"'
+      - name: Verify evidence or scan Git objects as data
+        env:
+          B10X_GATES_POLICY_JSON: ${{ secrets.B10X_GATES_POLICY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/b10x-gates" --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" ci --event "$GITHUB_EVENT_PATH" --objects "$RUNNER_TEMP/candidate.git"'

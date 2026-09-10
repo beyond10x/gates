@@ -1,0 +1,33 @@
+domain: gates.evidence
+entities:
+  - name: gates.evidence.Receipt
+    identity:
+      name: receipt_id
+      type: String
+    fields:
+      - name: repository
+        type: String
+      - name: repository_id
+        type: String
+      - name: base
+        type: String
+      - name: head
+        type: String
+      - name: objects_digest
+        type: String
+      - name: scanner_version
+        type: String
+      - name: public_policy_digest
+        type: String
+      - name: private_policy_digest
+        type: String
+      - name: results_digest
+        type: String
+      - name: signer_id
+        type: String
+      - name: signature
+        type: String
+    lifecycle:
+      initial: Signed
+      states: [Signed]
+      terminal: [Signed]
