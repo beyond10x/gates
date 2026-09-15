@@ -290,8 +290,21 @@ pub fn ci_candidate(policy: &Policy, event_path: &Path, target: &Path) -> Result
         );
         fetch_ref = format!("{tag}:{tag}");
     }
-    let fetch = git
-        .command()
+    // A private repository serves no objects anonymously, so the workflow token is
+    // supplied through the environment rather than argv or a URL: a credential in
+    // argv is readable by every process on the runner.
+    let mut fetch = git.command();
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let basic = base64(format!("x-access-token:{token}").as_bytes());
+        fetch
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!("AUTHORIZATION: basic {basic}"),
+            );
+    }
+    let fetch = fetch
         .args([
             "fetch",
             "--quiet",
@@ -307,4 +320,32 @@ pub fn ci_candidate(policy: &Policy, event_path: &Path, target: &Path) -> Result
     let tags = tag.map(|value| vec![value.to_owned()]).unwrap_or_default();
     let candidate = git.candidate(policy, repository, &head, &tags)?;
     Ok((git, candidate))
+}
+
+#[doc(hidden)]
+pub fn base64_for_test(bytes: &[u8]) -> String {
+    base64(bytes)
+}
+
+/// Standard base64, for the one HTTP Basic credential this binary constructs. A
+/// dependency is not worth taking for sixteen lines in a security-critical tool.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> shift) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

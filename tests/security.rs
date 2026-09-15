@@ -1539,3 +1539,27 @@ fn an_exception_may_cover_a_generated_tree_without_a_line_or_a_digest() {
     f.policy.exceptions[0].location = "*".into();
     assert!(f.policy.validate().is_err());
 }
+
+#[test]
+fn the_basic_credential_encoder_matches_standard_base64() {
+    // Vectors from RFC 4648 section 10, plus the exact shape this binary builds.
+    for (input, expected) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+        (
+            "x-access-token:ghs_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE",
+            "eC1hY2Nlc3MtdG9rZW46Z2hzX0VYQU1QTEVFWEFNUExFRVhBTVBMRUVYQU1QTEVFWEFNUExF",
+        ),
+    ] {
+        assert_eq!(
+            b10x_gates::delivery::base64_for_test(input.as_bytes()),
+            expected,
+            "input {input:?}"
+        );
+    }
+}

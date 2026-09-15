@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-09-16
+
+- Supply the workflow token to the candidate object fetch, so the shared gate works on a private repository. It served objects anonymously before, which only a public repository does; a private adopter refused with "candidate object fetch failed". The credential goes through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, never argv or a URL, because argv is readable by every process on the runner.
+- Change no check, policy field or receipt format; the version increment alone invalidates receipts retained under 0.1.3.
+
 ## 0.1.3 — 2026-09-16
 
 - Add `forbidden_patterns` and `allow_patterns` to the policy, at wire version 2. An allowance admits only what its `(?P<admit>...)` group captures and never reaches `personal-paths`; a rule that matches an ordinary line or the empty one is refused at load. A version 2 policy is unreadable by 0.1.2, which refuses it and fails closed.
