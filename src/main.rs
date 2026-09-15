@@ -106,10 +106,44 @@ enum Action {
         #[arg(long)]
         objects: PathBuf,
     },
+    /// Refuse a file that breaks a private rule, for content published outside Git.
+    ScanText {
+        #[arg(required = true)]
+        path: Vec<PathBuf>,
+    },
+    /// Edit the trusted policy itself.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Download and verify the pinned published Gitleaks archive for this platform.
     Bootstrap {
         #[arg(long)]
         directory: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Admit reported findings as exceptions, appended to the policy for review as a diff.
+    Except {
+        /// A findings report, as written by `audit --output`.
+        #[arg(long)]
+        findings: PathBuf,
+        /// Keep only these rules. Default: every rule in the report.
+        #[arg(long)]
+        rule: Vec<String>,
+        /// Keep only these locations. Default: every location in the report.
+        #[arg(long)]
+        location: Vec<String>,
+        /// Bind the content but not the line, so an insertion above does not
+        /// re-break the exception.
+        #[arg(long)]
+        any_line: bool,
+        /// Bind the location but not the content, for a tree regenerated on every
+        /// build where no digest survives the next run.
+        #[arg(long)]
+        any_content: bool,
     },
 }
 
@@ -168,6 +202,31 @@ fn execute(args: Args) -> Result<()> {
         return Github::bot()?.git(&args.repo, command);
     }
     if let Action::Gh { args: command } = &args.command {
+        // A pull request body, an issue comment and a release note are published
+        // content that no Git hook ever sees. Scan before the child is spawned.
+        // An option that names a file publishes the file, not its path. Scan what
+        // is sent; a scratch path under the home directory is not the content.
+        const FILE_OPTIONS: [&str; 3] = ["--body-file", "--notes-file", "--input"];
+        let matchers = matchers(args.policy.as_deref())?;
+        let mut previous: Option<&str> = None;
+        for (i, argument) in command.iter().enumerate() {
+            let named = previous.is_some_and(|p| FILE_OPTIONS.contains(&p));
+            let bytes = if named {
+                fs::read(argument).with_context(|| format!("argument {} unreadable", i + 1))?
+            } else {
+                argument.as_bytes().to_vec()
+            };
+            refuse(
+                &matchers,
+                &if named {
+                    format!("argument {}, the file it names,", i + 1)
+                } else {
+                    format!("argument {}", i + 1)
+                },
+                &bytes,
+            )?;
+            previous = Some(argument);
+        }
         return Github::bot()?.gh(&args.repo, command);
     }
     if let Action::Api {
@@ -177,15 +236,30 @@ fn execute(args: Args) -> Result<()> {
         output,
     } = &args.command
     {
-        let body = input
-            .as_ref()
-            .map(fs::read)
-            .transpose()?
+        let raw = input.as_ref().map(fs::read).transpose()?;
+        if let Some(raw) = &raw {
+            refuse(
+                &matchers(args.policy.as_deref())?,
+                &input
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.display().to_string()),
+                raw,
+            )?;
+        }
+        let body = raw
             .map(|v| serde_json::from_slice::<serde_json::Value>(&v))
             .transpose()?;
         let response = Github::bot()?.api(method.parse()?, path, body.as_ref())?;
         policy::private_write(output, &serde_json::to_vec(&response)?)?;
         println!("bot API operation completed; response retained locally");
+        return Ok(());
+    }
+    if let Action::ScanText { path } = &args.command {
+        let matchers = matchers(args.policy.as_deref())?;
+        for file in path {
+            refuse(&matchers, &file.display().to_string(), &fs::read(file)?)?;
+        }
+        println!("{} file(s) carry no private rule", path.len());
         return Ok(());
     }
     let root = policy::root()?;
@@ -220,6 +294,65 @@ fn execute(args: Args) -> Result<()> {
         );
         return Ok(());
     }
+    if let Action::Policy { action } = &args.command {
+        let PolicyAction::Except {
+            findings,
+            rule,
+            location,
+            any_line,
+            any_content,
+        } = action;
+        let reported: Vec<scan::Finding> = serde_json::from_slice(&fs::read(findings)?)
+            .map_err(|_| anyhow::anyhow!("findings report format invalid"))?;
+        let repository = args.repository.context("--repository is required")?;
+        policy.repository(&repository)?;
+        let mut edited = policy.clone();
+        let mut added = 0usize;
+        for finding in reported {
+            if !rule.is_empty() && !rule.contains(&finding.rule) {
+                continue;
+            }
+            if !location.is_empty() && !location.contains(&finding.location) {
+                continue;
+            }
+            let exception = policy::Exception {
+                repository: repository.clone(),
+                rule: finding.rule,
+                location: finding.location,
+                content_sha256: if *any_content {
+                    String::new()
+                } else {
+                    finding.content_sha256
+                },
+                line: if *any_line { 0 } else { finding.line },
+            };
+            if edited.exceptions.iter().any(|e| {
+                e.repository == exception.repository
+                    && e.rule == exception.rule
+                    && e.location == exception.location
+                    && e.content_sha256 == exception.content_sha256
+                    && e.line == exception.line
+            }) {
+                continue;
+            }
+            edited.exceptions.push(exception);
+            added += 1;
+        }
+        edited.exceptions.sort_by(|a, b| {
+            (&a.repository, &a.location, a.line, &a.rule).cmp(&(
+                &b.repository,
+                &b.location,
+                b.line,
+                &b.rule,
+            ))
+        });
+        edited.validate()?;
+        let mut bytes = serde_json::to_vec_pretty(&edited)?;
+        bytes.push(b'\n');
+        policy::private_write(&policy_path, &bytes)?;
+        println!("{added} exception(s) added; review the policy diff before committing");
+        return Ok(());
+    }
     let repository = args.repository.context("--repository is required")?;
     policy.repository(&repository)?;
     if let Action::Install {
@@ -235,6 +368,7 @@ fn execute(args: Args) -> Result<()> {
                 scanner: scanner_path,
                 previous: BTreeMap::new(),
                 retired_pre_push_digest: None,
+                installed_version: String::new(),
             },
             retire_pre_push_sha256.as_deref(),
         )?;
@@ -309,6 +443,33 @@ fn execute(args: Args) -> Result<()> {
         }
         _ => unreachable!(),
     }
+    Ok(())
+}
+
+/// The private rules alone, for the verbs that publish rather than commit. A missing
+/// policy is a refusal, never an unscanned send.
+fn matchers(path: Option<&std::path::Path>) -> Result<scan::Matchers> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => policy::root()?.join("policy.json"),
+    };
+    scan::Matchers::build(&Policy::load(&path)?)
+}
+
+/// Refuse without echoing the matched text, as every other scanner here does.
+fn refuse(matchers: &scan::Matchers, what: &str, bytes: &[u8]) -> Result<()> {
+    let broken = matchers.text(bytes);
+    ensure!(
+        broken.is_empty(),
+        "{what} breaks {} private rule(s): {}; private details remain local",
+        broken.len(),
+        broken
+            .iter()
+            .take(6)
+            .map(|(line, rule)| format!("line {line} {rule}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     Ok(())
 }
 

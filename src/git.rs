@@ -60,6 +60,11 @@ pub struct Unit {
     pub location: String,
     pub bytes: Vec<u8>,
     pub workflow: bool,
+    /// The same location's bytes before this change, when it had them. A finding
+    /// whose exact line is already present here is inherited, not introduced: a
+    /// commit that edits one line of a document is not answerable for the rest of
+    /// it. `None` for a new path, a tag, a commit message and the baseline audit.
+    pub inherited: Option<Vec<u8>>,
 }
 
 pub struct Candidate {
@@ -193,17 +198,23 @@ impl Git {
             if old.get(path) == Some(&(mode.clone(), oid.clone())) {
                 continue;
             }
+            let previous = old.get(path);
             units.push(Unit {
                 location: format!("filename:{path}"),
                 bytes: path.as_bytes().to_vec(),
                 workflow: false,
+                inherited: previous.map(|_| path.as_bytes().to_vec()),
             });
             let bytes = self.blob(oid)?;
+            // An oversized predecessor cannot be read, so nothing is inherited from
+            // it and the whole file is answerable. That fails closed.
+            let inherited = previous.and_then(|(_, old)| self.blob(old).ok());
             units.push(Unit {
                 location: format!("file:{path}"),
                 bytes,
                 workflow: path.starts_with(".github/workflows/")
                     && (path.ends_with(".yml") || path.ends_with(".yaml")),
+                inherited,
             });
         }
         ensure!(
@@ -268,6 +279,7 @@ impl Git {
                 location: format!("commit:{commit}"),
                 bytes: raw,
                 workflow: false,
+                inherited: None,
             });
         }
         let mut tags = BTreeSet::new();
@@ -292,6 +304,7 @@ impl Git {
                 location: "tag-ref".into(),
                 bytes: tag.as_bytes().to_vec(),
                 workflow: false,
+                inherited: None,
             });
             while self.text(&["cat-file", "-t", &oid])? == "tag" {
                 ensure!(tags.insert(oid.clone()), "duplicate or cyclic tag");
@@ -306,6 +319,7 @@ impl Git {
                     location: format!("tag:{oid}"),
                     bytes: raw,
                     workflow: false,
+                    inherited: None,
                 });
                 ensure!(is_oid(&next), "invalid nested tag");
                 oid = next;

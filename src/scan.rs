@@ -174,6 +174,212 @@ pub fn expected_results(units: &[Unit]) -> BTreeMap<String, RuleResult> {
         .collect()
 }
 
+/// The private rules, compiled once. Literals are escaped; patterns are not.
+pub struct Matchers {
+    private: Vec<regex::bytes::Regex>,
+    /// One per literal long enough to be unambiguous: the same literal with an
+    /// optional line break allowed between every character, so a soft-wrapped
+    /// paragraph or a reflowed table cell cannot split a term past a line scanner.
+    wrapped: Vec<regex::bytes::Regex>,
+    allow: Vec<regex::bytes::Regex>,
+    homes: regex::bytes::Regex,
+    format: regex::bytes::Regex,
+}
+
+/// Shortest literal that is re-checked across line breaks. Below it the joined
+/// form matches too much by accident.
+const WRAP_MINIMUM: usize = 8;
+
+/// A pattern that matches this, or the empty input, matches everything worth
+/// scanning, and is refused rather than silently disabling a rule.
+const CANARY: &[u8] = b"the quick brown fox jumps over the lazy dog 0123456789";
+
+fn compile(source: &str) -> Result<regex::bytes::Regex> {
+    regex::bytes::RegexBuilder::new(source)
+        .case_insensitive(true)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|_| anyhow::anyhow!("private pattern invalid"))
+}
+
+/// True when a rule is too broad to be a rule.
+pub fn matches_everything(source: &str) -> bool {
+    compile(source).is_ok_and(|r| r.is_match(b"") || r.is_match(CANARY))
+}
+
+/// The literal, with an optional line break permitted between every character.
+fn wrapped_source(literal: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in literal.chars().enumerate() {
+        if i > 0 {
+            out.push_str(r"(?:-?[ \t]*\r?\n[ \t>|*#]*)?");
+        }
+        out.push_str(&regex::escape(&ch.to_string()));
+    }
+    out
+}
+
+impl Matchers {
+    pub fn build(policy: &Policy) -> Result<Self> {
+        for pattern in policy
+            .forbidden_patterns
+            .iter()
+            .chain(&policy.allow_patterns)
+        {
+            ensure!(
+                !matches_everything(pattern),
+                "private rule matches everything"
+            );
+        }
+        ensure!(
+            policy
+                .allow_patterns
+                .iter()
+                .all(|v| v.contains("(?P<admit>") || v.contains("(?<admit>")),
+            "an allowance must name what it admits with (?P<admit>...)"
+        );
+        let private = policy
+            .forbidden_literals
+            .iter()
+            .map(|v| compile(&regex::escape(v)))
+            .chain(policy.forbidden_patterns.iter().map(|v| compile(v)))
+            .collect::<Result<Vec<_>>>()?;
+        let wrapped = policy
+            .forbidden_literals
+            .iter()
+            .filter(|v| v.chars().count() >= WRAP_MINIMUM)
+            .map(|v| compile(&wrapped_source(v)))
+            .collect::<Result<Vec<_>>>()?;
+        let allow = policy
+            .allow_patterns
+            .iter()
+            .map(|v| compile(v))
+            .collect::<Result<Vec<_>>>()?;
+        // The boundary excludes what a hostname or a relative path ends with, so
+        // `example.com/home/x`, `../home/x` and `src/home/mod.rs` stay clear while a
+        // backtick, a table pipe, an emphasis marker, a diff `-`, an underscore,
+        // `file://` and an invalid byte all open it. `/Users/` is the macOS spelling
+        // and is matched case-sensitively: lowercase `/users/...` is a REST route.
+        // The first segment is a user directory: either it is followed by `/`, or it
+        // ends the reference. A dotted segment that ends the reference is a file, so
+        // a markdown link to an index page and a REST route ending in a filename are
+        // routes, not paths.
+        let homes = regex::bytes::Regex::new(
+            r#"(?im)(?:^|(?-u:[^a-zA-Z0-9.\\]))(?:/home/|(?-i:/Users/)|[a-z]:[\\/]+(?:users|documents and settings)[\\/]+|(?-u:\\)(?-u:\\)[a-z0-9._-]+(?-u:\\)users(?-u:\\))(?:[a-z0-9_][a-z0-9_.-]*[/\\]|[a-z0-9_][a-z0-9_-]*(?:$|[^a-z0-9_.\\-]))"#,
+        )?;
+        // Format characters carry no meaning in a term and are what a word processor
+        // or a wiki paste inserts. They are removed before matching, never reported.
+        let format = regex::bytes::Regex::new(r"\p{Cf}")?;
+        Ok(Self {
+            private,
+            wrapped,
+            allow,
+            homes,
+            format,
+        })
+    }
+
+    /// Admitted byte ranges, merged into a disjoint ascending cover so containment
+    /// is a binary search rather than a scan of every span on every occurrence.
+    /// An allowance admits only what its `(?P<admit>…)` group captures, so the text
+    /// around a citation — a markdown link label, a query string, a quoted comment —
+    /// is never admitted with it.
+    fn admitted(&self, bytes: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = self
+            .allow
+            .iter()
+            .flat_map(|a| {
+                a.captures_iter(bytes)
+                    .filter_map(|c| c.name("admit").map(|m| (m.start(), m.end())))
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        merged
+    }
+
+    fn covered(cover: &[(usize, usize)], start: usize, end: usize) -> bool {
+        let i = cover.partition_point(|&(s, _)| s <= start);
+        i > 0 && cover[i - 1].1 >= end
+    }
+
+    /// Rules one line breaks. An allowance admits only an occurrence its match
+    /// *contains*: a line carrying an admitted URL and a forbidden prose use is
+    /// still refused. Allowances never reach `personal-paths` — they exist to admit
+    /// a citation of a private identifier, never a machine-local path.
+    pub fn line(&self, bytes: &[u8]) -> Vec<&'static str> {
+        let cover = self.admitted(bytes);
+        let uncovered = |pattern: &regex::bytes::Regex, bytes: &[u8], apply: bool| {
+            pattern
+                .find_iter(bytes)
+                .any(|m| !apply || !Self::covered(&cover, m.start(), m.end()))
+        };
+        let mut rules = Vec::new();
+        let stripped = self.strip(bytes);
+        if self.private.iter().any(|p| {
+            uncovered(p, bytes, true) || stripped.as_ref().is_some_and(|b| uncovered(p, b, false))
+        }) {
+            rules.push("private-identifiers");
+        }
+        if uncovered(&self.homes, bytes, false)
+            || stripped
+                .as_ref()
+                .is_some_and(|b| uncovered(&self.homes, b, false))
+        {
+            rules.push("personal-paths");
+        }
+        rules
+    }
+
+    /// The line with Unicode format characters removed, when it has any. `None`
+    /// when the line is plain ASCII, which is the common case and needs no copy.
+    fn strip(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.is_ascii() {
+            return None;
+        }
+        let out = self.format.replace_all(bytes, &b""[..]).into_owned();
+        (out != bytes).then_some(out)
+    }
+
+    /// Lines where a literal is present only once the unit's line breaks are
+    /// ignored. Reported against the line the occurrence starts on.
+    pub fn wrapped_lines(&self, unit: &[u8]) -> Vec<usize> {
+        let mut lines: Vec<usize> = self
+            .wrapped
+            .iter()
+            .flat_map(|w| w.find_iter(unit))
+            .filter(|m| unit[m.start()..m.end()].contains(&b'\n'))
+            .map(|m| unit.iter().take(m.start()).filter(|b| **b == b'\n').count() + 1)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Every broken rule in a block of text, with its line number. Used by the
+    /// delivery verbs, which publish content Git hooks never see.
+    pub fn text(&self, bytes: &[u8]) -> Vec<(usize, &'static str)> {
+        let mut broken: Vec<(usize, &'static str)> = bytes
+            .split(|v| *v == b'\n')
+            .enumerate()
+            .flat_map(|(i, line)| self.line(line).into_iter().map(move |r| (i + 1, r)))
+            .collect();
+        for line in self.wrapped_lines(bytes) {
+            if !broken.contains(&(line, "private-identifiers")) {
+                broken.push((line, "private-identifiers"));
+            }
+        }
+        broken.sort_unstable();
+        broken
+    }
+}
+
 pub fn run(
     policy: &Policy,
     repository: &str,
@@ -186,43 +392,54 @@ pub fn run(
         results: expected_results(units),
         findings: Vec::new(),
     };
-    let private = policy
-        .forbidden_literals
-        .iter()
-        .map(|literal| {
-            regex::bytes::RegexBuilder::new(&regex::escape(literal))
-                .case_insensitive(true)
-                .build()
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| anyhow::anyhow!("private pattern invalid"))?;
-    let homes = regex::bytes::Regex::new(
-        r#"(?im)(?:^|[\s="'(>:])(?:/home/|/users/|[a-z]:[\\/]+(?:users|documents and settings)[\\/]+)[a-z0-9_][a-z0-9_.-]*"#,
-    )?;
+    let matchers = Matchers::build(policy)?;
     for unit in units {
+        // A line already present in this location before the change was not
+        // introduced by it. This is what makes an adoption baseline mean anything
+        // for a file that is edited rather than left alone.
+        let inherited: std::collections::HashSet<&[u8]> = unit
+            .inherited
+            .as_deref()
+            .map(|b| b.split(|v| *v == b'\n').collect())
+            .unwrap_or_default();
+        // A compiled artifact, an archive or an image carries no prose. Gitleaks
+        // still reads it; the private literal and path rules do not.
+        let binary = unit.bytes.iter().take(8192).any(|b| *b == 0);
+        let mut reported: Vec<usize> = Vec::new();
         for (line, bytes) in unit.bytes.split(|v| *v == b'\n').enumerate() {
-            if private.iter().any(|p| p.is_match(bytes)) {
-                finding(
-                    policy,
-                    repository,
-                    &mut report,
-                    unit,
-                    line + 1,
-                    "private-identifiers",
-                    bytes,
-                );
+            if binary || inherited.contains(bytes) {
+                continue;
             }
-            if homes.is_match(bytes) {
-                finding(
-                    policy,
-                    repository,
-                    &mut report,
-                    unit,
-                    line + 1,
-                    "personal-paths",
-                    bytes,
-                );
+            for rule in matchers.line(bytes) {
+                if rule == "private-identifiers" {
+                    reported.push(line + 1);
+                }
+                finding(policy, repository, &mut report, unit, line + 1, rule, bytes);
             }
+        }
+        // A literal a soft wrap split over two lines is invisible to a line scanner.
+        for line in if binary {
+            Vec::new()
+        } else {
+            matchers.wrapped_lines(&unit.bytes)
+        } {
+            if reported.contains(&line) {
+                continue;
+            }
+            let bytes = unit
+                .bytes
+                .split(|v| *v == b'\n')
+                .nth(line - 1)
+                .unwrap_or(&[]);
+            finding(
+                policy,
+                repository,
+                &mut report,
+                unit,
+                line,
+                "private-identifiers",
+                bytes,
+            );
         }
         if unit.workflow {
             let (pins, permissions) = workflow(&unit.bytes);
@@ -251,14 +468,23 @@ pub fn run(
         }
     }
     for leak in scanner.scan(units)? {
+        let unit = &units[leak.unit];
+        // The same inheritance: a secret the previous version of this file already
+        // carried on that exact line is not introduced by this change.
+        let line = unit.bytes.split(|v| *v == b'\n').nth(leak.line - 1);
+        if let (Some(line), Some(previous)) = (line, unit.inherited.as_deref())
+            && previous.split(|v| *v == b'\n').any(|v| v == line)
+        {
+            continue;
+        }
         finding(
             policy,
             repository,
             &mut report,
-            &units[leak.unit],
+            unit,
             leak.line,
             "secrets",
-            &units[leak.unit].bytes,
+            &unit.bytes,
         );
     }
     Ok(report)
@@ -277,11 +503,9 @@ fn finding(
     // workflow exceptions bind the whole unit because those rules can span lines.
     let content_sha256 = digest(content);
     if policy.exceptions.iter().any(|e| {
-        e.repository == repository
-            && e.rule == rule
-            && e.location == unit.location
-            && e.content_sha256 == content_sha256
-            && e.line == line
+        e.covers(repository, rule, &unit.location)
+            && (e.content_sha256.is_empty() || e.content_sha256 == content_sha256)
+            && (e.line == 0 || e.line == line)
     }) {
         return;
     }

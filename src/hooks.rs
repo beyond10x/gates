@@ -15,6 +15,10 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// The one real copy of the binary in a repository's hook directory. Not a hook name,
+/// so `invoked()` never dispatches on it.
+const PINNED: &str = "b10x-gates";
+
 const HOOKS: [&str; 13] = [
     "pre-commit",
     "commit-msg",
@@ -40,14 +44,20 @@ pub struct Config {
     pub scanner: PathBuf,
     pub previous: BTreeMap<String, Vec<PathBuf>>,
     pub retired_pre_push_digest: Option<String>,
+    /// The `b10x-gates` version that installed these hooks. The pinned inode does not
+    /// change under `cargo install --force`, so a stale hook is otherwise silent.
+    #[serde(default)]
+    pub installed_version: String,
 }
 
 pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<()> {
     let git = Git::new(root)?;
+    policy::protect(&config.policy)?;
     Policy::load(&config.policy)?.repository(&config.repository)?;
     config.policy = fs::canonicalize(&config.policy)?;
     config.key = fs::canonicalize(&config.key)?;
     config.scanner = fs::canonicalize(&config.scanner)?;
+    config.installed_version = crate::VERSION.into();
     let common =
         PathBuf::from(git.text(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
     let installed = common.join("b10x-gates-hooks");
@@ -112,10 +122,25 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
         &installed.join("config.json"),
         &serde_json::to_vec(&config)?,
     )?;
+    // One pinned copy per repository; the 13 hook names are hardlinks to it. The hook
+    // dispatches on `argv[0]`, so a link behaves as a copy did, and the inode still
+    // pins the exact binary against an upgrade under a commit in flight. 6.9 MB a
+    // repository instead of 89 MB. All links live beside the copy, so never cross-device.
+    let pinned = installed.join(PINNED);
+    let staged = installed.join(".pinned.new");
+    let _ = fs::remove_file(&staged);
+    fs::copy(std::env::current_exe()?, &staged)?;
+    fs::rename(&staged, &pinned)?;
     for hook in HOOKS {
         let target = installed.join(hook);
         let staged = installed.join(format!(".{hook}.new"));
-        fs::copy(std::env::current_exe()?, &staged)?;
+        let _ = fs::remove_file(&staged);
+        match fs::hard_link(&pinned, &staged) {
+            Ok(()) => {}
+            Err(_) => {
+                fs::copy(&pinned, &staged).context("hook could not be linked or copied")?;
+            }
+        }
         fs::rename(staged, target)?;
     }
     git.read(&[
@@ -184,6 +209,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     location: ident.into(),
                     bytes,
                     workflow: false,
+                    inherited: None,
                 });
             }
         } else if name == "commit-msg" {
@@ -192,6 +218,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                 location: "commit-message".into(),
                 bytes: fs::read(path)?,
                 workflow: false,
+                inherited: None,
             });
         } else {
             ensure!(
@@ -249,6 +276,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     location: "push-ref".into(),
                     bytes: fields[2].as_bytes().to_vec(),
                     workflow: false,
+                    inherited: None,
                 });
             }
         }

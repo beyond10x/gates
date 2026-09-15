@@ -27,9 +27,26 @@ pub struct Signer {
 pub struct Exception {
     pub repository: String,
     pub rule: String,
+    /// An exact location, or a prefix ending in `*` for a generated or evidence
+    /// tree whose file names are not stable.
     pub location: String,
+    /// The exact line content the exception admits, or empty for any content at
+    /// this location. Empty is for a file regenerated on every build, where no
+    /// digest survives the next run.
     pub content_sha256: String,
+    /// The exact line, or 0 for any line.
     pub line: usize,
+}
+
+impl Exception {
+    pub fn covers(&self, repository: &str, rule: &str, location: &str) -> bool {
+        self.repository == repository
+            && self.rule == rule
+            && match self.location.strip_suffix('*') {
+                Some(prefix) => !prefix.is_empty() && location.starts_with(prefix),
+                None => self.location == location,
+            }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -39,6 +56,14 @@ pub struct Policy {
     // Random salt prevents a published digest from serving as a dictionary oracle.
     pub nonce: String,
     pub forbidden_literals: Vec<String>,
+    // Regular expressions, for rules a literal cannot express: separator and case
+    // variants, a bare surname, a customer name. Compiled case-insensitively.
+    #[serde(default)]
+    pub forbidden_patterns: Vec<String>,
+    // Regular expressions whose matched span admits an occurrence inside it, so a real
+    // upstream citation need not be falsified. Containment, never line membership.
+    #[serde(default)]
+    pub allow_patterns: Vec<String>,
     pub repositories: BTreeMap<String, Repository>,
     pub signers: BTreeMap<String, Signer>,
     pub exceptions: Vec<Exception>,
@@ -59,17 +84,48 @@ impl Policy {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.version == 1 && self.nonce.len() >= 32,
+            matches!(self.version, 1 | 2) && self.nonce.len() >= 32,
             "policy version or nonce invalid"
         );
         ensure!(
-            !self.forbidden_literals.is_empty(),
+            !self.forbidden_literals.is_empty() || !self.forbidden_patterns.is_empty(),
             "private policy is empty"
         );
         ensure!(
-            self.forbidden_literals.iter().all(|v| !v.is_empty()),
-            "private rule is empty"
+            self.forbidden_literals
+                .iter()
+                .all(|v| !v.trim().is_empty() && v.len() >= 3),
+            "private rule is empty or too short to be a rule"
         );
+        ensure!(
+            self.version == 2
+                || (self.forbidden_patterns.is_empty() && self.allow_patterns.is_empty()),
+            "pattern rules require policy version 2"
+        );
+        // A policy that cannot compile is refused at load, never at first scan.
+        for pattern in self.forbidden_patterns.iter().chain(&self.allow_patterns) {
+            ensure!(!pattern.is_empty(), "private rule is empty");
+            ensure!(
+                regex::bytes::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .size_limit(1 << 20)
+                    .build()
+                    .is_ok(),
+                "private rule does not compile"
+            );
+            // A rule that matches ordinary prose is not a rule: as a forbidden rule
+            // it reports every line, as an allowance it admits every occurrence.
+            ensure!(
+                !crate::scan::matches_everything(pattern),
+                "private rule matches everything"
+            );
+        }
+        for pattern in &self.allow_patterns {
+            ensure!(
+                pattern.contains("(?P<admit>") || pattern.contains("(?<admit>"),
+                "an allowance must name what it admits with (?P<admit>...)"
+            );
+        }
         for (name, repo) in &self.repositories {
             ensure!(
                 valid_repository(name)
@@ -83,10 +139,10 @@ impl Policy {
             ensure!(
                 self.repositories.contains_key(&exception.repository)
                     && RULES.contains(&exception.rule.as_str())
-                    && !exception.location.is_empty()
-                    && exception.line > 0
-                    && exception.content_sha256.len() == 64,
-                "exception must have an exact rule, repository, location, line and digest"
+                    && exception.location.len() > 1
+                    && exception.location != "*"
+                    && matches!(exception.content_sha256.len(), 0 | 64),
+                "exception must have an exact rule, repository, location and a digest or none"
             );
         }
         Ok(())
@@ -121,6 +177,31 @@ pub fn root() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".config")))
         .context("configuration home unavailable")?;
     Ok(base.join("b10x/gates"))
+}
+
+/// Narrow a file this user owns to owner-only, so a checkout made with the usual
+/// umask satisfies `protected_read`. Git records no mode below the execute bit, so
+/// a fresh clone of the policy repository always arrives group- and world-readable.
+pub fn protect(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::symlink_metadata(path).context("protected file unavailable")?;
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "protected file must be a regular file"
+        );
+        let probe = tempfile::tempfile()?;
+        ensure!(
+            meta.uid() == probe.metadata()?.uid(),
+            "refusing to change permissions on another user's file"
+        );
+        if meta.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let _ = path;
+    Ok(())
 }
 
 pub fn protected_read(path: &Path) -> Result<Vec<u8>> {

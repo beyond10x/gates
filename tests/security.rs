@@ -56,6 +56,8 @@ impl Fixture {
             version: 1,
             nonce: "synthetic-policy-nonce-for-local-test-1234".into(),
             forbidden_literals: vec![["synthetic", "restricted", "identifier"].join("-")],
+            forbidden_patterns: vec![],
+            allow_patterns: vec![],
             repositories: BTreeMap::from([(
                 REPOSITORY.into(),
                 Repository {
@@ -120,6 +122,13 @@ fn unit(bytes: impl AsRef<[u8]>) -> Unit {
         location: "file:sample".into(),
         bytes: bytes.as_ref().into(),
         workflow: false,
+        inherited: None,
+    }
+}
+fn unit_with(bytes: impl AsRef<[u8]>, inherited: Option<String>) -> Unit {
+    Unit {
+        inherited: inherited.map(String::into_bytes),
+        ..unit(bytes)
     }
 }
 fn home() -> String {
@@ -230,6 +239,7 @@ fn filenames_messages_author_and_committer_are_scanned() {
         location: format!("commit:{}", oid.trim()),
         bytes: raw.into_bytes(),
         workflow: false,
+        inherited: None,
     });
     let report = scan::run(&f.policy, REPOSITORY, &units, &mut CountScanner::default()).unwrap();
     assert!(report.results["private-identifiers"].findings >= 4);
@@ -702,6 +712,47 @@ fn installed_hooks_preserve_worktree_hooks_and_scan_after_existing_mutations_wit
         config.retired_pre_push_digest.as_deref(),
         Some(old_digest.as_str())
     );
+    assert_eq!(config.installed_version, b10x_gates::VERSION);
+    // One binary a repository. The 13 hook names are links to it, so `argv[0]` still
+    // selects the hook and the inode still pins the exact binary.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let pinned = fs::metadata(installed.join("b10x-gates")).unwrap().ino();
+        for hook in [
+            "pre-commit",
+            "commit-msg",
+            "pre-push",
+            "post-checkout",
+            "post-commit",
+            "post-merge",
+            "pre-rebase",
+            "prepare-commit-msg",
+            "post-rewrite",
+            "applypatch-msg",
+            "pre-applypatch",
+            "post-applypatch",
+            "reference-transaction",
+        ] {
+            assert_eq!(
+                fs::metadata(installed.join(hook)).unwrap().ino(),
+                pinned,
+                "{hook} is a copy, not a link"
+            );
+        }
+        let footprint: u64 = fs::read_dir(&installed)
+            .unwrap()
+            .map(|e| {
+                let meta = e.unwrap().metadata().unwrap();
+                if meta.ino() == pinned { 0 } else { meta.len() }
+            })
+            .sum::<u64>()
+            + fs::metadata(installed.join("b10x-gates")).unwrap().len();
+        let one = fs::metadata(installed.join("b10x-gates")).unwrap().len();
+        assert!(
+            footprint < one + 64 * 1024,
+            "installed footprint {footprint} exceeds one binary of {one}"
+        );
+    }
     let receipt = private.path().join("receipt.json");
     let checked = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
         .arg("--repo")
@@ -856,4 +907,635 @@ fn authorship_refuses_bad_intermediate_and_merged_side_commits() {
                 .is_err()
         );
     }
+}
+
+// --- private rules: the shapes a literal is smuggled in, and the shapes that are admitted ---
+
+/// A policy carrying only rule content, for matcher tests that touch no repository.
+fn rules(patterns: &[&str], allow: &[&str]) -> Policy {
+    Policy {
+        version: 2,
+        nonce: "synthetic-policy-nonce-for-local-test-1234".into(),
+        forbidden_literals: vec![["synthetic", "restricted", "identifier"].join("-")],
+        forbidden_patterns: patterns.iter().map(|v| (*v).to_owned()).collect(),
+        // An allowance must name what it admits. A fixture that does not care where
+        // the boundary falls admits its whole match; one that does places the group
+        // itself.
+        allow_patterns: allow
+            .iter()
+            .map(|v| {
+                if v.contains("(?P<admit>") {
+                    (*v).to_owned()
+                } else {
+                    format!("(?P<admit>{v})")
+                }
+            })
+            .collect(),
+        repositories: BTreeMap::new(),
+        signers: BTreeMap::new(),
+        exceptions: vec![],
+    }
+}
+
+fn breaks(policy: &Policy, line: &str) -> Vec<&'static str> {
+    scan::Matchers::build(policy).unwrap().line(line.as_bytes())
+}
+
+#[test]
+fn home_paths_are_caught_in_every_delimiter_this_estate_writes() {
+    let policy = rules(&[], &[]);
+    let path = home();
+    let caught = [
+        format!("the tree is at {path}/beyond10x"),
+        format!("{path}/beyond10x"),
+        format!("ROOT={path}/beyond10x"),
+        format!("[the tree]({path}/beyond10x)"),
+        // The four the old boundary class refused to open on.
+        format!("run `{path}/beyond10x/bin` first"),
+        format!("| tree | {path}/beyond10x |"),
+        format!("|{path}/beyond10x|"),
+        format!("see *{path}/beyond10x* above"),
+        format!("file://{path}/beyond10x"),
+        format!("\"{path}/beyond10x\""),
+    ];
+    for line in caught {
+        assert!(
+            breaks(&policy, &line).contains(&"personal-paths"),
+            "missed: {line}"
+        );
+    }
+}
+
+#[test]
+fn a_path_that_only_contains_the_word_home_is_not_a_personal_path() {
+    let policy = rules(&[], &[]);
+    for line in [
+        "https://example.invalid/home/index.html",
+        "../home/fixture-person",
+        "src/home/mod.rs",
+        "/usr/home-brew/bin",
+    ] {
+        assert!(
+            !breaks(&policy, line).contains(&"personal-paths"),
+            "false positive: {line}"
+        );
+    }
+}
+
+#[test]
+fn patterns_express_what_an_escaped_literal_cannot() {
+    let policy = rules(
+        &[r"fixture[\W_]{0,3}(alpha|beta)", r"(?:^|\W)surname(?:\W|$)"],
+        &[],
+    );
+    for line in [
+        "fixture-alpha",
+        "Fixture_Beta",
+        "fixture  alpha",
+        "FIXTUREALPHA",
+        "the surname stands alone",
+        "surname@example.invalid",
+        "Surname, capitalised",
+    ] {
+        assert_eq!(
+            breaks(&policy, line),
+            vec!["private-identifiers"],
+            "missed: {line}"
+        );
+    }
+    assert!(breaks(&policy, "a surnamed thing").is_empty());
+}
+
+#[test]
+fn an_allowance_admits_only_what_its_match_contains() {
+    let literal = ["synthetic", "restricted", "identifier"].join("-");
+    let policy = rules(&[], &[r"https://github\.com/[a-z0-9._-]+/[a-z0-9._-]+"]);
+    // The citation itself is admitted.
+    assert!(breaks(&policy, &format!("https://github.com/{literal}/thing")).is_empty());
+    assert!(
+        breaks(
+            &policy,
+            &format!("git = \"https://github.com/{literal}/thing\"")
+        )
+        .is_empty()
+    );
+    // The same name in prose on the same line is still refused: the allowance is a
+    // span, never the line it sits on.
+    assert_eq!(
+        breaks(
+            &policy,
+            &format!("https://github.com/{literal}/thing is run by {literal}")
+        ),
+        vec!["private-identifiers"]
+    );
+    assert_eq!(
+        breaks(&policy, &format!("{literal} ships it")),
+        vec!["private-identifiers"]
+    );
+}
+
+#[test]
+fn an_allowance_cannot_be_stretched_over_an_adjacent_use() {
+    // A greedy allowance that runs to end of line would swallow the prose use; the
+    // rule under test is that containment is computed per occurrence, not per line.
+    let literal = ["synthetic", "restricted", "identifier"].join("-");
+    let policy = rules(&[], &[r"https://github\.com/[a-z0-9._-]+/[a-z0-9._-]+"]);
+    let line = format!("{literal} at https://github.com/{literal}/thing");
+    assert_eq!(breaks(&policy, &line), vec!["private-identifiers"]);
+}
+
+#[test]
+fn text_reports_every_line_that_breaks_a_rule() {
+    let literal = ["synthetic", "restricted", "identifier"].join("-");
+    let policy = rules(&[], &[]);
+    let body = format!("clean line\n{literal}\nalso clean\n{}/x\n", home());
+    let broken = scan::Matchers::build(&policy)
+        .unwrap()
+        .text(body.as_bytes());
+    assert_eq!(
+        broken,
+        vec![(2, "private-identifiers"), (4, "personal-paths")]
+    );
+}
+
+#[test]
+fn a_policy_whose_pattern_does_not_compile_is_refused_at_load() {
+    let mut policy = rules(&["fixture(unclosed"], &[]);
+    assert!(policy.validate().is_err());
+    policy = rules(&[], &["fixture(unclosed"]);
+    assert!(policy.validate().is_err());
+}
+
+#[test]
+fn pattern_rules_require_the_second_policy_version() {
+    let mut policy = rules(&["fixture-alpha"], &[]);
+    policy.version = 1;
+    assert!(policy.validate().is_err());
+}
+
+// --- adversarial pass: evasion of the private rules ---
+//
+// Every case below is a smuggling attempt against the synthetic policy only. Tests
+// that pass record a defence that holds; tests marked `#[ignore]` are live defects
+// and each names the defect in its comment.
+
+fn literal() -> String {
+    ["synthetic", "restricted", "identifier"].join("-")
+}
+
+fn breaks_bytes(policy: &Policy, line: &[u8]) -> Vec<&'static str> {
+    scan::Matchers::build(policy).unwrap().line(line)
+}
+
+#[test]
+fn a_literal_survives_every_delimiter_this_estate_writes() {
+    let policy = rules(&[], &[]);
+    let l = literal();
+    for line in [
+        format!("`{l}`"),
+        format!("| owner | {l} |"),
+        format!("|{l}|"),
+        format!("*{l}*"),
+        format!("_{l}_"),
+        format!("<{l}>"),
+        format!("[{l}]"),
+        format!("({l})"),
+        format!("\"{l}\""),
+        format!("'{l}'"),
+        format!("file:///srv/{l}/x"),
+        // A CRLF file reaches the matcher with the CR still attached to the line.
+        format!("{l}\r"),
+        format!("a\r{l}\r"),
+        l.to_uppercase(),
+        "SyNtHeTiC-ResTricTed-IdEnTiFiEr".into(),
+    ] {
+        assert_eq!(
+            breaks(&policy, &line),
+            vec!["private-identifiers"],
+            "missed: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn case_insensitivity_is_unicode_simple_folding_not_ascii_folding() {
+    // Incidental, not a designed defence: `(?i)` in the regex crate folds under
+    // Unicode, so U+017F LATIN SMALL LETTER LONG S is an `s`. Recorded so that a
+    // later switch to `(?i-u:)` for byte matching is seen to lose it.
+    let policy = rules(&[], &[]);
+    let l = literal();
+    let long_s = format!("\u{17f}{}", &l[1..]);
+    assert_eq!(breaks(&policy, &long_s), vec!["private-identifiers"]);
+    let kelvin = rules(&["fixture-kappa"], &[]);
+    assert_eq!(
+        breaks(&kelvin, "fixture-\u{212a}appa"),
+        vec!["private-identifiers"]
+    );
+}
+
+#[test]
+fn an_allowance_span_does_not_leak_onto_an_abutting_occurrence() {
+    // Containment is `s <= start && end <= e`. Both bounds are inclusive by design;
+    // what must not happen is an occurrence one byte outside the span being admitted.
+    let l = literal();
+    let policy = rules(&[], &["citation:"]);
+    assert_eq!(
+        breaks(&policy, &format!("citation:{l}")),
+        vec!["private-identifiers"]
+    );
+    let policy = rules(&[], &[":citation"]);
+    assert_eq!(
+        breaks(&policy, &format!("{l}:citation")),
+        vec!["private-identifiers"]
+    );
+    // An allowance that exactly spans the occurrence admits it; a second occurrence
+    // one byte past the span end does not ride along.
+    let exact = format!("q={}", regex::escape(&l));
+    let policy = rules(&[], &[&exact]);
+    assert!(breaks(&policy, &format!("q={l}")).is_empty());
+    assert_eq!(
+        breaks(&policy, &format!("q={l} {l}")),
+        vec!["private-identifiers"]
+    );
+}
+
+#[test]
+fn a_bounded_separator_class_catches_the_separators_it_was_bounded_for() {
+    let policy = rules(&[r"fixture[\W_]{0,3}(alpha|beta)"], &[]);
+    for line in [
+        "fixture-alpha",
+        "FIXTURE-ALPHA",
+        "Fixture_Beta",
+        "fixture  alpha",
+        "fixtureALPHA",
+        // A non-breaking space, a non-breaking hyphen and a zero-width space are all
+        // `\W`, so a bounded class covers them.
+        "fixture\u{00a0}alpha",
+        "fixture\u{2011}alpha",
+        "fixture\u{200b}-alpha",
+    ] {
+        assert_eq!(
+            breaks(&policy, line),
+            vec!["private-identifiers"],
+            "missed: {line}"
+        );
+    }
+    // The bound is the policy author's exposure, not the engine's: four separators
+    // walk straight through a `{0,3}` rule.
+    assert!(breaks(&policy, "fixture....alpha").is_empty());
+}
+
+#[ignore = "DEFECT: line-based scanning. All 30 interior split points of the literal evade; \
+            a soft-wrapped paragraph or a hyphenated line break carries the term out"]
+#[test]
+fn a_literal_split_across_a_line_break_is_still_caught() {
+    let policy = rules(&[], &[]);
+    let l = literal();
+    let matchers = scan::Matchers::build(&policy).unwrap();
+    let evading = (1..l.len())
+        .filter(|i| {
+            matchers
+                .text(format!("{}\n{}", &l[..*i], &l[*i..]).as_bytes())
+                .is_empty()
+        })
+        .count();
+    assert_eq!(
+        evading,
+        0,
+        "{evading} of {} split points evade",
+        l.len() - 1
+    );
+}
+
+#[ignore = "DEFECT: no normalisation before matching. Percent, HTML-entity, JSON \\u and \
+            base64 encodings of the literal all pass; base64 is not covered by Gitleaks \
+            either, whose decode depth only applies to its own secret rules"]
+#[test]
+fn an_encoded_literal_is_still_caught() {
+    let policy = rules(&[], &[]);
+    let l = literal();
+    for line in [
+        l.replace('-', "%2D"),
+        l.bytes().map(|b| format!("%{b:02X}")).collect(),
+        l.replace('-', "&#45;"),
+        l.replace('-', "&hyphen;"),
+        l.replace('-', "\\u002D"),
+        l.replace("-i", "-<wbr>i"),
+        "c3ludGhldGljLXJlc3RyaWN0ZWQtaWRlbnRpZmllcg==".into(),
+    ] {
+        assert_eq!(
+            breaks(&policy, &line),
+            vec!["private-identifiers"],
+            "missed: {line:?}"
+        );
+    }
+}
+
+#[ignore = "DEFECT: no Unicode confusable or invisible-character normalisation. A zero-width \
+            space, a soft hyphen, a Cyrillic homoglyph, a combining mark or a fullwidth \
+            letter each defeat the literal"]
+#[test]
+fn a_literal_carrying_invisible_or_confusable_characters_is_still_caught() {
+    let policy = rules(&[], &[]);
+    let l = literal();
+    for line in [
+        l.replace('-', "\u{200b}-"),
+        l.replace('-', "\u{200c}-"),
+        l.replace('-', "\u{00ad}"),
+        l.replacen('c', "\u{0441}", 1),
+        l.replacen('i', "i\u{0301}", 1),
+        format!("\u{ff53}{}", &l[1..]),
+    ] {
+        assert_eq!(
+            breaks(&policy, &line),
+            vec!["private-identifiers"],
+            "missed: {line:?}"
+        );
+    }
+}
+
+#[ignore = "DEFECT: byte matching assumes UTF-8 or a superset of ASCII. A unit encoded \
+            UTF-16 carries the literal past every rule; Latin-1 is fine because the \
+            literal itself is ASCII"]
+#[test]
+fn a_literal_in_a_utf16_unit_is_still_caught() {
+    let policy = rules(&[], &[]);
+    let utf16: Vec<u8> = literal().bytes().flat_map(|b| [b, 0]).collect();
+    assert_eq!(
+        breaks_bytes(&policy, &utf16),
+        vec!["private-identifiers"],
+        "missed: UTF-16LE"
+    );
+}
+
+#[ignore = "DEFECT: the widened boundary class `[^a-z0-9._\\-\\\\]` still excludes `-` and \
+            `_`, so a unified-diff removal line, a tight markdown bullet and `_..._` \
+            emphasis each hide a home path. `-` and `_` cannot end a hostname, so \
+            admitting them costs no false positive"]
+#[test]
+fn a_home_path_behind_a_hyphen_or_an_underscore_is_caught() {
+    let policy = rules(&[], &[]);
+    let h = home();
+    for line in [
+        format!("_{h}_"),
+        format!("-{h}/config"),
+        format!("-{h}"),
+        format!("ROOT_{h}"),
+    ] {
+        assert!(
+            breaks(&policy, &line).contains(&"personal-paths"),
+            "missed: {line}"
+        );
+    }
+}
+
+#[ignore = "DEFECT: the boundary class is a Unicode class, so it cannot match a byte that \
+            is not valid UTF-8. One Latin-1 byte before the path hides it. Fix: wrap the \
+            class in `(?-u:)` so it is a byte class"]
+#[test]
+fn a_home_path_behind_an_invalid_utf8_byte_is_caught() {
+    let policy = rules(&[], &[]);
+    for prefix in [0xffu8, 0x80, 0xe9] {
+        let mut line = vec![prefix];
+        line.extend_from_slice(home().as_bytes());
+        assert!(
+            breaks_bytes(&policy, &line).contains(&"personal-paths"),
+            "missed: byte {prefix:#04x} before a home path"
+        );
+    }
+}
+
+#[test]
+fn a_rest_route_is_not_a_personal_path() {
+    let policy = rules(&[], &[]);
+    // Built rather than written, for the same reason `home()` is: this file must not
+    // carry a string that reads as a machine-local path.
+    let users = ["", "users", ""].join("/");
+    let home = ["", "home", ""].join("/");
+    for line in [
+        format!("`{users}me` returns the caller"),
+        format!("GET {users}me"),
+        format!("  \"{users}profile\": {{ \"get\": {{}} }}"),
+        format!("| `{users}me` | the caller |"),
+        format!("[Home]({home}index.html)"),
+        format!("<a href=\"{users}settings\">settings</a>"),
+        format!("router.get('{users}list', handler)"),
+        format!("- {users}search is paginated"),
+    ] {
+        assert!(
+            !breaks(&policy, &line).contains(&"personal-paths"),
+            "false positive: {line}"
+        );
+    }
+}
+
+#[test]
+fn an_allowance_admits_only_its_named_group_never_the_text_around_it() {
+    let l = literal();
+    // The allowance names the citation; the label beside it is not admitted.
+    for (allow, line) in [
+        (
+            r"\[[^\]]+\]\((?P<admit>[^)]+)\)",
+            format!("[{l}](https://example.invalid/x)"),
+        ),
+        (
+            r"(?P<admit>https://example\.invalid/docs)#\S*",
+            format!("see https://example.invalid/docs#{l}"),
+        ),
+        (
+            r"(?P<admit>https://example\.invalid/s)\?\S*",
+            format!("https://example.invalid/s?q={l}"),
+        ),
+        (
+            r"(?P<admit>https://github\.com/[a-z0-9._]+/[a-z0-9._]+)",
+            format!("https://github.com/example/repo-{l}"),
+        ),
+    ] {
+        let policy = rules(&[], &[allow]);
+        assert_eq!(
+            breaks(&policy, &line),
+            vec!["private-identifiers"],
+            "allowance {allow:?} swallowed prose in {line:?}"
+        );
+    }
+    // And the citation itself still passes.
+    let policy = rules(&[], &[r"\[[^\]]+\]\((?P<admit>[^)]+)\)"]);
+    assert!(breaks(&policy, &format!("[upstream](https://example.invalid/{l})")).is_empty());
+}
+
+#[ignore = "DEFECT: an allowance is not scoped to a rule. A citation allowance written for \
+            `private-identifiers` silently disables `personal-paths` inside its span, and \
+            a `file://` allowance is exactly the shape that covers a home path"]
+#[test]
+fn an_allowance_does_not_admit_a_rule_it_was_not_written_for() {
+    let policy = rules(&[], &[r"file://\S+"]);
+    assert!(
+        breaks(&policy, &format!("file://{}/x", home())).contains(&"personal-paths"),
+        "a citation allowance admitted a home path"
+    );
+}
+
+#[test]
+fn an_allow_pattern_that_admits_everything_is_refused() {
+    for allow in [r".*", r"(?s).*", r"[\s\S]*", r"\S*", r"^", r".+"] {
+        let policy = rules(&[], &[allow]);
+        assert!(
+            policy.validate().is_err(),
+            "accepted allow pattern {allow:?}"
+        );
+        assert!(
+            scan::Matchers::build(&policy).is_err(),
+            "built matchers for allow pattern {allow:?}"
+        );
+    }
+}
+
+#[test]
+fn an_allowance_must_name_what_it_admits() {
+    let mut policy = rules(&[], &[]);
+    policy.allow_patterns = vec![r"https://example\.invalid/\S+".into()];
+    assert!(policy.validate().is_err(), "accepted an unnamed allowance");
+    assert!(scan::Matchers::build(&policy).is_err());
+}
+
+#[test]
+fn a_forbidden_pattern_that_matches_everything_is_refused() {
+    for pattern in [r".*", r"^", r"\b", r"(?s).*", r"\S*"] {
+        let policy = rules(&[pattern], &[]);
+        assert!(
+            policy.validate().is_err(),
+            "accepted forbidden pattern {pattern:?}"
+        );
+        assert!(
+            scan::Matchers::build(&policy).is_err(),
+            "built matchers for forbidden pattern {pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn span_containment_is_not_quadratic_in_line_length() {
+    use std::time::Instant;
+    let policy = rules(&[r"invalid"], &[r#"https?://[^\s"']+"#]);
+    let matchers = scan::Matchers::build(&policy).unwrap();
+    // A ratio, not a wall clock: a debug build is an order of magnitude slower than
+    // a release one and CI is slower than this machine, but quadratic is quadratic.
+    let measure = |repeats: usize| {
+        let line = "https://example.invalid/a ".repeat(repeats);
+        let started = Instant::now();
+        let _ = matchers.line(line.as_bytes());
+        started.elapsed()
+    };
+    let _ = measure(2_000);
+    let small = measure(10_000);
+    let large = measure(40_000);
+    // Four times the input. Linear is 4x, quadratic is 16x.
+    assert!(
+        large.as_nanos() < small.as_nanos().saturating_mul(8).max(8_000_000),
+        "4x the line took {large:.1?} against {small:.1?}"
+    );
+}
+
+#[test]
+fn a_unc_user_profile_path_is_a_personal_path() {
+    let policy = rules(&[], &[]);
+    assert!(
+        breaks(&policy, "\\\\fileserver\\Users\\fixture.person\\notes").contains(&"personal-paths"),
+        "missed a UNC user profile path"
+    );
+}
+
+#[test]
+fn a_line_the_previous_version_already_carried_is_not_introduced_by_this_change() {
+    let f = Fixture::new();
+    let l = literal();
+    let carried = format!("upstream is {l}\n");
+    let mut unit = unit(format!("{carried}a new and harmless line\n"));
+    // Without a predecessor the whole file is answerable.
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        std::slice::from_ref(&unit),
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results["private-identifiers"].findings, 1);
+    // With one that already carried the line, editing the file elsewhere is clean.
+    unit.inherited = Some(carried.clone().into_bytes());
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        std::slice::from_ref(&unit),
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results["private-identifiers"].findings, 0);
+    // A new occurrence in the same file is still refused.
+    let added = unit_with(format!("{carried}and now {l} again\n"), Some(carried));
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        std::slice::from_ref(&added),
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results["private-identifiers"].findings, 1);
+}
+
+#[test]
+fn a_binary_unit_is_left_to_the_secret_scanner() {
+    let f = Fixture::new();
+    let l = literal();
+    let mut bytes = vec![0u8, 1, 2, 3];
+    bytes.extend_from_slice(l.as_bytes());
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        &[unit(&bytes)],
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results["private-identifiers"].findings, 0);
+}
+
+#[test]
+fn an_exception_may_cover_a_generated_tree_without_a_line_or_a_digest() {
+    let mut f = Fixture::new();
+    let l = literal();
+    let unit = Unit {
+        location: "file:generated/a/manifest.json".into(),
+        bytes: format!("first\n{l}\n").into_bytes(),
+        workflow: false,
+        inherited: None,
+    };
+    let count = |f: &Fixture, unit: &Unit| {
+        scan::run(
+            &f.policy,
+            REPOSITORY,
+            std::slice::from_ref(unit),
+            &mut CountScanner::default(),
+        )
+        .unwrap()
+        .results["private-identifiers"]
+            .findings
+    };
+    assert_eq!(count(&f, &unit), 1);
+    f.policy.exceptions.push(Exception {
+        repository: REPOSITORY.into(),
+        rule: "private-identifiers".into(),
+        location: "file:generated/*".into(),
+        content_sha256: String::new(),
+        line: 0,
+    });
+    f.policy.validate().unwrap();
+    assert_eq!(count(&f, &unit), 0);
+    // The prefix binds: a sibling tree is not covered.
+    let other = Unit {
+        location: "file:src/a/manifest.json".into(),
+        ..unit
+    };
+    assert_eq!(count(&f, &other), 1);
+    // And a bare `*` is refused rather than admitting the repository.
+    f.policy.exceptions[0].location = "*".into();
+    assert!(f.policy.validate().is_err());
 }
