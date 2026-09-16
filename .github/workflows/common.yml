@@ -21,9 +21,9 @@ jobs:
         shell: bash
         run: |
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            https://github.com/beyond10x/gates/releases/download/0.1.4/b10x-gates-linux-x86_64 \
+            https://github.com/beyond10x/gates/releases/download/0.1.5/b10x-gates-linux-x86_64 \
             --output "$RUNNER_TEMP/b10x-gates"
-          printf '%s  %s\n' '3204532175a0b219664f7667cab27d72d47ea341146c8e34f1b640e0691d1a9e' "$RUNNER_TEMP/b10x-gates" | sha256sum --check --status
+          printf '%s  %s\n' '59422621d04147eff54555c5b1050e16511306b07733262b821f154320b71661' "$RUNNER_TEMP/b10x-gates" | sha256sum --check --status
           chmod 700 "$RUNNER_TEMP/b10x-gates"
       - name: Fetch pinned published Gitleaks
         run: '"$RUNNER_TEMP/b10x-gates" bootstrap --directory "$RUNNER_TEMP/gitleaks"'
