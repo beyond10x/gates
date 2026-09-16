@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 — 2026-09-16
+
+- Admit `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` as a commit **author**. A dependency update was refused with `inadmissible authorship` and could not merge anywhere in the organization. Nothing else relaxes: the commit is scanned like any other, every other identity is still refused, and local delivery still requires the organization bot as author *and* committer, so this admits a pull request and never a push.
+- Resolve a body file named by `--body-file`, `--notes-file` or `--input` against `--repo`, which is the directory `gh` itself resolves against. A relative path was unreadable here and perfectly readable to the child.
+- Change no policy field or receipt format; the version increment alone invalidates receipts retained under 0.1.4.
+
 ## 0.1.4 — 2026-09-16
 
 - Supply the workflow token to the candidate object fetch, so the shared gate works on a private repository. It served objects anonymously before, which only a public repository does; a private adopter refused with "candidate object fetch failed". The credential goes through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, never argv or a URL, because argv is readable by every process on the runner.

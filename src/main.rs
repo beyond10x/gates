@@ -211,8 +211,19 @@ fn execute(args: Args) -> Result<()> {
         let mut previous: Option<&str> = None;
         for (i, argument) in command.iter().enumerate() {
             let named = previous.is_some_and(|p| FILE_OPTIONS.contains(&p));
+            // `gh` resolves a relative path against its own working directory, which is
+            // `--repo`. Read it the same way, or a relative notes file is unreadable here
+            // and perfectly readable to the child.
             let bytes = if named {
-                fs::read(argument).with_context(|| format!("argument {} unreadable", i + 1))?
+                let path = std::path::Path::new(argument);
+                let resolved = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    args.repo.join(path)
+                };
+                fs::read(&resolved)
+                    .or_else(|_| fs::read(path))
+                    .with_context(|| format!("argument {} unreadable", i + 1))?
             } else {
                 argument.as_bytes().to_vec()
             };

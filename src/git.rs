@@ -37,8 +37,9 @@ fn verify_automation_author(raw: &[u8]) -> Result<()> {
     ensure!(authors.next().is_none(), "duplicate commit author refused");
     ensure!(
         exact_identity(author, crate::BOT_NAME, crate::BOT_EMAIL)
-            || exact_identity(author, crate::ACTIONS_NAME, crate::ACTIONS_EMAIL),
-        "commit author must be the exact organization bot or GitHub Actions identity"
+            || exact_identity(author, crate::ACTIONS_NAME, crate::ACTIONS_EMAIL)
+            || exact_identity(author, crate::DEPENDABOT_NAME, crate::DEPENDABOT_EMAIL),
+        "commit author must be an exact admitted automation identity"
     );
     Ok(())
 }

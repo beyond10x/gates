@@ -1563,3 +1563,50 @@ fn the_basic_credential_encoder_matches_standard_base64() {
         );
     }
 }
+
+#[test]
+fn a_dependency_update_is_admitted_as_an_author_and_nothing_else_is() {
+    let f = Fixture::new();
+    let commit = |name: &str, email: &str| {
+        let out = Command::new("git")
+            .current_dir(f.dir.path())
+            .args(["commit", "--allow-empty", "-m", "dependency bump"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", BOT_NAME)
+            .env("GIT_COMMITTER_EMAIL", BOT_EMAIL)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(f.dir.path(), &["rev-parse", "HEAD"])
+    };
+    let head = commit(b10x_gates::DEPENDABOT_NAME, b10x_gates::DEPENDABOT_EMAIL);
+    Git::new(f.dir.path())
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &head, &[])
+        .expect("a dependency update is an admitted author");
+    // The name alone is not enough, and neither is a third automation identity.
+    for (name, email) in [
+        (b10x_gates::DEPENDABOT_NAME, BOT_EMAIL),
+        (
+            "renovate[bot]",
+            "29139614+renovate[bot]@users.noreply.github.com",
+        ),
+    ] {
+        let head = commit(name, email);
+        assert!(
+            Git::new(f.dir.path())
+                .unwrap()
+                .candidate(&f.policy, REPOSITORY, &head, &[])
+                .is_err(),
+            "{name} <{email}> must not be admissible"
+        );
+        git(f.dir.path(), &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+}
