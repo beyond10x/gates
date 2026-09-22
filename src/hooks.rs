@@ -158,6 +158,17 @@ pub fn invoked() -> Option<String> {
     HOOKS.contains(&name.as_str()).then_some(name)
 }
 
+/// Pre-push uses the same ancestry proof as publication, before receipt reuse.
+pub fn verify_pre_push(
+    git: &Git,
+    policy: &Policy,
+    repository: &str,
+    head: &str,
+    api: &impl crate::published_merge::AuthenticatedRead,
+) -> Result<()> {
+    crate::published_merge::verify(git, policy, repository, head, api)
+}
+
 pub fn run(name: &str, args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let directory = exe.parent().context("hook directory unavailable")?;
@@ -255,7 +266,13 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     Vec::new()
                 };
                 let candidate = git.candidate(&policy, &config.repository, &head, &tags)?;
-                git.verify_bot(&candidate.binding.commits)?;
+                verify_pre_push(
+                    &git,
+                    &policy,
+                    &config.repository,
+                    &head,
+                    &crate::delivery::PushEvidence,
+                )?;
                 let retained = directory.join(format!(
                     "{}.receipt.json",
                     digest(&serde_json::to_vec(&candidate.binding)?)

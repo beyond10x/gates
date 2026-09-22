@@ -4,6 +4,7 @@ use crate::{
     evidence::{self, Receipt},
     git::{Candidate, Git},
     policy::{self, Policy},
+    published_merge::{self, AuthenticatedRead},
 };
 use anyhow::{Context, Result, ensure};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -20,6 +21,36 @@ use std::{
 pub struct Github {
     client: Client,
     token: String,
+}
+
+impl AuthenticatedRead for Github {
+    fn get(&self, path: &str) -> Result<Value> {
+        self.api(Method::GET, path, None)
+    }
+}
+
+/// Publication's ancestry gate. Receipt verification and scans remain separate.
+pub fn verify_publication(
+    git: &Git,
+    policy: &Policy,
+    repository: &str,
+    head: &str,
+    api: &impl AuthenticatedRead,
+) -> Result<()> {
+    published_merge::verify(git, policy, repository, head, api)
+}
+
+/// Hooks receive the App credential from `Github::git`. Read it only when a
+/// historical merge needs proof; exact direct commits still need no API read.
+pub(crate) struct PushEvidence;
+
+impl AuthenticatedRead for PushEvidence {
+    fn get(&self, path: &str) -> Result<Value> {
+        Github::from_token(
+            std::env::var("B10X_BOT_TOKEN").context("authenticated push evidence unavailable")?,
+        )?
+        .get(path)
+    }
 }
 
 impl Github {

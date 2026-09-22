@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 — 2026-09-22
+
+- Verify already-published GitHub App merge ancestors through authenticated repository, branch authority, commit and pull request evidence in both publication and pre-push. A legitimate bot merge with GitHub as committer no longer prevents subsequent bot delivery. New direct commits retain exact bot author and committer checks; ambiguous or missing historical proof refuses.
+- Share the ancestry verifier across delivery entry points and validate every commit in the complete candidate DAG. Keep policy, adoption baselines, common scanners, signed receipts and commit-time identity checks unchanged.
+- Change no receipt format; the version increment invalidates receipts retained under earlier binaries.
+
 ## 0.1.5 — 2026-09-16
 
 - Admit `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` as a commit **author**. A dependency update was refused with `inadmissible authorship` and could not merge anywhere in the organization. Nothing else relaxes: the commit is scanned like any other, every other identity is still refused, and local delivery still requires the organization bot as author *and* committer, so this admits a pull request and never a push.

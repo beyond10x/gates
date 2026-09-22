@@ -4,6 +4,7 @@ pub mod evidence;
 pub mod git;
 pub mod hooks;
 pub mod policy;
+pub mod published_merge;
 pub mod scan;
 
 use sha2::{Digest, Sha256};

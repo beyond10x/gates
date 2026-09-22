@@ -430,7 +430,13 @@ fn execute(args: Args) -> Result<()> {
             evidence::verify(&policy, &candidate, &receipt)?;
             if let Action::Publish { remote_ref, .. } = &args.command {
                 let github = Github::bot()?;
-                git.verify_bot(&candidate.binding.commits)?;
+                b10x_gates::delivery::verify_publication(
+                    &git,
+                    &policy,
+                    &repository,
+                    &head,
+                    &github,
+                )?;
                 if let Some(remote_ref) = remote_ref {
                     ensure!(
                         remote_ref.starts_with("refs/heads/")

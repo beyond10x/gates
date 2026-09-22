@@ -28,6 +28,16 @@ pub fn exact_identity(value: &[u8], name: &str, email: &str) -> bool {
         && zone[1..].iter().all(u8::is_ascii_digit)
 }
 
+pub(crate) fn unique_header<'a>(raw: &'a [u8], field: &[u8]) -> Result<&'a [u8]> {
+    let mut values = raw
+        .split(|b| *b == b'\n')
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix(field));
+    let value = values.next().context("required commit header missing")?;
+    ensure!(values.next().is_none(), "duplicate commit header refused");
+    Ok(value)
+}
+
 fn verify_automation_author(raw: &[u8]) -> Result<()> {
     let mut authors = raw
         .split(|b| *b == b'\n')
@@ -387,13 +397,8 @@ impl Git {
         for oid in commits {
             let raw = self.read(&["cat-file", "commit", oid])?;
             for field in [b"author ".as_slice(), b"committer ".as_slice()] {
-                let value = raw
-                    .split(|v| *v == b'\n')
-                    .take_while(|v| !v.is_empty())
-                    .find_map(|line| line.strip_prefix(field))
-                    .context("missing identity")?;
-                let identity = format!("{} <{}> ", crate::BOT_NAME, crate::BOT_EMAIL);
-                if !value.starts_with(identity.as_bytes()) {
+                let value = unique_header(&raw, field)?;
+                if !exact_identity(value, crate::BOT_NAME, crate::BOT_EMAIL) {
                     bail!("outgoing commit must have the exact bot author and committer");
                 }
             }
