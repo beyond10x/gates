@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.7 — 2026-09-22
+
+- Admit a two-parent GitHub App merge whose head does not contain its base when the base's tree
+  equals the fork point's: the merge adopts the head's tree, so a base that added nothing since the
+  fork cannot have been dropped. A base that did add content is still refused. Without this a
+  repository whose default branch took one such merge could never deliver again
+  (epistemic-knowledge-runtime PR #12).
+- Admit a one-parent GitHub App commit (a squash merge) on shape; it is still proved against the
+  remote — verified signature, exact bot author, `merged_by`, `merge_commit_sha`, and the single
+  parent equal to the pull request base.
+- Raise the per-blob scan limit from 64 to 128 MiB and the total from 256 to 512 MiB.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.6.
+
 ## 0.1.6 — 2026-09-22
 
 - Verify already-published GitHub App merge ancestors through authenticated repository, branch authority, commit and pull request evidence in both publication and pre-push. A legitimate bot merge with GitHub as committer no longer prevents subsequent bot delivery. New direct commits retain exact bot author and committer checks; ambiguous or missing historical proof refuses.

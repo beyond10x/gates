@@ -569,12 +569,26 @@ fn local_merge_tree_must_equal_pr_head_tree() {
     );
 }
 
+/// A stale PR basis is refused when the base carried content the head could have dropped.
+///
+/// The base advanced past the fork point with a new file, and the merge adopted the head's tree,
+/// so the base's file is gone from the merge. That is the hazard the basis check exists for.
 #[test]
 fn merge_basis_must_already_be_in_pr_head() {
     let mut f = Fixture::new();
+    let blob = git(
+        f.dir.path(),
+        &["hash-object", "-w", "--stdin"],
+        b"content only the default branch carried\n",
+    );
+    let base_tree = git(
+        f.dir.path(),
+        &["mktree"],
+        format!("100644 blob {blob}\tbase-only\n").as_bytes(),
+    );
     let advanced = commit(
         f.dir.path(),
-        &f.tree,
+        &base_tree,
         &[&f.baseline],
         false,
         "advanced default branch",
@@ -582,15 +596,48 @@ fn merge_basis_must_already_be_in_pr_head() {
     let tree = f.tree.clone();
     let topic = f.topic.clone();
     f.replace_merge(&tree, &[&advanced, &topic]);
+    let error = f
+        .verify()
+        .expect_err("a merge that dropped the base's content is refused");
     assert!(
-        f.verify().is_err(),
-        "same tree cannot excuse a stale PR basis"
+        error
+            .to_string()
+            .contains("did not incorporate its merge basis"),
+        "refused for the basis, not for another reason: {error:#}"
+    );
+}
+
+/// A stale PR basis whose base added nothing since the fork point is admitted.
+///
+/// The base advanced by commits that leave its tree equal to the fork point's, so the merge, which
+/// adopts the head's tree, dropped nothing. Refusing this shape left a repository whose default
+/// branch took one such merge unable to deliver again (epistemic-knowledge-runtime PR #12).
+#[test]
+fn a_stale_basis_that_added_nothing_is_admitted() {
+    let mut f = Fixture::new();
+    let advanced = commit(
+        f.dir.path(),
+        &f.tree,
+        &[&f.baseline],
+        false,
+        "advanced default branch, tree unchanged",
+    );
+    let tree = f.tree.clone();
+    let topic = f.topic.clone();
+    f.replace_merge(&tree, &[&advanced, &topic]);
+    assert!(
+        f.verify().is_ok(),
+        "a base that added nothing since the fork cannot have been dropped: {:?}",
+        f.verify()
     );
 }
 
 #[test]
-fn github_committer_exception_requires_exactly_two_parents() {
-    for count in [0, 1, 3] {
+fn github_committer_exception_requires_one_or_two_parents() {
+    // One parent is a squash merge and two is an ordinary merge; both are shapes the button
+    // produces. A root commit and an octopus are neither, and stay refused on shape alone —
+    // before any remote claim is fetched, which is what makes this a cheap guard.
+    for count in [0, 3] {
         let mut f = Fixture::new();
         let tree = f.tree.clone();
         let third = commit(f.dir.path(), &tree, &[&f.baseline], false, "third parent");
@@ -609,11 +656,30 @@ fn github_committer_exception_requires_exactly_two_parents() {
         let error = f.verify().expect_err("GitHub merge has wrong parent count");
         if count > 0 {
             assert!(
-                error.to_string().contains("exactly two parents"),
+                error.to_string().contains("one or two parents"),
                 "wrong refusal: {error:#}"
             );
         }
     }
+}
+
+#[test]
+fn a_squash_merge_is_admitted_on_shape_and_still_proved_against_the_remote() {
+    // The shape check must let a one-parent GitHub commit through, and everything after it must
+    // still run: this asserts the refusal comes from the remote proof, never from the parent
+    // count. Without the first half a repository whose default branch has taken one squash merge
+    // can never deliver again; without the second half the squash would be admitted unproved.
+    let mut f = Fixture::new();
+    let tree = f.tree.clone();
+    let baseline = f.baseline.clone();
+    f.replace_merge(&tree, &[baseline.as_str()]);
+    let error = f
+        .verify()
+        .expect_err("a squash merge is still proved against the remote");
+    assert!(
+        !error.to_string().contains("one or two parents"),
+        "the shape check refused a squash merge: {error:#}"
+    );
 }
 
 #[test]

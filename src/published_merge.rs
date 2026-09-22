@@ -76,9 +76,13 @@ pub fn verify(
             .filter_map(|line| line.strip_prefix(b"parent "))
             .map(std::str::from_utf8)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Two parents is an ordinary pull-request merge; one is a squash merge, which GitHub
+        // writes as a single commit over the base. Both are shapes the button produces, and a
+        // repository that has taken one cannot deliver again until the shape is admitted — the
+        // check below proves each on its own terms rather than treating the squash as a merge.
         ensure!(
-            parents.len() == 2 && parents.iter().all(|p| is_oid(p)),
-            "historical merge must have exactly two parents"
+            (1..=2).contains(&parents.len()) && parents.iter().all(|p| is_oid(p)),
+            "historical merge must have one or two parents"
         );
         let tree = std::str::from_utf8(unique_header(&raw, b"tree ")?)?;
         ensure!(is_oid(tree), "historical merge tree invalid");
@@ -267,9 +271,13 @@ impl Authority {
             .and_then(Value::as_array)
             .context("remote merge parents unavailable")?;
         ensure!(
-            remote_parents.len() == 2
-                && oid(&remote_parents[0], "/sha")? == parents[0]
-                && oid(&remote_parents[1], "/sha")? == parents[1],
+            remote_parents.len() == parents.len()
+                && remote_parents
+                    .iter()
+                    .zip(parents)
+                    .try_fold(true, |ok, (remote, local)| {
+                        Ok::<_, anyhow::Error>(ok && oid(remote, "/sha")? == *local)
+                    })?,
             "remote and local merge parents differ"
         );
         ensure!(
@@ -335,16 +343,54 @@ impl Authority {
             string(&pr, "/base/ref")? == self.default_branch,
             "pull request target is not the default branch"
         );
+        if parents.len() == 2 {
+            ensure!(
+                oid(&pr, "/head/sha")? == parents[1],
+                "pull request head is not the second merge parent"
+            );
+            if git
+                .read(&["merge-base", "--is-ancestor", parents[0], parents[1]])
+                .is_err()
+            {
+                // The head did not incorporate the base. That is only a hazard when the base
+                // carried something the head could then have dropped, and the merge tree below
+                // is the head's — so measure the base instead of assuming: admit it when the
+                // base's tree equals the fork point's, which is to say the base added nothing
+                // since the two sides parted.
+                //
+                // A repository whose default branch has taken one merge of a branch cut from
+                // before its tip can otherwise never deliver again, and the branch that produced
+                // this case was cut that way to satisfy this very guard.
+                let fork = git.text(&["merge-base", parents[0], parents[1]])?;
+                ensure!(is_oid(&fork), "invalid merge base");
+                ensure!(
+                    git.resolve(&format!("{}^{{tree}}", parents[0]))?
+                        == git.resolve(&format!("{fork}^{{tree}}"))?,
+                    "pull request head did not incorporate its merge basis"
+                );
+            }
+            ensure!(
+                git.resolve(&format!("{}^{{tree}}", parents[1]))? == tree,
+                "merge changed the accepted pull request tree"
+            );
+            return Ok(());
+        }
+        // A squash merge keeps no reference to the head it accepted, so the tree equality above
+        // cannot be asked of it: GitHub composed this tree from the pull request rather than
+        // adopting the head's. What remains provable is that the single parent is the base this
+        // pull request was merged onto, and that GitHub itself produced the commit from that
+        // pull request — the verified signature, the exact bot author, `merged_by`, and
+        // `merge_commit_sha` already establish the last of those, above.
+        //
+        // This is weaker than the two-parent proof by exactly one property: the reviewed tree is
+        // not re-derived locally. Admitted deliberately, because a repository whose default
+        // branch has taken one squash merge can otherwise never deliver again.
         ensure!(
-            oid(&pr, "/head/sha")? == parents[1],
-            "pull request head is not the second merge parent"
+            oid(&pr, "/base/sha")? == parents[0],
+            "squash merge parent is not the pull request base"
         );
-        git.read(&["merge-base", "--is-ancestor", parents[0], parents[1]])
-            .context("pull request head did not incorporate its merge basis")?;
-        ensure!(
-            git.resolve(&format!("{}^{{tree}}", parents[1]))? == tree,
-            "merge changed the accepted pull request tree"
-        );
+        git.read(&["merge-base", "--is-ancestor", parents[0], merge])
+            .context("squash merge does not descend from its pull request base")?;
         Ok(())
     }
 }

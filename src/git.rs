@@ -8,8 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-const MAX_BLOB: usize = 64 * 1024 * 1024;
-const MAX_TOTAL: usize = 256 * 1024 * 1024;
+const MAX_BLOB: usize = 128 * 1024 * 1024;
+const MAX_TOTAL: usize = 512 * 1024 * 1024;
 
 /// Compare raw Git identity bytes, without mailmap or display-name normalization.
 pub fn exact_identity(value: &[u8], name: &str, email: &str) -> bool {
