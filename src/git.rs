@@ -10,6 +10,8 @@ use std::{
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
 const MAX_TOTAL: usize = 512 * 1024 * 1024;
+/// Lines of an append-only file's previous version rescanned with what it appended.
+const TAIL_CONTEXT: usize = 4;
 
 /// Compare raw Git identity bytes, without mailmap or display-name normalization.
 pub fn exact_identity(value: &[u8], name: &str, email: &str) -> bool {
@@ -76,6 +78,39 @@ pub struct Unit {
     /// commit that edits one line of a document is not answerable for the rest of
     /// it. `None` for a new path, a tag, a commit message and the baseline audit.
     pub inherited: Option<Vec<u8>>,
+    /// Lines of the file that precede `bytes`. Non-zero only when `bytes` is the
+    /// appended tail of a file whose previous version is a byte prefix of it; a
+    /// finding's line is reported as `line_offset` plus its line within `bytes`.
+    pub line_offset: usize,
+}
+
+/// Reduce an append-only change to what it appended.
+///
+/// When `old` is a byte prefix of `new`, every line of `old` is already inherited, so
+/// scanning it again finds nothing the inheritance rule would not discard, while it
+/// costs the full file against `MAX_TOTAL` on every commit that appends one line to a
+/// large log. The tail keeps the last `TAIL_CONTEXT` lines of `old`, so a literal
+/// soft-wrapped across the old end and the appended lines is still found whole.
+/// Anything that is not a pure append scans in full.
+fn appended_tail(new: Vec<u8>, old: &[u8]) -> (Vec<u8>, usize) {
+    if old.is_empty() || new.len() <= old.len() || !new.starts_with(old) {
+        return (new, 0);
+    }
+    // `cut` is the start of the TAIL_CONTEXT-th line from the end of `old`, counting a
+    // final line without its newline as a line.
+    let body = old.strip_suffix(b"\n").unwrap_or(old);
+    let Some(cut) = body
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, v)| **v == b'\n')
+        .nth(TAIL_CONTEXT - 1)
+        .map(|(i, _)| i + 1)
+    else {
+        return (new, 0);
+    };
+    let offset = new[..cut].iter().filter(|v| **v == b'\n').count();
+    (new[cut..].to_vec(), offset)
 }
 
 pub struct Candidate {
@@ -215,17 +250,24 @@ impl Git {
                 bytes: path.as_bytes().to_vec(),
                 workflow: false,
                 inherited: previous.map(|_| path.as_bytes().to_vec()),
+                line_offset: 0,
             });
             let bytes = self.blob(oid)?;
             // An oversized predecessor cannot be read, so nothing is inherited from
             // it and the whole file is answerable. That fails closed.
             let inherited = previous.and_then(|(_, old)| self.blob(old).ok());
+            let workflow = path.starts_with(".github/workflows/")
+                && (path.ends_with(".yml") || path.ends_with(".yaml"));
+            let (bytes, line_offset) = match &inherited {
+                Some(old) if !workflow => appended_tail(bytes, old),
+                _ => (bytes, 0),
+            };
             units.push(Unit {
                 location: format!("file:{path}"),
                 bytes,
-                workflow: path.starts_with(".github/workflows/")
-                    && (path.ends_with(".yml") || path.ends_with(".yaml")),
+                workflow,
                 inherited,
+                line_offset,
             });
         }
         ensure!(
@@ -291,6 +333,7 @@ impl Git {
                 bytes: raw,
                 workflow: false,
                 inherited: None,
+                line_offset: 0,
             });
         }
         let mut tags = BTreeSet::new();
@@ -316,6 +359,7 @@ impl Git {
                 bytes: tag.as_bytes().to_vec(),
                 workflow: false,
                 inherited: None,
+                line_offset: 0,
             });
             while self.text(&["cat-file", "-t", &oid])? == "tag" {
                 ensure!(tags.insert(oid.clone()), "duplicate or cyclic tag");
@@ -331,6 +375,7 @@ impl Git {
                     bytes: raw,
                     workflow: false,
                     inherited: None,
+                    line_offset: 0,
                 });
                 ensure!(is_oid(&next), "invalid nested tag");
                 oid = next;

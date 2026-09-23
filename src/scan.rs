@@ -501,6 +501,8 @@ fn finding(
 ) {
     // Historical privacy findings are bounded to unchanged exact lines. Secret and
     // workflow exceptions bind the whole unit because those rules can span lines.
+    // A line is always a line of the whole file, including for an appended tail.
+    let line = line + unit.line_offset;
     let content_sha256 = digest(content);
     if policy.exceptions.iter().any(|e| {
         e.covers(repository, rule, &unit.location)

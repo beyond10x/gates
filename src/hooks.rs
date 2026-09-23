@@ -221,6 +221,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     bytes,
                     workflow: false,
                     inherited: None,
+                    line_offset: 0,
                 });
             }
         } else if name == "commit-msg" {
@@ -230,6 +231,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                 bytes: fs::read(path)?,
                 workflow: false,
                 inherited: None,
+                line_offset: 0,
             });
         } else {
             ensure!(
@@ -294,6 +296,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     bytes: fields[2].as_bytes().to_vec(),
                     workflow: false,
                     inherited: None,
+                    line_offset: 0,
                 });
             }
         }

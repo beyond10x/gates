@@ -123,6 +123,7 @@ fn unit(bytes: impl AsRef<[u8]>) -> Unit {
         bytes: bytes.as_ref().into(),
         workflow: false,
         inherited: None,
+        line_offset: 0,
     }
 }
 fn unit_with(bytes: impl AsRef<[u8]>, inherited: Option<String>) -> Unit {
@@ -240,6 +241,7 @@ fn filenames_messages_author_and_committer_are_scanned() {
         bytes: raw.into_bytes(),
         workflow: false,
         inherited: None,
+        line_offset: 0,
     });
     let report = scan::run(&f.policy, REPOSITORY, &units, &mut CountScanner::default()).unwrap();
     assert!(report.results["private-identifiers"].findings >= 4);
@@ -1507,6 +1509,7 @@ fn an_exception_may_cover_a_generated_tree_without_a_line_or_a_digest() {
         bytes: format!("first\n{l}\n").into_bytes(),
         workflow: false,
         inherited: None,
+        line_offset: 0,
     };
     let count = |f: &Fixture, unit: &Unit| {
         scan::run(
@@ -1609,4 +1612,89 @@ fn a_dependency_update_is_admitted_as_an_author_and_nothing_else_is() {
         );
         git(f.dir.path(), &["reset", "-q", "--hard", "HEAD~1"]);
     }
+}
+
+fn file_unit<'a>(candidate: &'a Candidate, path: &str) -> &'a Unit {
+    let location = format!("file:{path}");
+    candidate
+        .units
+        .iter()
+        .rev()
+        .find(|u| u.location == location)
+        .unwrap()
+}
+
+#[test]
+fn an_append_only_change_is_counted_and_scanned_as_what_it_appended() {
+    let f = Fixture::new();
+    let old: String = (1..=1000).map(|i| format!("{{\"frame\":{i}}}\n")).collect();
+    f.commit("state/events.jsonl", old.as_bytes(), "first frames");
+    let denied = f.policy.forbidden_literals[0].clone();
+    let new = format!("{old}{{\"frame\":\"{denied}\"}}\n");
+    let head = f.commit("state/events.jsonl", new.as_bytes(), "append a frame");
+    let candidate = f.candidate(&head);
+    let unit = file_unit(&candidate, "state/events.jsonl");
+    // Four lines of context from the previous version, then the appended line.
+    assert_eq!(unit.line_offset, 996);
+    assert_eq!(unit.bytes.split(|v| *v == b'\n').count(), 6);
+    assert!(unit.bytes.len() < 200, "{} bytes", unit.bytes.len());
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        &candidate.units,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let lines: Vec<usize> = report
+        .findings
+        .iter()
+        .filter(|v| v.location == "file:state/events.jsonl")
+        .map(|v| v.line)
+        .collect();
+    assert_eq!(lines, vec![1001], "a line is a line of the whole file");
+}
+
+#[test]
+fn a_change_that_is_not_a_pure_append_is_scanned_in_full() {
+    let f = Fixture::new();
+    let old: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    f.commit("doc", old.as_bytes(), "document");
+    let edited = format!("changed first line\n{}line 101\n", &old["line 1\n".len()..]);
+    let head = f.commit("doc", edited.as_bytes(), "edit and append");
+    let candidate = f.candidate(&head);
+    let unit = file_unit(&candidate, "doc");
+    assert_eq!(unit.line_offset, 0);
+    assert_eq!(unit.bytes, edited.as_bytes());
+}
+
+#[test]
+fn a_literal_wrapped_across_the_old_end_is_still_found() {
+    let f = Fixture::new();
+    let parts = ["synthetic", "restricted", "identifier"];
+    let mut old: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+    old.push_str(&format!("prose ending in {}-\n", parts[0]));
+    f.commit("notes", old.as_bytes(), "notes");
+    let new = format!("{old}{}-{} continues\n", parts[1], parts[2]);
+    let head = f.commit("notes", new.as_bytes(), "append");
+    let candidate = f.candidate(&head);
+    assert!(file_unit(&candidate, "notes").line_offset > 0);
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        &candidate.units,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|v| v.location == "file:notes" && v.rule == "private-identifiers"),
+        "{:?}",
+        report
+            .findings
+            .iter()
+            .map(|v| (&v.location, v.line))
+            .collect::<Vec<_>>()
+    );
 }
