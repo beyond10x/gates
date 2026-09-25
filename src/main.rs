@@ -159,6 +159,26 @@ fn main() {
     }
 }
 
+/// Name the input a refusal is about and the flag or variable that supplies it, so the
+/// caller can close the refusal instead of routing around it. `arg` is the clap argument id;
+/// its `env` attribute is `B10X_GATES_` plus the id in upper case.
+fn named_input(
+    error: anyhow::Error,
+    what: &str,
+    path: &std::path::Path,
+    arg: &str,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{what} at {}: {error}; pass --{arg} or set B10X_GATES_{}",
+        path.display(),
+        arg.to_uppercase()
+    )
+}
+
+fn load_policy(path: &std::path::Path) -> Result<Policy> {
+    Policy::load(path).map_err(|e| named_input(e, "trusted policy", path, "policy"))
+}
+
 fn execute(args: Args) -> Result<()> {
     if matches!(args.command, Action::Gate) {
         let scanner = args
@@ -280,10 +300,10 @@ fn execute(args: Args) -> Result<()> {
     let policy = if matches!(args.command, Action::Ci { .. }) {
         match std::env::var("B10X_GATES_POLICY_JSON") {
             Ok(bytes) => Policy::parse(bytes.as_bytes())?,
-            Err(_) => Policy::load(&policy_path)?,
+            Err(_) => load_policy(&policy_path)?,
         }
     } else {
-        Policy::load(&policy_path)?
+        load_policy(&policy_path)?
     };
     let mut scanner = Gitleaks {
         binary: scanner_path.clone(),
@@ -418,7 +438,8 @@ fn execute(args: Args) -> Result<()> {
             {
                 println!("valid retained receipt reused; scanner_invocations=0");
             } else {
-                let key = evidence::read_key(&key_path)?;
+                let key = evidence::read_key(&key_path)
+                    .map_err(|e| named_input(e, "signing key", &key_path, "key"))?;
                 let receipt = evidence::check(&policy, &candidate, &key, &mut scanner)?;
                 policy::private_write(receipt_path, &serde_json::to_vec(&receipt)?)?;
                 println!("common checks passed; signed receipt retained");
