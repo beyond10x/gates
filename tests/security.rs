@@ -1814,3 +1814,32 @@ fn a_merge_group_event_for_another_repository_identity_is_refused() {
         assert!(!scratch.path().join("candidate.git").exists(), "{id}");
     }
 }
+
+#[test]
+fn missing_protected_inputs_name_the_flag_and_variable_that_supply_them() {
+    let scratch = tempfile::tempdir().unwrap();
+    let policy = scratch.path().join("absent-policy.json");
+    let refused = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+        .arg("--repo")
+        .arg(scratch.path())
+        .arg("--policy")
+        .arg(&policy)
+        .args(["verify", "--receipt"])
+        .arg(scratch.path().join("receipt.json"))
+        .env_remove("B10X_GATES_POLICY")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    for expected in [
+        "trusted policy",
+        policy.to_str().unwrap(),
+        "--policy",
+        "B10X_GATES_POLICY",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "{expected} missing from: {stderr}"
+        );
+    }
+}

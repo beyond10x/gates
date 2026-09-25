@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.9 — 2026-09-25
+
+- A missing or unreadable trusted policy or signing key now names the input, its path, and the
+  flag or variable that supplies it (`--policy` / `B10X_GATES_POLICY`, `--key` /
+  `B10X_GATES_KEY`). Before this every subcommand, `verify` included, refused with only
+  "protected file unavailable", which agents repeatedly routed around instead of closing.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.8.
+
 ## 0.1.8 — 2026-09-25
 
 - Admit a `merge_group` (`checks_requested`) event in `ci`, so the shared check can gate a GitHub
