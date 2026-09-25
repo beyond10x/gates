@@ -264,6 +264,20 @@ impl Github {
 
 /// Download candidate objects into a fresh bare repository. The event is trusted workflow input.
 pub fn ci_candidate(policy: &Policy, event_path: &Path, target: &Path) -> Result<(Git, Candidate)> {
+    ci_candidate_from(policy, event_path, target, |repository| {
+        format!("https://github.com/{repository}.git")
+    })
+}
+
+/// `ci_candidate` with the object source supplied, so a test can serve a local
+/// repository. Production always passes the GitHub URL of the trusted repository.
+#[doc(hidden)]
+pub fn ci_candidate_from(
+    policy: &Policy,
+    event_path: &Path,
+    target: &Path,
+    remote: impl Fn(&str) -> String,
+) -> Result<(Git, Candidate)> {
     let event: Value = serde_json::from_slice(&fs::read(event_path)?)
         .map_err(|_| anyhow::anyhow!("workflow event invalid"))?;
     let repository = event["repository"]["full_name"]
@@ -290,6 +304,16 @@ pub fn ci_candidate(policy: &Policy, event_path: &Path, target: &Path) -> Result
                 .to_owned(),
             format!("refs/pull/{number}/head"),
         )
+    } else if let Some(group) = event.get("merge_group") {
+        // The queue's merge commit is what lands on the protected branch, so it is
+        // fetched by its exact id and bound like a push of that commit: the scan runs
+        // from the policy baseline, and `base_sha` decides nothing, as `before` does
+        // not for a push. The `gh-readonly-queue` ref can move; the id cannot.
+        let head = group["head_sha"]
+            .as_str()
+            .context("merge group commit missing")?
+            .to_owned();
+        (head.clone(), head)
     } else {
         let head = event["after"]
             .as_str()
@@ -341,7 +365,7 @@ pub fn ci_candidate(policy: &Policy, event_path: &Path, target: &Path) -> Result
             "--quiet",
             "--no-tags",
             "--no-recurse-submodules",
-            &format!("https://github.com/{repository}.git"),
+            &remote(repository),
             &fetch_ref,
             &trusted.baseline,
         ])

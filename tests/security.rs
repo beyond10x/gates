@@ -1610,3 +1610,207 @@ fn a_dependency_update_is_admitted_as_an_author_and_nothing_else_is() {
         git(f.dir.path(), &["reset", "-q", "--hard", "HEAD~1"]);
     }
 }
+
+/// A merge queue as GitHub builds one: `main` advanced to `base`, a pull request
+/// branch forked from the baseline, and the queue's merge commit of the two on a
+/// `gh-readonly-queue` branch. `main` then moves on to a commit the queue never saw.
+struct MergeQueue {
+    f: Fixture,
+    base: String,
+    pr: String,
+    head: String,
+    later: String,
+    head_ref: String,
+}
+
+impl MergeQueue {
+    fn new() -> Self {
+        let f = Fixture::new();
+        let root = f.dir.path();
+        let base = f.commit("readme", b"main moved on\n", "main");
+        git(root, &["checkout", "-q", "-b", "feature", &f.baseline]);
+        let pr = f.commit("feature.txt", b"pull request bytes\n", "feature");
+        let head_ref = format!("refs/heads/gh-readonly-queue/main/pr-91-{base}");
+        let queue = head_ref.trim_start_matches("refs/heads/").to_owned();
+        git(root, &["checkout", "-q", "-b", &queue, &base]);
+        git(
+            root,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge pull request #91",
+                "feature",
+            ],
+        );
+        let head = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["checkout", "-q", "main"]);
+        let later = f.commit("later.txt", b"not in the queue\n", "later");
+        Self {
+            f,
+            base,
+            pr,
+            head,
+            later,
+            head_ref,
+        }
+    }
+
+    /// The `merge_group` `checks_requested` payload, in the shape GitHub delivers it.
+    fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "action": "checks_requested",
+            "merge_group": {
+                "head_sha": self.head,
+                "head_ref": self.head_ref,
+                "base_sha": self.base,
+                "base_ref": "refs/heads/main",
+                "head_commit": {
+                    "id": self.head,
+                    "tree_id": git(self.f.dir.path(), &["rev-parse", &format!("{}^{{tree}}", self.head)]),
+                    "message": "Merge pull request #91",
+                    "timestamp": "2026-09-25T10:00:00Z",
+                    "author": {"name": BOT_NAME, "email": BOT_EMAIL},
+                    "committer": {"name": BOT_NAME, "email": BOT_EMAIL}
+                }
+            },
+            "repository": {
+                "id": 123,
+                "node_id": "R_fixture",
+                "name": "repository",
+                "full_name": REPOSITORY,
+                "private": false,
+                "owner": {"login": "example", "type": "Organization"},
+                "default_branch": "main"
+            },
+            "organization": {"login": "example"},
+            "sender": {"login": "fixture-maintainer", "type": "User"}
+        })
+    }
+
+    fn ci(&self, event: &serde_json::Value, scratch: &TempDir) -> anyhow::Result<(Git, Candidate)> {
+        let path = scratch.path().join("event.json");
+        fs::write(&path, serde_json::to_vec(event).unwrap()).unwrap();
+        let remote = self.f.dir.path().display().to_string();
+        b10x_gates::delivery::ci_candidate_from(
+            &self.f.policy,
+            &path,
+            &scratch.path().join("candidate.git"),
+            |_| remote.clone(),
+        )
+    }
+}
+
+#[test]
+fn a_merge_group_event_is_admitted_and_scans_the_queued_merge_commit() {
+    let q = MergeQueue::new();
+    let scratch = tempfile::tempdir().unwrap();
+    let (_, candidate) = q
+        .ci(&q.event(), &scratch)
+        .expect("a merge_group checks_requested event must be admitted");
+    assert_eq!(candidate.binding.head, q.head);
+    assert_eq!(candidate.binding.baseline, q.f.baseline);
+    let commits: std::collections::BTreeSet<_> =
+        candidate.binding.commits.iter().cloned().collect();
+    assert_eq!(
+        commits,
+        [q.base.clone(), q.pr.clone(), q.head.clone()].into(),
+        "the scan covers baseline..head_sha, the commit that lands on main"
+    );
+    let locations: Vec<_> = candidate
+        .units
+        .iter()
+        .map(|u| u.location.as_str())
+        .collect();
+    assert!(locations.contains(&format!("commit:{}", q.head).as_str()));
+    assert!(locations.contains(&"file:feature.txt"));
+    assert!(!locations.contains(&format!("commit:{}", q.later).as_str()));
+    assert!(!locations.contains(&"file:later.txt"));
+
+    // The same policy as a push of that commit to the protected branch: the push
+    // payload for head_sha yields the identical binding, receipt reuse included.
+    let push = serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": q.base,
+        "after": q.head,
+        "repository": q.event()["repository"].clone(),
+    });
+    let scratch = tempfile::tempdir().unwrap();
+    let (_, pushed) = q
+        .ci(&push, &scratch)
+        .expect("the push path admits the same commit");
+    assert_eq!(candidate.binding, pushed.binding);
+    assert_eq!(candidate.binding, q.f.candidate(&q.head).binding);
+}
+
+#[test]
+fn a_merge_group_event_without_an_exact_head_commit_is_refused() {
+    let q = MergeQueue::new();
+    for head in [
+        serde_json::json!(q.head.to_uppercase()),
+        serde_json::json!(&q.head[..12]),
+        serde_json::json!(q.head_ref),
+        serde_json::json!("main"),
+    ] {
+        let mut event = q.event();
+        event["merge_group"]["head_sha"] = head.clone();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = q
+            .ci(&event, &scratch)
+            .err()
+            .expect("non-oid head must refuse");
+        assert_eq!(
+            error.to_string(),
+            "event must name an exact commit",
+            "{head}"
+        );
+        assert!(!scratch.path().join("candidate.git").exists(), "{head}");
+    }
+    // A missing head never falls through to the push fields of the payload.
+    let mut event = q.event();
+    event["merge_group"]
+        .as_object_mut()
+        .unwrap()
+        .remove("head_sha");
+    event["after"] = serde_json::json!(q.later);
+    let scratch = tempfile::tempdir().unwrap();
+    let error = q
+        .ci(&event, &scratch)
+        .err()
+        .expect("missing head must refuse");
+    assert_eq!(error.to_string(), "merge group commit missing");
+    assert!(!scratch.path().join("candidate.git").exists());
+    // An exact head still needs a fresh object directory.
+    let scratch = tempfile::tempdir().unwrap();
+    fs::create_dir(scratch.path().join("candidate.git")).unwrap();
+    let error = q
+        .ci(&q.event(), &scratch)
+        .err()
+        .expect("reused objects must refuse");
+    assert_eq!(error.to_string(), "CI object directory must be new");
+}
+
+#[test]
+fn a_merge_group_event_for_another_repository_identity_is_refused() {
+    let q = MergeQueue::new();
+    for id in [
+        serde_json::json!(124),
+        serde_json::json!("123"),
+        serde_json::Value::Null,
+    ] {
+        let mut event = q.event();
+        event["repository"]["id"] = id.clone();
+        let scratch = tempfile::tempdir().unwrap();
+        let error = q
+            .ci(&event, &scratch)
+            .err()
+            .expect("identity mismatch must refuse");
+        assert_eq!(
+            error.to_string(),
+            "event repository identity mismatch",
+            "{id}"
+        );
+        assert!(!scratch.path().join("candidate.git").exists(), "{id}");
+    }
+}

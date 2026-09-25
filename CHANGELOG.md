@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.8 — 2026-09-25
+
+- Admit a `merge_group` (`checks_requested`) event in `ci`, so the shared check can gate a GitHub
+  merge queue. Before this every merge-group run refused with "push commit missing". The queue's
+  merge commit, `merge_group.head_sha`, must be an exact commit id and is fetched by that id; it is
+  bound exactly as a push of that commit to the protected branch would be — scanned from the policy
+  baseline, with the same receipt lookup. `base_sha` decides nothing, as `before` does not for a
+  push. A missing head refuses and never falls back to the payload's push fields; repository
+  identity and a fresh object directory are still required.
+- A caller adds `merge_group:` to its workflow's `on:`; `common.yml` itself reads no event-specific
+  field.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.7.
+
 ## 0.1.7 — 2026-09-22
 
 - Admit a two-parent GitHub App merge whose head does not contain its base when the base's tree
