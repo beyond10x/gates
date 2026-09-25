@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.10 — 2026-09-25
+
+- A refused Git operation now names its subcommand and exit status, and an object the local store
+  lacks is named by id with the remedy, `git fetch origin`. Before this every such refusal read only
+  "Git object operation failed" — including `publish` against a remote default branch that had
+  advanced past the last fetch, whose cause was not findable from the message.
+- Git's stderr and the operation's arguments are still never echoed: both can carry candidate
+  bytes. The subcommand and object ids are the only things named.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.9.
+
 ## 0.1.9 — 2026-09-25
 
 - A missing or unreadable trusted policy or signing key now names the input, its path, and the

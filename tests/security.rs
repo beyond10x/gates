@@ -1843,3 +1843,39 @@ fn missing_protected_inputs_name_the_flag_and_variable_that_supply_them() {
         );
     }
 }
+
+#[test]
+fn a_refused_git_operation_names_it_and_a_missing_object_names_the_fetch_that_supplies_it() {
+    let f = Fixture::new();
+    // The remote advanced: a commit exists upstream that this store never fetched.
+    let upstream = tempfile::tempdir().unwrap();
+    git(
+        upstream.path(),
+        &["clone", "-q", f.dir.path().to_str().unwrap(), "."],
+    );
+    fs::write(upstream.path().join("readme"), "upstream only\n").unwrap();
+    git(upstream.path(), &["commit", "-qam", "upstream"]);
+    let unfetched = git(upstream.path(), &["rev-parse", "HEAD"]);
+    let local = Git::new(f.dir.path()).unwrap();
+    let refused = local
+        .resolve(&format!("{unfetched}^{{commit}}"))
+        .unwrap_err()
+        .to_string();
+    for expected in ["rev-parse", unfetched.as_str(), "git fetch origin"] {
+        assert!(
+            refused.contains(expected),
+            "{expected} missing from: {refused}"
+        );
+    }
+    // A refusal whose argument carries candidate bytes names the operation and echoes neither
+    // the argument nor Git's own stderr.
+    let restricted = literal();
+    let refused = local
+        .resolve(&format!("refs/tags/{restricted}"))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("rev-parse"), "{refused}");
+    assert!(!refused.contains(&restricted), "{refused}");
+    assert!(!refused.contains("fatal"), "{refused}");
+    assert!(!refused.contains("git fetch"), "{refused}");
+}

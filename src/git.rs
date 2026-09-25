@@ -142,12 +142,53 @@ impl Git {
             .args(args)
             .output()
             .context("Git plumbing failed")?;
-        ensure!(output.status.success(), "Git object operation failed");
+        if !output.status.success() {
+            return Err(self.refusal(args, output.status));
+        }
         ensure!(
             output.stdout.len() <= MAX_TOTAL,
             "Git object output exceeds limit"
         );
         Ok(output.stdout)
+    }
+
+    /// Classify a failed Git operation without echoing its stderr or arguments: both can carry
+    /// candidate bytes (ref names, paths, object content) that must not reach a diagnostic. The
+    /// subcommand is ours, and an object id is a digest, so those two are named; an object the
+    /// local store lacks is probed for directly and gets the remedy that supplies it.
+    fn refusal(&self, args: &[&str], status: std::process::ExitStatus) -> anyhow::Error {
+        let operation = args.first().copied().unwrap_or("command");
+        let operation = if operation
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'-')
+        {
+            operation
+        } else {
+            "command"
+        };
+        let missing = args
+            .iter()
+            .flat_map(|arg| arg.split(|c: char| !c.is_ascii_hexdigit()))
+            .filter(|oid| is_oid(oid))
+            .find(|oid| {
+                !self
+                    .command()
+                    .args(["cat-file", "-e", &format!("{oid}^{{object}}")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|probe| probe.success())
+            });
+        let exit = status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
+        match missing {
+            Some(oid) => anyhow::anyhow!(
+                "Git {operation} failed ({exit}): object {oid} is not in the local object store; \
+                 run `git fetch origin` and retry"
+            ),
+            None => anyhow::anyhow!("Git {operation} failed ({exit})"),
+        }
     }
 
     pub fn text(&self, args: &[&str]) -> Result<String> {
