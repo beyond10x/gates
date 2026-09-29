@@ -158,11 +158,11 @@ impl Objects {
             size <= limit,
             "blob exceeds scan limit; no receipt can be issued"
         );
+        let answer = self.ask("contents", oid)?;
+        // `ask` marks the stream in place once it has parsed a header; the body is still
+        // unread here, so the stream stays broken until it has been consumed.
         self.broken = true;
-        ensure!(
-            self.ask("contents", oid)? == (kind, size),
-            "Git cat-file answered out of order"
-        );
+        ensure!(answer == (kind, size), "Git cat-file answered out of order");
         let mut bytes = vec![0; size];
         self.output
             .read_exact(&mut bytes)

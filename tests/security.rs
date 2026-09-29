@@ -2284,3 +2284,209 @@ fn a_blob_missing_from_the_object_store_refuses_the_candidate() {
         );
     }
 }
+
+// --- independent review: ancestor reuse and the batched object stream ---
+
+/// The covered set is what Git shows for the ancestor's head now, never what a receipt
+/// claims: a genuinely signed receipt whose range reaches past its own head must not
+/// exempt the commits it overclaims.
+#[test]
+fn review_a_signed_ancestor_receipt_claiming_more_commits_than_git_shows_is_not_trusted() {
+    let c = chain();
+    let mut receipt = c.receipt.clone();
+    receipt.payload.binding.commits.push(c.head.clone());
+    resign(&mut receipt, &c.f.key);
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+/// A forbidden term on a merged side branch the ancestor receipt does not cover refuses
+/// the receipt, and the refusal comes from the narrowed scan.
+#[test]
+fn review_a_forbidden_term_on_an_uncovered_merged_side_branch_refuses_signing() {
+    let f = Fixture::new();
+    let denied = f.policy.forbidden_literals[0].clone();
+    let covered = f.commit("readme", b"covered change\n", "covered");
+    let receipt = evidence::check(
+        &f.policy,
+        &f.candidate(&covered),
+        &f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    git(f.dir.path(), &["checkout", "-qb", "side"]);
+    let side = f.commit("side/one", format!("{denied}\n").as_bytes(), "side");
+    git(f.dir.path(), &["checkout", "-q", "main"]);
+    f.commit("mainline", b"mainline change\n", "mainline");
+    git(
+        f.dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+    );
+    let merge = git(f.dir.path(), &["rev-parse", "HEAD"]);
+    let candidate = f.candidate(&merge);
+    let mut scanner = Recording::default();
+    let refused = evidence::check_reusing(
+        &f.policy,
+        &Git::new(f.dir.path()).unwrap(),
+        &candidate,
+        &[receipt],
+        &f.key,
+        &mut scanner,
+    )
+    .err()
+    .expect("an uncovered forbidden term must refuse the receipt")
+    .to_string();
+    assert!(refused.contains("common checks failed"), "{refused}");
+    assert_eq!(
+        scanner.handed,
+        vec![locations_except(&candidate, &[&covered])]
+    );
+    assert!(scanner.handed[0].contains(&format!("commit:{side}")));
+}
+
+/// A forbidden term in an annotated tag refuses the receipt when every commit is covered
+/// by a retained receipt for the exact head without that tag.
+#[test]
+fn review_a_forbidden_tag_message_refuses_signing_when_every_commit_is_covered() {
+    let c = chain();
+    let denied = c.f.policy.forbidden_literals[0].clone();
+    let untagged = evidence::check(
+        &c.f.policy,
+        &c.f.candidate(&c.head),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    git(c.f.dir.path(), &["tag", "-a", "v1", "-m", &denied]);
+    let git_store = Git::new(c.f.dir.path()).unwrap();
+    let candidate = git_store
+        .candidate(&c.f.policy, REPOSITORY, &c.head, &["v1".to_owned()])
+        .unwrap();
+    let mut scanner = Recording::default();
+    let refused = evidence::check_reusing(
+        &c.f.policy,
+        &git_store,
+        &candidate,
+        &[untagged],
+        &c.f.key,
+        &mut scanner,
+    )
+    .err()
+    .expect("a forbidden tag message must refuse the receipt")
+    .to_string();
+    assert!(refused.contains("common checks failed"), "{refused}");
+    assert_eq!(scanner.handed.len(), 1);
+    assert!(scanner.handed[0].iter().all(|l| l.starts_with("tag")));
+}
+
+/// `check` must not report reuse of an exact-head receipt planted in the hook directory
+/// when it was signed under another policy: it scans, and here the scanner is absent.
+#[test]
+fn review_check_scans_despite_a_stale_exact_receipt_planted_in_the_hook_directory() {
+    let c = chain();
+    let mut stale_policy = c.f.policy.clone();
+    stale_policy.nonce.push('x');
+    let stale = evidence::check(
+        &stale_policy,
+        &c.f.candidate(&c.head),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let policy_path = private.path().join("policy.json");
+    let key_path = private.path().join("key");
+    b10x_gates::policy::private_write(&policy_path, &serde_json::to_vec(&c.f.policy).unwrap())
+        .unwrap();
+    b10x_gates::policy::private_write(&key_path, hex::encode(c.f.key.to_bytes()).as_bytes())
+        .unwrap();
+    b10x_gates::policy::private_write(
+        &c.f.dir
+            .path()
+            .join(".git/b10x-gates-hooks/planted.receipt.json"),
+        &serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    let receipt = private.path().join("receipt.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+        .arg("--repo")
+        .arg(c.f.dir.path())
+        .args(["--repository", REPOSITORY, "--policy"])
+        .arg(&policy_path)
+        .arg("--key")
+        .arg(&key_path)
+        .arg("--gitleaks")
+        .arg(private.path().join("missing-scanner"))
+        .args(["check", "--head", &c.head, "--receipt"])
+        .arg(&receipt)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() && !stdout.contains("scanner_invocations=0"),
+        "a stale planted receipt was reused: {stdout}"
+    );
+    assert!(!receipt.exists(), "a receipt was written");
+}
+
+/// Blob bytes that mimic the batch protocol, carry no final newline, are empty, carry NUL
+/// or are a symlink target reach the scanner exactly, as do their predecessors.
+#[test]
+fn review_blob_bytes_that_look_like_batch_protocol_survive_the_stream_exactly() {
+    let f = Fixture::new();
+    let root = f.dir.path();
+    fs::write(root.join("target"), b"hello").unwrap();
+    let target = git(root, &["hash-object", "-w", "target"]);
+    let first: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a-decoy",
+            format!("{target} blob 5\nhello\n{target} missing\n\n\n{target} blob 99999999\n")
+                .into_bytes(),
+        ),
+        ("b-empty", Vec::new()),
+        ("c-no-newline", b"tail without newline".to_vec()),
+        ("d-nul", b"\0\n\0".to_vec()),
+        ("target", b"hello".to_vec()),
+    ];
+    for (path, bytes) in &first {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    std::os::unix::fs::symlink("a-decoy", root.join("e-link")).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "protocol-shaped content"]);
+    let second: Vec<(&str, Vec<u8>)> = first
+        .iter()
+        .map(|(path, bytes)| {
+            let mut edited = bytes.clone();
+            edited.extend_from_slice(format!("\n{target} blob 1\n").as_bytes());
+            (*path, edited)
+        })
+        .collect();
+    for (path, bytes) in &second {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "edit every file"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let candidate = f.candidate(&head);
+    let found = |path: &str| -> Vec<&Unit> {
+        candidate
+            .units
+            .iter()
+            .filter(|u| u.location == format!("file:{path}"))
+            .collect()
+    };
+    for ((path, before), (_, after)) in first.iter().zip(&second) {
+        let units = found(path);
+        assert_eq!(units.len(), 2, "{path}");
+        assert_eq!(&units[0].bytes, before, "{path} first version");
+        assert_eq!(&units[1].bytes, after, "{path} second version");
+        assert_eq!(
+            units[1].inherited.as_deref(),
+            Some(before.as_slice()),
+            "{path} predecessor"
+        );
+    }
+    let link = found("e-link");
+    assert_eq!(link.len(), 1);
+    assert_eq!(link[0].bytes, b"a-decoy");
+}
