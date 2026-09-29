@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.11 — 2026-09-29
 
 - `check` and the pre-push hook scan only the commits no verified retained receipt covers. A
   retained receipt for an ancestor of the candidate head is reused only when it verifies in full
@@ -17,6 +17,8 @@
 - The receipt format and its statement do not change: it states that the common checks passed
   for every commit from the baseline to its head, and a receipt signed after a partial scan is
   byte-identical to one signed after a full scan. `verify` and `ci` are unchanged.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.10, so the first check after upgrading scans in full once.
 
 ## 0.1.10 — 2026-09-25
 
