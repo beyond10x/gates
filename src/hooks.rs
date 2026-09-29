@@ -58,9 +58,10 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
     config.key = fs::canonicalize(&config.key)?;
     config.scanner = fs::canonicalize(&config.scanner)?;
     config.installed_version = crate::VERSION.into();
-    let common =
-        PathBuf::from(git.text(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
-    let installed = common.join("b10x-gates-hooks");
+    let installed = directory(&git)?;
+    let common = installed
+        .parent()
+        .context("Git common directory unavailable")?;
     let mut originals = vec![common.join("hooks")];
     if let Ok(current) = git.text(&["config", "--get", "core.hooksPath"]) {
         let current = if Path::new(&current).is_absolute() {
@@ -150,6 +151,13 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
         installed.to_str().context("hook path invalid")?,
     ])?;
     Ok(())
+}
+
+/// The installed hook directory, where the pre-push hook retains its receipts.
+pub fn directory(git: &Git) -> Result<PathBuf> {
+    let common =
+        PathBuf::from(git.text(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
+    Ok(common.join("b10x-gates-hooks"))
 }
 
 pub fn invoked() -> Option<String> {
@@ -277,16 +285,23 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                     "{}.receipt.json",
                     digest(&serde_json::to_vec(&candidate.binding)?)
                 ));
-                let previous = fs::read(&retained)
-                    .ok()
-                    .and_then(|v| serde_json::from_slice::<evidence::Receipt>(&v).ok());
-                if previous
-                    .as_ref()
-                    .is_none_or(|r| evidence::verify(&policy, &candidate, r).is_err())
+                // Every receipt this hook retained is evidence to reuse: one for this exact
+                // head, or one for an ancestor that leaves only the newer commits to scan.
+                let previous = evidence::retained_in(directory);
+                if !previous
+                    .iter()
+                    .any(|r| evidence::verify(&policy, &candidate, r).is_ok())
                 {
                     let key = evidence::read_key(&config.key)?;
-                    let receipt = evidence::check(&policy, &candidate, &key, &mut scanner)?;
-                    policy::private_write(&retained, &serde_json::to_vec(&receipt)?)?;
+                    let checked = evidence::check_reusing(
+                        &policy,
+                        &git,
+                        &candidate,
+                        &previous,
+                        &key,
+                        &mut scanner,
+                    )?;
+                    policy::private_write(&retained, &serde_json::to_vec(&checked.receipt)?)?;
                 }
                 // Destination ref names are also untrusted data, including branch names.
                 units.push(Unit {

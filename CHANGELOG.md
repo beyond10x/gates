@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.11 — 2026-09-29
+
+- `check` and the pre-push hook scan only the commits no verified retained receipt covers. A
+  retained receipt for an ancestor of the candidate head is reused only when it verifies in full
+  against the candidate Gates builds for that ancestor from local Git objects: trusted signer,
+  repository, baseline, exact commit range and objects, policy digest, Gates and scanner version.
+  Of those, the one covering the most commits is chosen; every other commit, merged side
+  branches included, and every tag is scanned, each commit against its own parent as before. Any
+  receipt that does not verify leaves the scan whole.
+- `check` also considers the receipts the pre-push hook retained in the Git common directory's
+  `b10x-gates-hooks`, and writes a reused exact-head receipt to `--receipt`.
+- Object sizes and blob bytes are read through one `git cat-file --batch-command` per candidate
+  instead of two `git` processes per blob, with the same size limits and refusals; an object
+  missing from the local store still refuses and names the fetch that supplies it.
+- The receipt format and its statement do not change: it states that the common checks passed
+  for every commit from the baseline to its head, and a receipt signed after a partial scan is
+  byte-identical to one signed after a full scan. `verify` and `ci` are unchanged.
+- Change no policy field or receipt format; the version increment alone invalidates receipts
+  retained under 0.1.10, so the first check after upgrading scans in full once.
+
 ## 0.1.10 — 2026-09-25
 
 - A refused Git operation now names its subcommand and exit status, and an object the local store

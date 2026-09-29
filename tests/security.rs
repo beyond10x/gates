@@ -1879,3 +1879,614 @@ fn a_refused_git_operation_names_it_and_a_missing_object_names_the_fetch_that_su
     assert!(!refused.contains("fatal"), "{refused}");
     assert!(!refused.contains("git fetch"), "{refused}");
 }
+
+// --- ancestor receipt reuse: scan only what no verified retained receipt covers ---
+
+/// Records the locations of every unit handed to the scanner, one entry per invocation.
+#[derive(Default)]
+struct Recording {
+    handed: Vec<Vec<String>>,
+}
+impl SecretScanner for Recording {
+    fn scan(&mut self, units: &[Unit]) -> anyhow::Result<Vec<SecretFinding>> {
+        self.handed
+            .push(units.iter().map(|u| u.location.clone()).collect());
+        Ok(vec![])
+    }
+}
+
+/// The candidate's unit locations, less those of the named commits. A commit's units end
+/// with its own `commit:` unit, so the groups are recovered from the candidate order.
+fn locations_except(candidate: &Candidate, covered: &[&str]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut group = Vec::new();
+    for unit in &candidate.units {
+        group.push(unit.location.clone());
+        if let Some(commit) = unit.location.strip_prefix("commit:") {
+            if !covered.contains(&commit) {
+                kept.append(&mut group);
+            }
+            group.clear();
+        }
+    }
+    kept.append(&mut group);
+    kept
+}
+
+/// A baseline, two commits and a receipt for the second; the candidate is a third.
+struct Chain {
+    f: Fixture,
+    first: String,
+    parent: String,
+    head: String,
+    receipt: Receipt,
+}
+fn chain() -> Chain {
+    let f = Fixture::new();
+    let first = f.commit("readme", b"first change\n", "first");
+    let parent = f.commit("notes", b"second change\n", "second");
+    let receipt = evidence::check(
+        &f.policy,
+        &f.candidate(&parent),
+        &f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let head = f.commit("readme", b"third change\n", "third");
+    Chain {
+        f,
+        first,
+        parent,
+        head,
+        receipt,
+    }
+}
+
+fn check_reusing(
+    policy: &Policy,
+    f: &Fixture,
+    candidate: &Candidate,
+    retained: &[Receipt],
+) -> (evidence::Checked, Recording) {
+    let git = Git::new(f.dir.path()).unwrap();
+    let mut scanner = Recording::default();
+    let checked =
+        evidence::check_reusing(policy, &git, candidate, retained, &f.key, &mut scanner).unwrap();
+    // Whatever was reused, the signed statement is the full one and verifies as such.
+    evidence::verify(policy, candidate, &checked.receipt).unwrap();
+    (checked, scanner)
+}
+
+/// The retained receipt must not be reused: every unit since the baseline is scanned.
+fn assert_full_scan(policy: &Policy, f: &Fixture, head: &str, retained: Receipt) {
+    let candidate = Git::new(f.dir.path())
+        .unwrap()
+        .candidate(policy, REPOSITORY, head, &[])
+        .unwrap();
+    let (checked, scanner) = check_reusing(policy, f, &candidate, &[retained]);
+    assert_eq!(checked.reused, None);
+    assert_eq!(
+        scanner.handed,
+        vec![locations_except(&candidate, &[])],
+        "a receipt that does not verify must not narrow the scan"
+    );
+}
+
+#[test]
+fn a_verified_parent_receipt_limits_the_scan_to_the_new_commit() {
+    let c = chain();
+    let candidate = c.f.candidate(&c.head);
+    let (checked, scanner) = check_reusing(
+        &c.f.policy,
+        &c.f,
+        &candidate,
+        std::slice::from_ref(&c.receipt),
+    );
+    assert_eq!(
+        scanner.handed,
+        vec![vec![
+            "filename:readme".to_owned(),
+            "file:readme".to_owned(),
+            format!("commit:{}", c.head),
+        ]]
+    );
+    assert_eq!(checked.reused.as_deref(), Some(c.parent.as_str()));
+    assert_eq!(checked.scanned_commits, 1);
+    // The receipt states exactly what a full scan's receipt states.
+    let full = evidence::check(
+        &c.f.policy,
+        &candidate,
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&checked.receipt).unwrap(),
+        serde_json::to_value(&full).unwrap()
+    );
+}
+
+#[test]
+fn the_verified_receipt_leaving_fewest_commits_is_chosen() {
+    let c = chain();
+    let older = evidence::check(
+        &c.f.policy,
+        &c.f.candidate(&c.first),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let candidate = c.f.candidate(&c.head);
+    let (checked, scanner) =
+        check_reusing(&c.f.policy, &c.f, &candidate, &[older, c.receipt.clone()]);
+    assert_eq!(checked.reused.as_deref(), Some(c.parent.as_str()));
+    assert_eq!(
+        scanner.handed,
+        vec![locations_except(&candidate, &[&c.first, &c.parent])]
+    );
+}
+
+#[test]
+fn an_exact_head_receipt_is_reused_with_zero_scanner_invocations() {
+    let c = chain();
+    let candidate = c.f.candidate(&c.parent);
+    struct Unavailable;
+    impl SecretScanner for Unavailable {
+        fn scan(&mut self, _: &[Unit]) -> anyhow::Result<Vec<SecretFinding>> {
+            panic!("an exact verified receipt invoked a scanner")
+        }
+    }
+    let git = Git::new(c.f.dir.path()).unwrap();
+    let checked = evidence::check_reusing(
+        &c.f.policy,
+        &git,
+        &candidate,
+        std::slice::from_ref(&c.receipt),
+        &c.f.key,
+        &mut Unavailable,
+    )
+    .unwrap();
+    assert_eq!(checked.scanned_commits, 0);
+    assert_eq!(checked.reused.as_deref(), Some(c.parent.as_str()));
+    assert_eq!(checked.receipt.signature, c.receipt.signature);
+}
+
+#[test]
+fn an_ancestor_receipt_with_a_bad_signature_causes_a_full_scan() {
+    let c = chain();
+    let mut receipt = c.receipt.clone();
+    let first = if receipt.signature.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    receipt.signature.replace_range(..1, first);
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+#[test]
+fn an_ancestor_receipt_under_another_policy_digest_causes_a_full_scan() {
+    let c = chain();
+    let mut other = c.f.policy.clone();
+    other.nonce.push('x');
+    let receipt = evidence::check(
+        &other,
+        &c.f.candidate(&c.parent),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_ne!(
+        receipt.payload.private_policy_digest,
+        c.receipt.payload.private_policy_digest
+    );
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+#[test]
+fn an_ancestor_receipt_from_another_scanner_version_causes_a_full_scan() {
+    let c = chain();
+    let mut receipt = c.receipt.clone();
+    receipt.payload.scanner_version = "0.0.0".into();
+    resign(&mut receipt, &c.f.key);
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+#[test]
+fn an_ancestor_receipt_for_another_repository_causes_a_full_scan() {
+    let c = chain();
+    // One signer enrolled for two repositories that share this history and baseline: only
+    // the repository the receipt names differs.
+    let other = "example/other";
+    let mut policy = c.f.policy.clone();
+    policy.repositories.insert(
+        other.into(),
+        Repository {
+            id: "456".into(),
+            baseline: c.f.baseline.clone(),
+        },
+    );
+    for signer in policy.signers.values_mut() {
+        signer.repositories.push(other.into());
+    }
+    let git = Git::new(c.f.dir.path()).unwrap();
+    let foreign = git.candidate(&policy, other, &c.parent, &[]).unwrap();
+    let receipt =
+        evidence::check(&policy, &foreign, &c.f.key, &mut CountScanner::default()).unwrap();
+    assert_full_scan(&policy, &c.f, &c.head, receipt);
+}
+
+#[test]
+fn a_receipt_for_a_head_that_is_not_an_ancestor_causes_a_full_scan() {
+    let c = chain();
+    // A sibling of the parent: it descends from the baseline and carries a valid receipt,
+    // but the candidate does not contain it.
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}>");
+    let sibling = identity_commit(&c.f, &[&c.first], &bot, &bot);
+    let receipt = evidence::check(
+        &c.f.policy,
+        &c.f.candidate(&sibling),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+#[test]
+fn a_merged_side_branch_the_ancestor_receipt_does_not_cover_is_scanned() {
+    let f = Fixture::new();
+    let covered = f.commit("readme", b"covered change\n", "covered");
+    let receipt = evidence::check(
+        &f.policy,
+        &f.candidate(&covered),
+        &f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    git(f.dir.path(), &["checkout", "-qb", "side"]);
+    let side_one = f.commit("side/one", b"side one\n", "side one");
+    let side_two = f.commit("side/two", b"side two\n", "side two");
+    git(f.dir.path(), &["checkout", "-q", "main"]);
+    let mainline = f.commit("mainline", b"mainline change\n", "mainline");
+    git(
+        f.dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+    );
+    let merge = git(f.dir.path(), &["rev-parse", "HEAD"]);
+    let candidate = f.candidate(&merge);
+    let (checked, scanner) = check_reusing(&f.policy, &f, &candidate, &[receipt]);
+    assert_eq!(checked.reused.as_deref(), Some(covered.as_str()));
+    assert_eq!(checked.scanned_commits, 4);
+    let expected = locations_except(&candidate, &[&covered]);
+    for commit in [&side_one, &side_two, &mainline, &merge] {
+        assert!(expected.contains(&format!("commit:{commit}")));
+    }
+    assert!(!expected.contains(&format!("commit:{covered}")));
+    assert_eq!(scanner.handed, vec![expected]);
+}
+
+#[test]
+fn tags_are_scanned_in_full_when_an_ancestor_receipt_is_reused() {
+    let c = chain();
+    git(c.f.dir.path(), &["tag", "-a", "v1", "-m", "release one"]);
+    let candidate = Git::new(c.f.dir.path())
+        .unwrap()
+        .candidate(&c.f.policy, REPOSITORY, &c.head, &["v1".to_owned()])
+        .unwrap();
+    let (checked, scanner) = check_reusing(
+        &c.f.policy,
+        &c.f,
+        &candidate,
+        std::slice::from_ref(&c.receipt),
+    );
+    assert_eq!(checked.reused.as_deref(), Some(c.parent.as_str()));
+    let handed = &scanner.handed[0];
+    assert_eq!(
+        handed,
+        &locations_except(&candidate, &[&c.first, &c.parent])
+    );
+    assert!(handed.iter().any(|l| l == "tag-ref"));
+    assert!(handed.iter().any(|l| l.starts_with("tag:")));
+    // A receipt for the exact head that lacks the tag covers every commit: only the tag is
+    // left to scan.
+    let untagged = evidence::check(
+        &c.f.policy,
+        &c.f.candidate(&c.head),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let (checked, scanner) = check_reusing(&c.f.policy, &c.f, &candidate, &[untagged]);
+    assert_eq!(checked.scanned_commits, 0);
+    assert_eq!(
+        scanner.handed,
+        vec![locations_except(
+            &candidate,
+            &[&c.first, &c.parent, &c.head]
+        )]
+    );
+    assert!(scanner.handed[0].iter().all(|l| l.starts_with("tag")));
+}
+
+#[test]
+fn check_reuses_a_receipt_the_pre_push_hook_retained_for_an_ancestor() {
+    let c = chain();
+    let private = tempfile::tempdir().unwrap();
+    let policy_path = private.path().join("policy.json");
+    let key_path = private.path().join("key");
+    b10x_gates::policy::private_write(&policy_path, &serde_json::to_vec(&c.f.policy).unwrap())
+        .unwrap();
+    b10x_gates::policy::private_write(&key_path, hex::encode(c.f.key.to_bytes()).as_bytes())
+        .unwrap();
+    let hooks = c.f.dir.path().join(".git/b10x-gates-hooks");
+    b10x_gates::policy::private_write(
+        &hooks.join("retained.receipt.json"),
+        &serde_json::to_vec(&c.receipt).unwrap(),
+    )
+    .unwrap();
+    let scanner = std::env::var_os("B10X_GATES_GITLEAKS").unwrap();
+    let receipt = private.path().join("receipt.json");
+    let run = |command: &str, scanner: &std::ffi::OsStr| {
+        let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+            .arg("--repo")
+            .arg(c.f.dir.path())
+            .args(["--repository", REPOSITORY, "--policy"])
+            .arg(&policy_path)
+            .arg("--key")
+            .arg(&key_path)
+            .arg("--gitleaks")
+            .arg(scanner)
+            .args([command, "--receipt"])
+            .arg(&receipt)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let checked = run("check", &scanner);
+    assert!(checked.contains("scanned_commits=1"), "{checked}");
+    let missing = private.path().join("missing-scanner");
+    let verified = run("verify", missing.as_os_str());
+    assert!(verified.contains("scanner_invocations=0"), "{verified}");
+    // The receipt just written is now itself retained evidence for the exact head.
+    let again = run("check", missing.as_os_str());
+    assert!(again.contains("scanner_invocations=0"), "{again}");
+}
+
+#[test]
+fn a_blob_missing_from_the_object_store_refuses_the_candidate() {
+    let f = Fixture::new();
+    let head = f.commit("readme", b"a blob that will go missing\n", "missing");
+    let blob = git(f.dir.path(), &["rev-parse", &format!("{head}:readme")]);
+    fs::remove_file(
+        f.dir
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    let refused = Git::new(f.dir.path())
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &head, &[])
+        .err()
+        .expect("a missing blob must refuse")
+        .to_string();
+    for expected in [blob.as_str(), "local object store", "git fetch origin"] {
+        assert!(
+            refused.contains(expected),
+            "{expected} missing from: {refused}"
+        );
+    }
+}
+
+// --- independent review: ancestor reuse and the batched object stream ---
+
+/// The covered set is what Git shows for the ancestor's head now, never what a receipt
+/// claims: a genuinely signed receipt whose range reaches past its own head must not
+/// exempt the commits it overclaims.
+#[test]
+fn review_a_signed_ancestor_receipt_claiming_more_commits_than_git_shows_is_not_trusted() {
+    let c = chain();
+    let mut receipt = c.receipt.clone();
+    receipt.payload.binding.commits.push(c.head.clone());
+    resign(&mut receipt, &c.f.key);
+    assert_full_scan(&c.f.policy, &c.f, &c.head, receipt);
+}
+
+/// A forbidden term on a merged side branch the ancestor receipt does not cover refuses
+/// the receipt, and the refusal comes from the narrowed scan.
+#[test]
+fn review_a_forbidden_term_on_an_uncovered_merged_side_branch_refuses_signing() {
+    let f = Fixture::new();
+    let denied = f.policy.forbidden_literals[0].clone();
+    let covered = f.commit("readme", b"covered change\n", "covered");
+    let receipt = evidence::check(
+        &f.policy,
+        &f.candidate(&covered),
+        &f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    git(f.dir.path(), &["checkout", "-qb", "side"]);
+    let side = f.commit("side/one", format!("{denied}\n").as_bytes(), "side");
+    git(f.dir.path(), &["checkout", "-q", "main"]);
+    f.commit("mainline", b"mainline change\n", "mainline");
+    git(
+        f.dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+    );
+    let merge = git(f.dir.path(), &["rev-parse", "HEAD"]);
+    let candidate = f.candidate(&merge);
+    let mut scanner = Recording::default();
+    let refused = evidence::check_reusing(
+        &f.policy,
+        &Git::new(f.dir.path()).unwrap(),
+        &candidate,
+        &[receipt],
+        &f.key,
+        &mut scanner,
+    )
+    .err()
+    .expect("an uncovered forbidden term must refuse the receipt")
+    .to_string();
+    assert!(refused.contains("common checks failed"), "{refused}");
+    assert_eq!(
+        scanner.handed,
+        vec![locations_except(&candidate, &[&covered])]
+    );
+    assert!(scanner.handed[0].contains(&format!("commit:{side}")));
+}
+
+/// A forbidden term in an annotated tag refuses the receipt when every commit is covered
+/// by a retained receipt for the exact head without that tag.
+#[test]
+fn review_a_forbidden_tag_message_refuses_signing_when_every_commit_is_covered() {
+    let c = chain();
+    let denied = c.f.policy.forbidden_literals[0].clone();
+    let untagged = evidence::check(
+        &c.f.policy,
+        &c.f.candidate(&c.head),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    git(c.f.dir.path(), &["tag", "-a", "v1", "-m", &denied]);
+    let git_store = Git::new(c.f.dir.path()).unwrap();
+    let candidate = git_store
+        .candidate(&c.f.policy, REPOSITORY, &c.head, &["v1".to_owned()])
+        .unwrap();
+    let mut scanner = Recording::default();
+    let refused = evidence::check_reusing(
+        &c.f.policy,
+        &git_store,
+        &candidate,
+        &[untagged],
+        &c.f.key,
+        &mut scanner,
+    )
+    .err()
+    .expect("a forbidden tag message must refuse the receipt")
+    .to_string();
+    assert!(refused.contains("common checks failed"), "{refused}");
+    assert_eq!(scanner.handed.len(), 1);
+    assert!(scanner.handed[0].iter().all(|l| l.starts_with("tag")));
+}
+
+/// `check` must not report reuse of an exact-head receipt planted in the hook directory
+/// when it was signed under another policy: it scans, and here the scanner is absent.
+#[test]
+fn review_check_scans_despite_a_stale_exact_receipt_planted_in_the_hook_directory() {
+    let c = chain();
+    let mut stale_policy = c.f.policy.clone();
+    stale_policy.nonce.push('x');
+    let stale = evidence::check(
+        &stale_policy,
+        &c.f.candidate(&c.head),
+        &c.f.key,
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let policy_path = private.path().join("policy.json");
+    let key_path = private.path().join("key");
+    b10x_gates::policy::private_write(&policy_path, &serde_json::to_vec(&c.f.policy).unwrap())
+        .unwrap();
+    b10x_gates::policy::private_write(&key_path, hex::encode(c.f.key.to_bytes()).as_bytes())
+        .unwrap();
+    b10x_gates::policy::private_write(
+        &c.f.dir
+            .path()
+            .join(".git/b10x-gates-hooks/planted.receipt.json"),
+        &serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    let receipt = private.path().join("receipt.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+        .arg("--repo")
+        .arg(c.f.dir.path())
+        .args(["--repository", REPOSITORY, "--policy"])
+        .arg(&policy_path)
+        .arg("--key")
+        .arg(&key_path)
+        .arg("--gitleaks")
+        .arg(private.path().join("missing-scanner"))
+        .args(["check", "--head", &c.head, "--receipt"])
+        .arg(&receipt)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() && !stdout.contains("scanner_invocations=0"),
+        "a stale planted receipt was reused: {stdout}"
+    );
+    assert!(!receipt.exists(), "a receipt was written");
+}
+
+/// Blob bytes that mimic the batch protocol, carry no final newline, are empty, carry NUL
+/// or are a symlink target reach the scanner exactly, as do their predecessors.
+#[test]
+fn review_blob_bytes_that_look_like_batch_protocol_survive_the_stream_exactly() {
+    let f = Fixture::new();
+    let root = f.dir.path();
+    fs::write(root.join("target"), b"hello").unwrap();
+    let target = git(root, &["hash-object", "-w", "target"]);
+    let first: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a-decoy",
+            format!("{target} blob 5\nhello\n{target} missing\n\n\n{target} blob 99999999\n")
+                .into_bytes(),
+        ),
+        ("b-empty", Vec::new()),
+        ("c-no-newline", b"tail without newline".to_vec()),
+        ("d-nul", b"\0\n\0".to_vec()),
+        ("target", b"hello".to_vec()),
+    ];
+    for (path, bytes) in &first {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    std::os::unix::fs::symlink("a-decoy", root.join("e-link")).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "protocol-shaped content"]);
+    let second: Vec<(&str, Vec<u8>)> = first
+        .iter()
+        .map(|(path, bytes)| {
+            let mut edited = bytes.clone();
+            edited.extend_from_slice(format!("\n{target} blob 1\n").as_bytes());
+            (*path, edited)
+        })
+        .collect();
+    for (path, bytes) in &second {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "edit every file"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let candidate = f.candidate(&head);
+    let found = |path: &str| -> Vec<&Unit> {
+        candidate
+            .units
+            .iter()
+            .filter(|u| u.location == format!("file:{path}"))
+            .collect()
+    };
+    for ((path, before), (_, after)) in first.iter().zip(&second) {
+        let units = found(path);
+        assert_eq!(units.len(), 2, "{path}");
+        assert_eq!(&units[0].bytes, before, "{path} first version");
+        assert_eq!(&units[1].bytes, after, "{path} second version");
+        assert_eq!(
+            units[1].inherited.as_deref(),
+            Some(before.as_slice()),
+            "{path} predecessor"
+        );
+    }
+    let link = found("e-link");
+    assert_eq!(link.len(), 1);
+    assert_eq!(link[0].bytes, b"a-decoy");
+}

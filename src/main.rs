@@ -429,20 +429,52 @@ fn execute(args: Args) -> Result<()> {
     let candidate = git.candidate(&policy, &repository, &head, tags)?;
     match &args.command {
         Action::Check { .. } => {
-            let retained = fs::read(receipt_path)
+            // The receipt at `--receipt` first, then every receipt the pre-push hook retained.
+            let mut retained: Vec<Receipt> = fs::read(receipt_path)
                 .ok()
-                .and_then(|v| serde_json::from_slice::<Receipt>(&v).ok());
-            if retained
-                .as_ref()
-                .is_some_and(|r| evidence::verify(&policy, &candidate, r).is_ok())
+                .and_then(|v| serde_json::from_slice::<Receipt>(&v).ok())
+                .into_iter()
+                .collect();
+            let held = !retained.is_empty();
+            retained.extend(evidence::retained_in(&hooks::directory(&git)?));
+            match retained
+                .iter()
+                .position(|r| evidence::verify(&policy, &candidate, r).is_ok())
             {
-                println!("valid retained receipt reused; scanner_invocations=0");
-            } else {
-                let key = evidence::read_key(&key_path)
-                    .map_err(|e| named_input(e, "signing key", &key_path, "key"))?;
-                let receipt = evidence::check(&policy, &candidate, &key, &mut scanner)?;
-                policy::private_write(receipt_path, &serde_json::to_vec(&receipt)?)?;
-                println!("common checks passed; signed receipt retained");
+                Some(found) => {
+                    if !(held && found == 0) {
+                        policy::private_write(
+                            receipt_path,
+                            &serde_json::to_vec(&retained[found])?,
+                        )?;
+                    }
+                    println!("valid retained receipt reused; scanner_invocations=0");
+                }
+                None => {
+                    let key = evidence::read_key(&key_path)
+                        .map_err(|e| named_input(e, "signing key", &key_path, "key"))?;
+                    let checked = evidence::check_reusing(
+                        &policy,
+                        &git,
+                        &candidate,
+                        &retained,
+                        &key,
+                        &mut scanner,
+                    )?;
+                    policy::private_write(receipt_path, &serde_json::to_vec(&checked.receipt)?)?;
+                    match &checked.reused {
+                        Some(ancestor) => println!(
+                            "common checks passed; receipt for ancestor {ancestor} reused; \
+                             scanned_commits={} of {}; signed receipt retained",
+                            checked.scanned_commits,
+                            candidate.binding.commits.len()
+                        ),
+                        None => println!(
+                            "common checks passed; scanned_commits={}; signed receipt retained",
+                            checked.scanned_commits
+                        ),
+                    }
+                }
             }
         }
         Action::Verify { .. } | Action::Publish { .. } => {
