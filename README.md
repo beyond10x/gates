@@ -16,7 +16,7 @@ b10x-gates --repository beyond10x/eventlog verify --receipt "$HOME/.local/state/
 b10x-gates --repository beyond10x/eventlog publish --receipt "$HOME/.local/state/b10x/gates/candidate.json" --remote-ref refs/heads/fix-example
 ```
 
-`check` retains a signed receipt and reuses it on retry when it still matches. `verify` invokes no scanners. `publish` verifies the retained receipt, optionally pushes its exact commit, then creates a bot-owned check containing only signed successful evidence. A failed network publication retains the receipt. An enrolled signer is a trusted local runner: its signature establishes origin and integrity, not hardware attestation. Revoking a signer or changing its repository grants invalidates existing evidence.
+`check` retains a signed receipt and reuses it on retry when it still matches. When a retained receipt for an ancestor of the head, from `--receipt` or the pre-push hook, verifies in full, only the commits it does not cover are scanned; the new receipt still states that every commit since the baseline passed. `verify` invokes no scanners. `publish` verifies the retained receipt, optionally pushes its exact commit, then creates a bot-owned check containing only signed successful evidence. A failed network publication retains the receipt. An enrolled signer is a trusted local runner: its signature establishes origin and integrity, not hardware attestation. Revoking a signer or changing its repository grants invalidates existing evidence.
 
 `install` coordinates `pre-commit`, `commit-msg` and `pre-push` with existing hooks, including worktree hooks. Existing hooks run first, then the gates inspect their final index/message. Reinstallation preserves the chain. One copy of the binary is written per repository and the thirteen hook names are hardlinks to it, so an installation costs one binary rather than thirteen. The link holds that exact inode, which is what pins a hook against a binary changing under a commit in flight; the cost is that `cargo install --force` does not upgrade installed hooks, and `install` must be re-run in every repository. `config.json` records the version that installed them. During an authorized migration, `--retire-pre-push-sha256 <exact-old-binary-digest>` retires only that identified pre-push guard; unrelated hooks remain active. No candidate file controls this selection. Local commits require the exact bot author and committer. Hooks are local prevention, not remote authority: GitHub enforcement remains required.
 
@@ -69,7 +69,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-The real-scanner tests fail if Gitleaks is unavailable; they never silently skip. Tests cover index isolation, intermediate commits, metadata/tags, suppression attacks, private-output redaction, hostile candidate files, hook chaining, cryptographic rejection and zero-invocation reuse. ESS models the signed receipt under `ess/`.
+The real-scanner tests fail if Gitleaks is unavailable; they never silently skip. Tests cover index isolation, intermediate commits, metadata/tags, suppression attacks, private-output redaction, hostile candidate files, hook chaining, cryptographic rejection, zero-invocation reuse and ancestor receipt reuse. ESS models the signed receipt under `ess/`.
 
 `cargo run --locked -- gate` performs the complete repository gate and installs the pinned scanner if missing; CI delegates to this same Rust command.
 

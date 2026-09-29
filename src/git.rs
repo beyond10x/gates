@@ -4,8 +4,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{BufRead, BufReader, Read, Write},
+    ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
@@ -81,6 +83,144 @@ pub struct Unit {
 pub struct Candidate {
     pub binding: Binding,
     pub units: Vec<Unit>,
+    /// The units of `binding.commits[i]` are `units[spans[i]]`; every unit after the last
+    /// span belongs to the candidate's tags.
+    pub(crate) spans: Vec<Range<usize>>,
+}
+
+impl Candidate {
+    /// The units of every commit not in `covered`, then every tag unit, in candidate order,
+    /// and how many commits they belong to. Each commit's units were computed against its own
+    /// parent, so they are exactly the units a full scan would hand the scanner for it.
+    pub(crate) fn units_outside(&self, covered: &BTreeSet<&str>) -> (Vec<Unit>, usize) {
+        let mut units = Vec::new();
+        let mut commits = 0;
+        for (commit, span) in self.binding.commits.iter().zip(&self.spans) {
+            if !covered.contains(commit.as_str()) {
+                units.extend_from_slice(&self.units[span.clone()]);
+                commits += 1;
+            }
+        }
+        let tags = self.spans.last().map_or(0, |span| span.end);
+        units.extend_from_slice(&self.units[tags..]);
+        (units, commits)
+    }
+}
+
+/// One long-running `git cat-file --batch-command` answers every object read of a
+/// candidate, instead of two processes a blob. A size is read before any content, so the
+/// limits refuse without reading an oversized object, and every answer must name the
+/// object asked for: a stream that loses its place refuses every later read.
+struct Objects {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    broken: bool,
+}
+
+impl Objects {
+    fn open(git: &Git) -> Result<Self> {
+        let mut child = git
+            .command()
+            .args(["cat-file", "--batch-command"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Git cat-file could not start")?;
+        let input = child
+            .stdin
+            .take()
+            .context("Git cat-file input unavailable")?;
+        let output = child
+            .stdout
+            .take()
+            .context("Git cat-file output unavailable")?;
+        Ok(Self {
+            child,
+            input: Some(input),
+            output: BufReader::new(output),
+            broken: false,
+        })
+    }
+
+    /// Read a blob of at most `limit` bytes. A refusal for size, type or absence leaves the
+    /// stream in place; any other failure breaks it for good.
+    fn blob(&mut self, oid: &str, limit: usize) -> Result<Vec<u8>> {
+        ensure!(is_oid(oid), "invalid blob id");
+        ensure!(
+            !self.broken,
+            "Git cat-file stream refused after an earlier failure"
+        );
+        let (kind, size) = self.ask("info", oid)?;
+        ensure!(kind == "blob", "Git object {oid} is not a blob");
+        ensure!(
+            size <= limit,
+            "blob exceeds scan limit; no receipt can be issued"
+        );
+        self.broken = true;
+        ensure!(
+            self.ask("contents", oid)? == (kind, size),
+            "Git cat-file answered out of order"
+        );
+        let mut bytes = vec![0; size];
+        self.output
+            .read_exact(&mut bytes)
+            .context("Git cat-file ended early")?;
+        let mut end = [0u8; 1];
+        self.output
+            .read_exact(&mut end)
+            .context("Git cat-file ended early")?;
+        ensure!(end == *b"\n", "Git cat-file answered out of order");
+        self.broken = false;
+        Ok(bytes)
+    }
+
+    /// Send one command and parse its header. An absent object refuses as a failed one-shot
+    /// read of it does, naming the id and the fetch that supplies it.
+    fn ask(&mut self, command: &str, oid: &str) -> Result<(String, usize)> {
+        self.broken = true;
+        let input = self.input.as_mut().context("Git cat-file input closed")?;
+        input
+            .write_all(format!("{command} {oid}\n").as_bytes())
+            .and_then(|()| input.flush())
+            .context("Git cat-file failed")?;
+        let mut line = Vec::new();
+        self.output
+            .read_until(b'\n', &mut line)
+            .context("Git cat-file failed")?;
+        let line = line
+            .strip_suffix(b"\n")
+            .context("Git cat-file ended early")?;
+        let line = std::str::from_utf8(line).context("Git cat-file answered out of order")?;
+        let fields: Vec<&str> = line.split(' ').collect();
+        match fields.as_slice() {
+            [answered, "missing"] if *answered == oid => {
+                self.broken = false;
+                bail!(
+                    "Git cat-file failed: object {oid} is not in the local object store; \
+                     run `git fetch origin` and retry"
+                )
+            }
+            [answered, kind, size] if *answered == oid => {
+                let size = size.parse().context("Git cat-file answered out of order")?;
+                self.broken = false;
+                Ok(((*kind).to_owned(), size))
+            }
+            _ => bail!("Git cat-file answered out of order"),
+        }
+    }
+}
+
+impl Drop for Objects {
+    fn drop(&mut self) {
+        // Closing the input ends the batch; a stream left mid-object is killed instead.
+        drop(self.input.take());
+        if self.broken {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
 }
 
 pub struct Git {
@@ -205,13 +345,7 @@ impl Git {
     }
 
     pub fn blob(&self, oid: &str) -> Result<Vec<u8>> {
-        ensure!(is_oid(oid), "invalid blob id");
-        let size: usize = self.text(&["cat-file", "-s", oid])?.parse()?;
-        ensure!(
-            size <= MAX_BLOB,
-            "blob exceeds scan limit; no receipt can be issued"
-        );
-        self.read(&["cat-file", "blob", oid])
+        Objects::open(self)?.blob(oid, MAX_BLOB)
     }
 
     fn tree(&self, rev: &str) -> Result<BTreeMap<String, (String, String)>> {
@@ -241,7 +375,7 @@ impl Git {
     }
 
     fn units(
-        &self,
+        objects: &mut Objects,
         tree: &BTreeMap<String, (String, String)>,
         old: &BTreeMap<String, (String, String)>,
     ) -> Result<Vec<Unit>> {
@@ -257,10 +391,10 @@ impl Git {
                 workflow: false,
                 inherited: previous.map(|_| path.as_bytes().to_vec()),
             });
-            let bytes = self.blob(oid)?;
+            let bytes = objects.blob(oid, MAX_BLOB)?;
             // An oversized predecessor cannot be read, so nothing is inherited from
             // it and the whole file is answerable. That fails closed.
-            let inherited = previous.and_then(|(_, old)| self.blob(old).ok());
+            let inherited = previous.and_then(|(_, old)| objects.blob(old, MAX_BLOB).ok());
             units.push(Unit {
                 location: format!("file:{path}"),
                 bytes,
@@ -282,6 +416,31 @@ impl Git {
         repository: &str,
         head: &str,
         tag_refs: &[String],
+    ) -> Result<Candidate> {
+        self.build(policy, repository, head, tag_refs, None)
+    }
+
+    /// The candidate for `head` with no tags, taking the units of every commit `known`
+    /// already holds from it instead of reading them again. A commit's units depend only on
+    /// its own objects and its first parent's tree, so they are the units a fresh build
+    /// reads; every other commit is read and admitted exactly as `candidate` does.
+    pub(crate) fn candidate_from(
+        &self,
+        policy: &Policy,
+        repository: &str,
+        head: &str,
+        known: &Candidate,
+    ) -> Result<Candidate> {
+        self.build(policy, repository, head, &[], Some(known))
+    }
+
+    fn build(
+        &self,
+        policy: &Policy,
+        repository: &str,
+        head: &str,
+        tag_refs: &[String],
+        known: Option<&Candidate>,
     ) -> Result<Candidate> {
         let repo = policy.repository(repository)?;
         ensure!(is_oid(head), "candidate must be an exact commit");
@@ -309,8 +468,26 @@ impl Git {
             .collect();
         commits.retain(|v| !v.is_empty());
         let mut units = Vec::new();
+        let mut spans = Vec::with_capacity(commits.len());
+        let mut objects = Objects::open(self)?;
+        let held: BTreeMap<&str, &[Unit]> = known
+            .into_iter()
+            .flat_map(|k| {
+                k.binding
+                    .commits
+                    .iter()
+                    .zip(&k.spans)
+                    .map(|(commit, span)| (commit.as_str(), &k.units[span.clone()]))
+            })
+            .collect();
         for commit in &commits {
             ensure!(is_oid(commit), "invalid commit coordinate");
+            let start = units.len();
+            if let Some(known) = held.get(commit.as_str()) {
+                units.extend_from_slice(known);
+                spans.push(start..units.len());
+                continue;
+            }
             let raw = self.read(&["cat-file", "commit", commit])?;
             // This admission runs before scans AND before receipt reuse, for every
             // reachable candidate commit, including merged side branches.
@@ -326,14 +503,16 @@ impl Git {
                 Some(p) => self.tree(p)?,
                 None => BTreeMap::new(),
             };
-            units.extend(self.units(&self.tree(commit)?, &old)?);
+            units.extend(Self::units(&mut objects, &self.tree(commit)?, &old)?);
             units.push(Unit {
                 location: format!("commit:{commit}"),
                 bytes: raw,
                 workflow: false,
                 inherited: None,
             });
+            spans.push(start..units.len());
         }
+        drop(objects);
         let mut tags = BTreeSet::new();
         for tag in tag_refs {
             let tag = self.text(&[
@@ -396,6 +575,7 @@ impl Git {
                 objects_digest: digest(&serde_json::to_vec(&manifest)?),
             },
             units,
+            spans,
         })
     }
 
@@ -427,11 +607,15 @@ impl Git {
                 .context("non-UTF-8 index path refused")?;
             tree.insert(path, (header[0].into(), header[1].into()));
         }
-        self.units(&tree, &old)
+        Self::units(&mut Objects::open(self)?, &tree, &old)
     }
 
     pub fn historical(&self, baseline: &str) -> Result<Vec<Unit>> {
-        self.units(&self.tree(baseline)?, &BTreeMap::new())
+        Self::units(
+            &mut Objects::open(self)?,
+            &self.tree(baseline)?,
+            &BTreeMap::new(),
+        )
     }
 
     pub fn verify_bot(&self, commits: &[String]) -> Result<()> {
@@ -445,5 +629,59 @@ impl Git {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Git) {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .current_dir(dir.path())
+            .args(["-c", "init.templateDir=", "init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let git = Git::new(dir.path()).unwrap();
+        (dir, git)
+    }
+
+    fn write(git: &Git, bytes: &[u8]) -> String {
+        let path = git.root.join("object-input");
+        std::fs::write(&path, bytes).unwrap();
+        git.text(&["hash-object", "-w", "--", "object-input"])
+            .unwrap()
+    }
+
+    /// A refusal for size, type or absence must leave the batch in place: the inherited
+    /// predecessor read swallows those refusals and the candidate reads on.
+    #[test]
+    fn a_refused_object_leaves_the_batch_answering_exactly() {
+        let (_dir, git) = store();
+        let small = write(&git, b"small\n");
+        let large = write(&git, &[b'x'; 64]);
+        let tree = git.text(&["mktree"]).unwrap();
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let mut objects = Objects::open(&git).unwrap();
+        let refused = objects.blob(&large, 63).unwrap_err().to_string();
+        assert!(refused.contains("exceeds scan limit"), "{refused}");
+        assert_eq!(objects.blob(&small, 63).unwrap(), b"small\n");
+        let refused = objects.blob(absent, 63).unwrap_err().to_string();
+        assert!(
+            refused.contains(absent)
+                && refused.contains("local object store")
+                && refused.contains("git fetch origin"),
+            "{refused}"
+        );
+        assert_eq!(objects.blob(&large, 64).unwrap(), vec![b'x'; 64]);
+        assert!(objects.blob(&tree, 1 << 20).is_err());
+        assert_eq!(objects.blob(&small, 63).unwrap(), b"small\n");
+        assert!(objects.blob("not an object id", 63).is_err());
+        assert_eq!(objects.blob(&small, 6).unwrap(), b"small\n");
+        assert!(objects.blob(&small, 5).is_err());
     }
 }
