@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:ancestor-receipt-reuse
 kind: story
-status: active
+status: implemented
 title: A push scans only the commits no verified receipt covers
 scope:
 - confidence: inferred
@@ -13,7 +13,7 @@ scope:
   path: src/hooks.rs
 - confidence: inferred
   path: src/main.rs
-revision: 7
+revision: 8
 ---
 ## Context
 
