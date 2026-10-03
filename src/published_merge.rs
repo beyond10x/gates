@@ -23,6 +23,11 @@ struct Authority {
     published_head: String,
 }
 
+struct GithubCommit {
+    tree: String,
+    parents: Vec<String>,
+}
+
 /// Verify the entire candidate DAG after the enrolled baseline, including side
 /// branches. A caller cannot exempt an ancestor by omitting it from a list.
 pub fn verify(
@@ -56,46 +61,66 @@ pub fn verify(
         if git.verify_bot(&[oid.to_owned()]).is_ok() {
             continue;
         }
-        // Only this exact raw identity and shape can even request an exception.
-        let raw = git.read(&["cat-file", "commit", oid])?;
-        ensure!(
-            exact_identity(unique_header(&raw, b"author ")?, BOT_NAME, BOT_EMAIL),
-            "historical merge author is not the exact bot"
-        );
-        ensure!(
-            exact_identity(
-                unique_header(&raw, b"committer ")?,
-                "GitHub",
-                "noreply@github.com"
-            ),
-            "historical merge committer is not exact GitHub"
-        );
-        let parents = raw
-            .split(|b| *b == b'\n')
-            .take_while(|line| !line.is_empty())
-            .filter_map(|line| line.strip_prefix(b"parent "))
-            .map(std::str::from_utf8)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        // Two parents is an ordinary pull-request merge; one is a squash merge, which GitHub
-        // writes as a single commit over the base. Both are shapes the button produces, and a
-        // repository that has taken one cannot deliver again until the shape is admitted — the
-        // check below proves each on its own terms rather than treating the squash as a merge.
-        ensure!(
-            (1..=2).contains(&parents.len()) && parents.iter().all(|p| is_oid(p)),
-            "historical merge must have one or two parents"
-        );
-        let tree = std::str::from_utf8(unique_header(&raw, b"tree ")?)?;
-        ensure!(is_oid(tree), "historical merge tree invalid");
-        git.read(&["cat-file", "-e", &format!("{tree}^{{tree}}")])?;
+        let commit = github_commit(git, oid)?;
         if authority.is_none() {
             authority = Some(Authority::load(git, api, repository, &enrolled.id)?);
         }
         authority
             .as_ref()
             .context("remote authority unavailable")?
-            .verify_merge(git, api, repository, oid, tree, &parents)?;
+            .verify_github_commit(git, api, repository, oid, &commit)?;
     }
     Ok(())
+}
+
+fn github_commit(git: &Git, oid: &str) -> Result<GithubCommit> {
+    ensure!(
+        git.resolve(&format!("{oid}^{{commit}}"))? == oid,
+        "historical GitHub object is not this commit"
+    );
+    let raw = git.read(&["cat-file", "commit", oid])?;
+    ensure!(
+        exact_identity(unique_header(&raw, b"author ")?, BOT_NAME, BOT_EMAIL),
+        "historical merge author is not the exact bot"
+    );
+    ensure!(
+        exact_identity(
+            unique_header(&raw, b"committer ")?,
+            "GitHub",
+            "noreply@github.com"
+        ),
+        "historical merge committer is not exact GitHub"
+    );
+    let parents = raw
+        .split(|b| *b == b'\n')
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix(b"parent "))
+        .map(std::str::from_utf8)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Two parents is an ordinary pull-request merge; one is a squash merge, which GitHub
+    // writes as a single commit over the base. Both are shapes the button produces, and a
+    // repository that has taken one cannot deliver again until the shape is admitted — the
+    // check below proves each on its own terms rather than treating the squash as a merge.
+    ensure!(
+        (1..=2).contains(&parents.len()) && parents.iter().all(|p| is_oid(p)),
+        "historical merge must have one or two parents"
+    );
+    let tree = std::str::from_utf8(unique_header(&raw, b"tree ")?)?.to_owned();
+    ensure!(is_oid(&tree), "historical merge tree invalid");
+    git.read(&["cat-file", "-e", &format!("{tree}^{{tree}}")])?;
+    for parent in &parents {
+        ensure!(
+            git.resolve(&format!("{parent}^{{commit}}"))? == *parent,
+            "historical merge parent object unavailable"
+        );
+        let parent_tree = git.resolve(&format!("{parent}^{{tree}}"))?;
+        ensure!(is_oid(&parent_tree), "historical merge parent tree invalid");
+        git.read(&["cat-file", "-e", &format!("{parent_tree}^{{tree}}")])?;
+    }
+    Ok(GithubCommit { tree, parents })
 }
 
 fn string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
@@ -233,20 +258,44 @@ impl Authority {
         })
     }
 
-    fn verify_merge(
+    fn verify_github_commit(
         &self,
         git: &Git,
         api: &impl AuthenticatedRead,
         repository: &str,
-        merge: &str,
-        tree: &str,
-        parents: &[&str],
+        oid: &str,
+        commit: &GithubCommit,
     ) -> Result<()> {
-        git.read(&["merge-base", "--is-ancestor", merge, &self.published_head])
+        self.ensure_published(git, oid)?;
+        self.verify_remote_commit(api, oid, commit)?;
+        let pulls = self.pull_associations(api, oid)?;
+        let terminal = pulls
+            .iter()
+            .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str) == Some(oid))
+            .count();
+        if terminal > 0 {
+            ensure!(terminal == 1, "merged pull request missing or ambiguous");
+            return self
+                .verify_terminal_merge(git, api, repository, oid, commit, &pulls, None, false);
+        }
+        self.verify_update_branch(git, api, repository, oid, commit, &pulls)
+    }
+
+    fn ensure_published(&self, git: &Git, oid: &str) -> Result<()> {
+        git.read(&["merge-base", "--is-ancestor", oid, &self.published_head])
             .context("merge is not on the authenticated published default branch")?;
-        let remote = api.get(&format!("{}/commits/{merge}", self.root))?;
+        Ok(())
+    }
+
+    fn verify_remote_commit(
+        &self,
+        api: &impl AuthenticatedRead,
+        commit_oid: &str,
+        commit: &GithubCommit,
+    ) -> Result<()> {
+        let remote = api.get(&format!("{}/commits/{commit_oid}", self.root))?;
         ensure!(
-            oid(&remote, "/sha")? == merge,
+            oid(&remote, "/sha")? == commit_oid,
             "remote merge identity mismatch"
         );
         ensure!(
@@ -271,21 +320,24 @@ impl Authority {
             .and_then(Value::as_array)
             .context("remote merge parents unavailable")?;
         ensure!(
-            remote_parents.len() == parents.len()
-                && remote_parents
-                    .iter()
-                    .zip(parents)
-                    .try_fold(true, |ok, (remote, local)| {
-                        Ok::<_, anyhow::Error>(ok && oid(remote, "/sha")? == *local)
-                    })?,
+            remote_parents.len() == commit.parents.len()
+                && remote_parents.iter().zip(&commit.parents).try_fold(
+                    true,
+                    |ok, (remote, local)| {
+                        Ok::<_, anyhow::Error>(ok && oid(remote, "/sha")? == local)
+                    }
+                )?,
             "remote and local merge parents differ"
         );
         ensure!(
-            oid(&remote, "/commit/tree/sha")? == tree,
+            oid(&remote, "/commit/tree/sha")? == commit.tree,
             "remote and local merge trees differ"
         );
+        Ok(())
+    }
 
-        let pulls = pages(api, &format!("{}/commits/{merge}/pulls", self.root))?;
+    fn pull_associations(&self, api: &impl AuthenticatedRead, oid: &str) -> Result<Vec<Value>> {
+        let pulls = pages(api, &format!("{}/commits/{oid}/pulls", self.root))?;
         for pull in &pulls {
             ensure!(
                 pull.get("number")
@@ -301,6 +353,90 @@ impl Authority {
                 "associated pull request list entry missing or malformed"
             );
         }
+        Ok(pulls)
+    }
+
+    fn verify_update_branch(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        repository: &str,
+        update: &str,
+        update_commit: &GithubCommit,
+        pulls: &[Value],
+    ) -> Result<()> {
+        ensure!(
+            update_commit.parents.len() == 2
+                && update_commit.parents[0] != update_commit.parents[1],
+            "branch update must have distinct ordered head and base parents"
+        );
+        let completed: Vec<_> = pulls
+            .iter()
+            .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str).is_some())
+            .collect();
+        ensure!(
+            completed.len() == 1,
+            "updated pull request missing or ambiguous"
+        );
+        let summary = completed[0];
+        let number = summary
+            .get("number")
+            .and_then(Value::as_u64)
+            .filter(|number| *number > 0)
+            .context("pull request identity unavailable")?;
+        let merge = oid(summary, "/merge_commit_sha")?;
+        ensure!(merge != update, "branch update cannot be its final merge");
+        self.ensure_same_repository(summary, repository)?;
+        ensure!(
+            string(summary, "/base/ref")? == self.default_branch
+                && oid(summary, "/head/sha")? == update,
+            "updated pull request summary does not bind this accepted head"
+        );
+        let pull = self.completed_pull_request(api, repository, number, merge)?;
+        ensure!(
+            oid(&pull, "/head/sha")? == update,
+            "pull request head is not the authenticated branch update"
+        );
+
+        let merge_commit = github_commit(git, merge)?;
+        ensure!(
+            merge_commit.parents.len() == 2
+                && merge_commit.parents[0] == update_commit.parents[1]
+                && merge_commit.parents[1] == update,
+            "final merge parents are not the update base and accepted head"
+        );
+        ensure!(
+            merge_commit.tree == update_commit.tree
+                && git.resolve(&format!("{update}^{{tree}}"))? == update_commit.tree,
+            "final merge did not preserve the accepted update tree"
+        );
+        self.ensure_published(git, merge)?;
+        self.verify_remote_commit(api, merge, &merge_commit)?;
+        let merge_pulls = self.pull_associations(api, merge)?;
+        self.verify_terminal_merge(
+            git,
+            api,
+            repository,
+            merge,
+            &merge_commit,
+            &merge_pulls,
+            Some(number),
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_terminal_merge(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        repository: &str,
+        merge: &str,
+        commit: &GithubCommit,
+        pulls: &[Value],
+        expected_number: Option<u64>,
+        ordinary_only: bool,
+    ) -> Result<()> {
         let matches: Vec<_> = pulls
             .iter()
             .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str) == Some(merge))
@@ -314,42 +450,49 @@ impl Authority {
             .and_then(Value::as_u64)
             .filter(|n| *n > 0)
             .context("pull request identity unavailable")?;
-        let pr = api.get(&format!("{}/pulls/{number}", self.root))?;
-        ensure!(
-            pr.get("number").and_then(Value::as_u64) == Some(number),
-            "pull request identity mismatch"
-        );
-        ensure!(
-            pr.get("merged") == Some(&json!(true))
-                && string(&pr, "/state")? == "closed"
-                && oid(&pr, "/merge_commit_sha")? == merge,
-            "pull request is not this completed merge"
-        );
-        ensure!(
-            string(&pr, "/merged_by/login")? == BOT_NAME,
-            "pull request was not merged by the exact bot"
-        );
-        for side in ["head", "base"] {
+        if let Some(expected) = expected_number {
             ensure!(
-                string(&pr, &format!("/{side}/repo/full_name"))? == repository
-                    && pr
-                        .pointer(&format!("/{side}/repo/id"))
-                        .and_then(Value::as_u64)
-                        == Some(self.repository_id),
-                "pull request is not same-repository"
+                pulls
+                    .iter()
+                    .filter(|pull| {
+                        pull.get("merge_commit_sha")
+                            .and_then(Value::as_str)
+                            .is_some()
+                    })
+                    .count()
+                    == 1,
+                "final merge association is ambiguous"
+            );
+            ensure!(
+                number == expected,
+                "final merge is tied to another pull request"
+            );
+            self.ensure_same_repository(matches[0], repository)?;
+            ensure!(
+                string(matches[0], "/base/ref")? == self.default_branch
+                    && oid(matches[0], "/head/sha")? == commit.parents[1],
+                "final merge summary does not bind the accepted head"
             );
         }
-        ensure!(
-            string(&pr, "/base/ref")? == self.default_branch,
-            "pull request target is not the default branch"
-        );
-        if parents.len() == 2 {
+        let pr = self.completed_pull_request(api, repository, number, merge)?;
+        if ordinary_only {
             ensure!(
-                oid(&pr, "/head/sha")? == parents[1],
+                commit.parents.len() == 2,
+                "final update merge must be an ordinary merge"
+            );
+        }
+        if commit.parents.len() == 2 {
+            ensure!(
+                oid(&pr, "/head/sha")? == commit.parents[1],
                 "pull request head is not the second merge parent"
             );
             if git
-                .read(&["merge-base", "--is-ancestor", parents[0], parents[1]])
+                .read(&[
+                    "merge-base",
+                    "--is-ancestor",
+                    &commit.parents[0],
+                    &commit.parents[1],
+                ])
                 .is_err()
             {
                 // The head did not incorporate the base. That is only a hazard when the base
@@ -361,16 +504,16 @@ impl Authority {
                 // A repository whose default branch has taken one merge of a branch cut from
                 // before its tip can otherwise never deliver again, and the branch that produced
                 // this case was cut that way to satisfy this very guard.
-                let fork = git.text(&["merge-base", parents[0], parents[1]])?;
+                let fork = git.text(&["merge-base", &commit.parents[0], &commit.parents[1]])?;
                 ensure!(is_oid(&fork), "invalid merge base");
                 ensure!(
-                    git.resolve(&format!("{}^{{tree}}", parents[0]))?
+                    git.resolve(&format!("{}^{{tree}}", commit.parents[0]))?
                         == git.resolve(&format!("{fork}^{{tree}}"))?,
                     "pull request head did not incorporate its merge basis"
                 );
             }
             ensure!(
-                git.resolve(&format!("{}^{{tree}}", parents[1]))? == tree,
+                git.resolve(&format!("{}^{{tree}}", commit.parents[1]))? == commit.tree,
                 "merge changed the accepted pull request tree"
             );
             return Ok(());
@@ -386,11 +529,55 @@ impl Authority {
         // not re-derived locally. Admitted deliberately, because a repository whose default
         // branch has taken one squash merge can otherwise never deliver again.
         ensure!(
-            oid(&pr, "/base/sha")? == parents[0],
+            oid(&pr, "/base/sha")? == commit.parents[0],
             "squash merge parent is not the pull request base"
         );
-        git.read(&["merge-base", "--is-ancestor", parents[0], merge])
+        git.read(&["merge-base", "--is-ancestor", &commit.parents[0], merge])
             .context("squash merge does not descend from its pull request base")?;
+        Ok(())
+    }
+
+    fn completed_pull_request(
+        &self,
+        api: &impl AuthenticatedRead,
+        repository: &str,
+        number: u64,
+        merge: &str,
+    ) -> Result<Value> {
+        let pr = api.get(&format!("{}/pulls/{number}", self.root))?;
+        ensure!(
+            pr.get("number").and_then(Value::as_u64) == Some(number),
+            "pull request identity mismatch"
+        );
+        ensure!(
+            pr.get("merged") == Some(&json!(true))
+                && string(&pr, "/state")? == "closed"
+                && oid(&pr, "/merge_commit_sha")? == merge,
+            "pull request is not this completed merge"
+        );
+        ensure!(
+            string(&pr, "/merged_by/login")? == BOT_NAME,
+            "pull request was not merged by the exact bot"
+        );
+        self.ensure_same_repository(&pr, repository)?;
+        ensure!(
+            string(&pr, "/base/ref")? == self.default_branch,
+            "pull request target is not the default branch"
+        );
+        Ok(pr)
+    }
+
+    fn ensure_same_repository(&self, pr: &Value, repository: &str) -> Result<()> {
+        for side in ["head", "base"] {
+            ensure!(
+                string(pr, &format!("/{side}/repo/full_name"))? == repository
+                    && pr
+                        .pointer(&format!("/{side}/repo/id"))
+                        .and_then(Value::as_u64)
+                        == Some(self.repository_id),
+                "pull request is not same-repository"
+            );
+        }
         Ok(())
     }
 }

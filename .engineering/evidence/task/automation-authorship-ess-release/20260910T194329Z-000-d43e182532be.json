@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-10T19:43:29Z",
+  "actor": "human:timo",
+  "artifact": "task:automation-authorship-ess-release",
+  "kind": "task",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/gates/actions/runs/34518576090",
+    "reference": "https://github.com/beyond10x/gates/releases/tag/0.1.1"
+  }
+}

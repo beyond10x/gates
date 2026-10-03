@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.12 — 2026-10-03
+
+- Verify an already-published GitHub update-branch commit when it is the exact head of a
+  completed same-repository pull request merged by the organization bot. Both the update and
+  final merge must have authenticated identities, signatures, parents and trees. The final
+  merge must retain the update's tree and merge onto the update's second parent.
+- Keep complete ancestry verification, exact direct-bot identity, App-only branch authority,
+  scanner checks and receipt verification unchanged. Unsupported intermediate update graphs,
+  missing evidence and ambiguous pull-request associations continue to refuse publication.
+- No policy field or receipt format changes. The version increment invalidates receipts
+  retained under 0.1.11, so the first check after upgrading scans in full once.
+
 ## 0.1.11 — 2026-09-29
 
 - `check` and the pre-push hook scan only the commits no verified retained receipt covers. A

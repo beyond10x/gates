@@ -380,3 +380,159 @@ fn adversary_duplicate_proof_on_later_page_is_not_ignored() {
         }
     }
 }
+
+// Build the update proof through this adversary's fixture, independently of the
+// implementation author's UpdateFixture. All API data remains synthetic.
+fn updated_fixture(untrusted_prior: bool) -> (Fixture, String) {
+    let mut fixture = Fixture::new();
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}>");
+    let base = commit(
+        fixture.directory.path(),
+        &fixture.tree,
+        &[&fixture.baseline],
+        &bot,
+        "update base",
+    );
+    if untrusted_prior {
+        let hidden = commit(
+            fixture.directory.path(),
+            &fixture.tree,
+            &[&fixture.baseline],
+            "Human <human@example.invalid>",
+            "untrusted side ancestor",
+        );
+        fixture.topic = commit(
+            fixture.directory.path(),
+            &fixture.tree,
+            &[&fixture.topic, &hidden],
+            &bot,
+            "bot join does not authorize the side ancestor",
+        );
+    }
+    let update = commit(
+        fixture.directory.path(),
+        &fixture.tree,
+        &[&fixture.topic, &base],
+        "GitHub <noreply@github.com>",
+        "branch update",
+    );
+    fixture.merge = commit(
+        fixture.directory.path(),
+        &fixture.tree,
+        &[&base, &update],
+        "GitHub <noreply@github.com>",
+        "terminal merge",
+    );
+    fixture.candidate = commit(
+        fixture.directory.path(),
+        &fixture.tree,
+        &[&fixture.merge],
+        &bot,
+        "candidate after update",
+    );
+    fixture.prove(update.clone(), fixture.topic.clone(), base.clone(), 2);
+    fixture.prove(fixture.merge.clone(), base, update.clone(), 1);
+    let pull = fixture.evidence.0[&format!("{ROOT}/pulls/1")].clone();
+    fixture.evidence.0.insert(
+        format!("{ROOT}/commits/{update}/pulls?per_page=100&page=1"),
+        json!([pull]),
+    );
+    fixture.evidence.0.get_mut(REF).unwrap()["object"]["sha"] = json!(fixture.merge);
+    (fixture, update)
+}
+
+#[test]
+fn adversary_update_proof_never_excuses_a_nonbot_side_ancestor() {
+    updated_fixture(false).0.assert_valid();
+    let (fixture, _) = updated_fixture(true);
+    for result in fixture.verify() {
+        assert!(
+            result.is_err(),
+            "authenticated update exempted a nonbot side ancestor"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("committer"),
+            "refusal must identify the nonbot ancestor rather than missing synthetic evidence"
+        );
+    }
+}
+
+#[test]
+fn adversary_update_and_terminal_pagination_cannot_hide_incomplete_or_ambiguous_proof() {
+    for terminal in [false, true] {
+        for mutation in ["missing-page", "duplicate", "malformed", "other-completed"] {
+            let (mut fixture, update) = updated_fixture(false);
+            let oid = if terminal { &fixture.merge } else { &update };
+            let first = format!("{ROOT}/commits/{oid}/pulls?per_page=100&page=1");
+            let second = format!("{ROOT}/commits/{oid}/pulls?per_page=100&page=2");
+            let accepted = fixture.evidence.0[&first][0].clone();
+            let mut page = vec![accepted.clone()];
+            page.extend((2..=100).map(|number| json!({"number":number,"merge_commit_sha":null})));
+            fixture.evidence.0.insert(first, json!(page));
+            fixture.evidence.0.insert(second.clone(), json!([]));
+            fixture.assert_valid();
+            match mutation {
+                "missing-page" => {
+                    fixture.evidence.0.remove(&second);
+                }
+                "duplicate" => {
+                    fixture.evidence.0.insert(second, json!([accepted]));
+                }
+                "malformed" => {
+                    fixture.evidence.0.insert(second, json!([{"number":101}]));
+                }
+                "other-completed" => {
+                    let mut other = accepted;
+                    other["number"] = json!(101);
+                    other["merge_commit_sha"] = json!(fixture.baseline);
+                    fixture.evidence.0.insert(second, json!([other]));
+                }
+                _ => unreachable!(),
+            }
+            for result in fixture.verify() {
+                assert!(
+                    result.is_err(),
+                    "terminal={terminal}, mutation={mutation} was accepted"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn adversary_each_update_and_terminal_commit_identity_field_is_required() {
+    for terminal in [false, true] {
+        for pointer in [
+            "/sha",
+            "/author/login",
+            "/committer/login",
+            "/commit/author/name",
+            "/commit/author/email",
+            "/commit/committer/name",
+            "/commit/committer/email",
+            "/commit/tree/sha",
+            "/commit/verification/verified",
+            "/commit/verification/reason",
+            "/parents/0/sha",
+            "/parents/1/sha",
+        ] {
+            let (mut fixture, update) = updated_fixture(false);
+            fixture.assert_valid();
+            let oid = if terminal { &fixture.merge } else { &update };
+            let path = format!("{ROOT}/commits/{oid}");
+            *fixture
+                .evidence
+                .0
+                .get_mut(&path)
+                .unwrap()
+                .pointer_mut(pointer)
+                .unwrap() = Value::Null;
+            for result in fixture.verify() {
+                assert!(
+                    result.is_err(),
+                    "terminal={terminal}, missing {pointer} was accepted"
+                );
+            }
+        }
+    }
+}

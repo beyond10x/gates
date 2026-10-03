@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: review-result:published-merge-adversary
 kind: review-result
 status: active
