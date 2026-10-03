@@ -46,6 +46,20 @@ The workflow first retrieves bot-published evidence. It verifies Ed25519 signatu
 
 A pull request body, an issue comment, a release note and a chat message are published without passing through Git, so no hook sees them. The delivery verbs scan before they send: `gh -- <args>` scans its arguments, `api --input <file>` scans the body file, and `scan-text <file>...` refuses any file that breaks a rule, for publishers that are not `gh`. Each refuses with rule coordinates and never echoes the matched text. A missing policy is a refusal, not an unscanned send.
 
+`scan-artifact <file>` validates an executable release artifact without executing it. The supported
+format is an ELF64 little-endian `ET_EXEC` or `ET_DYN` file of at most 128 MiB, with no more than
+4096 sections and 4096 segments. Its complete section and segment ranges must be in bounds;
+file-backed sections may not overlap; compressed sections are refused. The private-identifier and
+personal-path policy reads every byte from non-executable sections, preserving its existing UTF-8
+and format-character handling. Pinned Gitleaks reads printable runs of any length from those
+sections. Both checks additionally read printable runs of at least four bytes from the complete
+file. Marking a normal string executable therefore does not hide it, while a three-byte instruction
+encoding is not treated as prose. A successful report includes the complete original file's
+SHA-256, original, privacy and extracted byte counts, non-null section count, format, and scanner
+invocation count. The extraction does not establish that encoded, encrypted, or strings shorter
+than four bytes in executable sections contain no private data; unsupported or ambiguous artifacts
+refuse rather than receiving an exception.
+
 The boundary: a raw `gh` or `curl` invoked outside `b10x-gates` is unguarded. Route delivery through the verbs.
 
 Require the resulting `Security and privacy` check before integration, retain repository correctness checks separately, and enable GitHub secret scanning and push protection where supported. Initial adoption installs the caller after local verification, observes its first successful main run, then enables the required check. Fork workflows must never receive private policy through a candidate checkout or candidate action.
@@ -73,7 +87,7 @@ The real-scanner tests fail if Gitleaks is unavailable; they never silently skip
 
 `cargo run --locked -- gate` performs the complete repository gate and installs the pinned scanner if missing; CI delegates to this same Rust command.
 
-Release only from gated `main` with a bare annotated version tag. Publish the static Linux binary and `SHA256SUMS`, verify both after downloading them, and verify the GitHub release author is the organization bot before pinning consumers. Build release binaries with Rust source-path remapping and scan them for private provenance. Documentation publication and downstream releases are separate operations.
+Release only from gated `main` with a bare annotated version tag. Publish the static Linux binary and `SHA256SUMS`, verify both after downloading them, and verify the GitHub release author is the organization bot before pinning consumers. Build release binaries with Rust source-path remapping and validate them with `scan-artifact` before publication. Documentation publication and downstream releases are separate operations.
 
 <!-- b10x-docs:start -->
 ## Documentation

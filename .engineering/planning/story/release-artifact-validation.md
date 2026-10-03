@@ -21,9 +21,11 @@ scope:
   path: src/lib.rs
 - confidence: inferred
   path: src/main.rs
+- confidence: cited
+  path: tests/adversary_artifact.rs
 - confidence: inferred
   path: tests/artifact.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-03T08:17:09Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-03T08:17:09Z", actor: "human:timo", revision: 4}

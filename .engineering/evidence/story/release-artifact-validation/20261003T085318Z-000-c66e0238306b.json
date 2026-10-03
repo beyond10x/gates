@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-03T08:53:18Z",
+  "actor": "human:timo",
+  "artifact": "story:release-artifact-validation",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Final static artifact scan under unchanged trusted policy: SHA256 10eea3ff2864947b75501965643ea2f48bb3a413b92d152428ef36aa0bab34a0; 7542888 input bytes; 1707133 extracted bytes; one pinned scanner invocation"
+  }
+}

@@ -2,6 +2,11 @@
 
 ## 0.1.12 — 2026-10-03
 
+- Add `scan-artifact` for bounded ELF64 little-endian release executables. It validates the
+  complete section and segment inventory, scans embedded printable data with the existing private
+  policy, invokes pinned Gitleaks over the nonempty extraction, and reports the complete input
+  SHA-256 without executing the artifact. Malformed, truncated, compressed and unsupported inputs
+  fail closed.
 - Verify an already-published GitHub update-branch commit when it is the exact head of a
   completed same-repository pull request merged by the organization bot. Both the update and
   final merge must have authenticated identities, signatures, parents and trees. The final

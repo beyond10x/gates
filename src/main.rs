@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use b10x_gates::{
+    artifact,
     delivery::{self, Github},
     evidence::{self, Receipt},
     git::Git,
@@ -110,6 +111,11 @@ enum Action {
     ScanText {
         #[arg(required = true)]
         path: Vec<PathBuf>,
+    },
+    /// Validate and scan a supported executable release artifact without executing it.
+    ScanArtifact {
+        #[arg(required = true)]
+        path: PathBuf,
     },
     /// Edit the trusted policy itself.
     Policy {
@@ -291,6 +297,27 @@ fn execute(args: Args) -> Result<()> {
             refuse(&matchers, &file.display().to_string(), &fs::read(file)?)?;
         }
         println!("{} file(s) carry no private rule", path.len());
+        return Ok(());
+    }
+    if let Action::ScanArtifact { path } = &args.command {
+        let root = policy::root()?;
+        let policy_path = args.policy.unwrap_or_else(|| root.join("policy.json"));
+        let scanner_path = args.gitleaks.unwrap_or_else(|| root.join("bin/gitleaks"));
+        let report = artifact::validate(
+            path,
+            &load_policy(&policy_path)?,
+            &mut Gitleaks {
+                binary: scanner_path,
+            },
+        )?;
+        println!(
+            "artifact valid; format=elf64-little-endian; sha256={}; input_bytes={}; privacy_bytes={}; extracted_bytes={}; sections={}; scanner_invocations=1",
+            report.sha256,
+            report.input_bytes,
+            report.privacy_bytes,
+            report.extracted_bytes,
+            report.sections
+        );
         return Ok(());
     }
     let root = policy::root()?;
