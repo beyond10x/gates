@@ -225,6 +225,758 @@ impl Fixture {
     }
 }
 
+struct UpdateFixture {
+    dir: TempDir,
+    prior_head: String,
+    base: String,
+    update: String,
+    merge: String,
+    candidate: String,
+    tree: String,
+    policy: Policy,
+    api: Evidence,
+}
+
+impl UpdateFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        git(
+            dir.path(),
+            &["init", "-q", "--initial-branch=main", "--template="],
+            b"",
+        );
+        let blob = git(dir.path(), &["hash-object", "-w", "--stdin"], b"accepted\n");
+        let tree = git(
+            dir.path(),
+            &["mktree"],
+            format!("100644 blob {blob}\taccepted\n").as_bytes(),
+        );
+        let baseline = commit(dir.path(), &tree, &[], false, "baseline");
+        let prior_head = commit(dir.path(), &tree, &[&baseline], false, "prior pull head");
+        let base = commit(dir.path(), &tree, &[&baseline], false, "updated base");
+        let update = commit(
+            dir.path(),
+            &tree,
+            &[&prior_head, &base],
+            true,
+            "GitHub update branch",
+        );
+        let merge = commit(
+            dir.path(),
+            &tree,
+            &[&base, &update],
+            true,
+            "GitHub final merge",
+        );
+        let candidate = commit(dir.path(), &tree, &[&merge], false, "candidate");
+        git(
+            dir.path(),
+            &["update-ref", "refs/heads/main", &candidate],
+            b"",
+        );
+        let policy = Policy {
+            version: 1,
+            nonce: "synthetic-update-branch-policy".into(),
+            forbidden_literals: vec![],
+            forbidden_patterns: vec![],
+            allow_patterns: vec![],
+            repositories: BTreeMap::from([(
+                REPOSITORY.into(),
+                Repository {
+                    id: "123".into(),
+                    baseline: baseline.clone(),
+                },
+            )]),
+            signers: BTreeMap::new(),
+            exceptions: vec![],
+        };
+        let mut api = Evidence::default();
+        api.responses.insert(ROOT.into(), json!({"id":123,"full_name":REPOSITORY,"private":false,"visibility":"public","default_branch":"main"}));
+        api.responses.insert(
+            format!("{ROOT}/rulesets?includes_parents=true&per_page=100&page=1"),
+            json!([{"id":7,"name":"b10x-bot-branch-authority"}]),
+        );
+        api.responses.insert(AUTHORITY.into(), json!({"id":7,"name":"b10x-bot-branch-authority","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":4579525,"actor_type":"Integration","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]}));
+        api.responses.insert(
+            REF.into(),
+            json!({"ref":"refs/heads/main","object":{"type":"commit","sha":merge}}),
+        );
+        let mut fixture = Self {
+            dir,
+            prior_head,
+            base,
+            update,
+            merge,
+            candidate,
+            tree,
+            policy,
+            api,
+        };
+        fixture.prove_commit(
+            fixture.update.clone(),
+            &fixture.update_parents(),
+            fixture.tree.clone(),
+        );
+        fixture.prove_commit(
+            fixture.merge.clone(),
+            &fixture.merge_parents(),
+            fixture.tree.clone(),
+        );
+        let pull = fixture.pull();
+        fixture.api.responses.insert(
+            format!(
+                "{ROOT}/commits/{}/pulls?per_page=100&page=1",
+                fixture.update
+            ),
+            json!([pull.clone()]),
+        );
+        fixture.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", fixture.merge),
+            json!([pull.clone()]),
+        );
+        fixture
+            .api
+            .responses
+            .insert(format!("{ROOT}/pulls/404"), pull);
+        fixture
+    }
+
+    fn update_parents(&self) -> [String; 2] {
+        [self.prior_head.clone(), self.base.clone()]
+    }
+
+    fn merge_parents(&self) -> [String; 2] {
+        [self.base.clone(), self.update.clone()]
+    }
+
+    fn prove_commit(&mut self, oid: String, parents: &[String], tree: String) {
+        let parents: Vec<_> = parents.iter().map(|sha| json!({"sha":sha})).collect();
+        self.api.responses.insert(format!("{ROOT}/commits/{oid}"), json!({
+            "sha":oid,"author":{"login":BOT_NAME},"committer":{"login":"web-flow"},
+            "commit":{"author":{"name":BOT_NAME,"email":BOT_EMAIL},"committer":{"name":"GitHub","email":"noreply@github.com"},"tree":{"sha":tree},"verification":{"verified":true,"reason":"valid"}},
+            "parents":parents
+        }));
+    }
+
+    fn pull(&self) -> Value {
+        self.pull_with_head(&self.update)
+    }
+
+    fn pull_with_head(&self, head: &str) -> Value {
+        json!({"number":404,"state":"closed","merged":true,"merge_commit_sha":self.merge,
+            "merged_by":{"login":BOT_NAME},
+            "head":{"sha":head,"repo":{"full_name":REPOSITORY,"id":123}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY,"id":123}}})
+    }
+
+    fn update_remote(&mut self) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!("{ROOT}/commits/{}", self.update))
+            .unwrap()
+    }
+
+    fn merge_remote(&mut self) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!("{ROOT}/commits/{}", self.merge))
+            .unwrap()
+    }
+
+    fn update_pulls(&mut self) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!(
+                "{ROOT}/commits/{}/pulls?per_page=100&page=1",
+                self.update
+            ))
+            .unwrap()
+    }
+
+    fn merge_pulls(&mut self) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!(
+                "{ROOT}/commits/{}/pulls?per_page=100&page=1",
+                self.merge
+            ))
+            .unwrap()
+    }
+
+    fn pr(&mut self) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!("{ROOT}/pulls/404"))
+            .unwrap()
+    }
+
+    fn replace_update_raw(&mut self, author: &str, committer: &str, parents: &[String]) {
+        let mut raw = format!("tree {}\n", self.tree);
+        for parent in parents {
+            raw.push_str(&format!("parent {parent}\n"));
+        }
+        raw.push_str(&format!(
+            "author {author}\ncommitter {committer}\n\nreplacement update\n"
+        ));
+        self.update = git(
+            self.dir.path(),
+            &[
+                "hash-object",
+                "--literally",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ],
+            raw.as_bytes(),
+        );
+        self.replace_final(
+            &self.tree.clone(),
+            &[self.base.clone(), self.update.clone()],
+        );
+        self.prove_commit(self.update.clone(), parents, self.tree.clone());
+        let pull = self.pull();
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.update),
+            json!([pull]),
+        );
+    }
+
+    fn replace_final(&mut self, tree: &str, parents: &[String]) {
+        self.replace_final_with_head(tree, parents, &self.update.clone());
+    }
+
+    fn replace_final_with_head(&mut self, tree: &str, parents: &[String], head: &str) {
+        let parent_refs: Vec<_> = parents.iter().map(String::as_str).collect();
+        self.merge = commit(
+            self.dir.path(),
+            tree,
+            &parent_refs,
+            true,
+            "replacement final merge",
+        );
+        self.candidate = commit(
+            self.dir.path(),
+            tree,
+            &[&self.merge],
+            false,
+            "replacement candidate",
+        );
+        git(
+            self.dir.path(),
+            &["update-ref", "refs/heads/main", &self.candidate],
+            b"",
+        );
+        self.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(self.merge);
+        self.prove_commit(self.merge.clone(), parents, tree.to_owned());
+        let pull = self.pull_with_head(head);
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.update),
+            json!([pull.clone()]),
+        );
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.merge),
+            json!([pull.clone()]),
+        );
+        self.api.responses.insert(format!("{ROOT}/pulls/404"), pull);
+    }
+
+    fn replace_final_raw(&mut self, tree: &str, parents: &[String], author: &str, committer: &str) {
+        let mut raw = format!("tree {tree}\n");
+        for parent in parents {
+            raw.push_str(&format!("parent {parent}\n"));
+        }
+        raw.push_str(&format!(
+            "author {author}\ncommitter {committer}\n\nreplacement final merge\n"
+        ));
+        self.merge = git(
+            self.dir.path(),
+            &[
+                "hash-object",
+                "--literally",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ],
+            raw.as_bytes(),
+        );
+        self.candidate = commit(
+            self.dir.path(),
+            tree,
+            &[&self.merge],
+            false,
+            "replacement candidate",
+        );
+        git(
+            self.dir.path(),
+            &["update-ref", "refs/heads/main", &self.candidate],
+            b"",
+        );
+        self.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(self.merge);
+        self.prove_commit(self.merge.clone(), parents, tree.to_owned());
+        let pull = self.pull();
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.update),
+            json!([pull.clone()]),
+        );
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.merge),
+            json!([pull.clone()]),
+        );
+        self.api.responses.insert(format!("{ROOT}/pulls/404"), pull);
+    }
+
+    fn verify(&self) -> [Result<()>; 2] {
+        let git = Git::new(self.dir.path()).unwrap();
+        [
+            b10x_gates::delivery::verify_publication(
+                &git,
+                &self.policy,
+                REPOSITORY,
+                &self.candidate,
+                &self.api,
+            ),
+            b10x_gates::hooks::verify_pre_push(
+                &git,
+                &self.policy,
+                REPOSITORY,
+                &self.candidate,
+                &self.api,
+            ),
+        ]
+    }
+
+    fn assert_refused(&self, mutation: &str) {
+        for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+            .into_iter()
+            .zip(self.verify())
+        {
+            assert!(result.is_err(), "{mutation} admitted through {entrypoint}");
+        }
+    }
+}
+
+#[test]
+fn exact_update_branch_then_final_merge_is_admitted_by_both_entrypoints() {
+    let fixture = UpdateFixture::new();
+    let failures: Vec<_> = ["verify_publication", "verify_pre_push"]
+        .into_iter()
+        .zip(fixture.verify())
+        .filter_map(|(entrypoint, result)| result.err().map(|error| (entrypoint, error)))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "exact authenticated update graph refused: {failures:#?}"
+    );
+}
+
+#[test]
+fn update_branch_local_and_remote_commit_identity_is_exact() {
+    macro_rules! refusal {
+        ($label:literal, $change:expr) => {{
+            let mut fixture = UpdateFixture::new();
+            ($change)(&mut fixture);
+            fixture.assert_refused($label);
+        }};
+    }
+
+    refusal!("local update author", |f: &mut UpdateFixture| {
+        let parents = f.update_parents();
+        f.replace_update_raw(
+            "Human <human@example.invalid> 1700000000 +0000",
+            "GitHub <noreply@github.com> 1700000000 +0000",
+            &parents,
+        );
+    });
+    refusal!("local update committer", |f: &mut UpdateFixture| {
+        let parents = f.update_parents();
+        f.replace_update_raw(
+            &format!("{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000"),
+            "Human <human@example.invalid> 1700000000 +0000",
+            &parents,
+        );
+    });
+    refusal!("duplicate local update author", |f: &mut UpdateFixture| {
+        let parents = f.update_parents();
+        f.replace_update_raw(
+            &format!(
+                "{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000\nauthor Human <human@example.invalid> 1700000000 +0000"
+            ),
+            "GitHub <noreply@github.com> 1700000000 +0000",
+            &parents,
+        );
+    });
+    refusal!("reversed local update parents", |f: &mut UpdateFixture| {
+        let parents = [f.base.clone(), f.prior_head.clone()];
+        f.replace_update_raw(
+            &format!("{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000"),
+            "GitHub <noreply@github.com> 1700000000 +0000",
+            &parents,
+        );
+    });
+    refusal!("remote update SHA", |f: &mut UpdateFixture| {
+        let other = f.prior_head.clone();
+        f.update_remote()["sha"] = json!(other);
+    });
+    refusal!("remote update author account", |f: &mut UpdateFixture| {
+        f.update_remote()["author"]["login"] = json!("other[bot]");
+    });
+    refusal!("remote update author identity", |f: &mut UpdateFixture| {
+        f.update_remote()["commit"]["author"]["email"] = json!("forged@example.invalid");
+    });
+    refusal!(
+        "remote update committer account",
+        |f: &mut UpdateFixture| {
+            f.update_remote()["committer"]["login"] = json!("other[bot]");
+        }
+    );
+    refusal!(
+        "remote update committer identity",
+        |f: &mut UpdateFixture| {
+            f.update_remote()["commit"]["committer"]["email"] = json!("forged@example.invalid");
+        }
+    );
+    refusal!("remote update signature", |f: &mut UpdateFixture| {
+        f.update_remote()["commit"]["verification"]["verified"] = json!(false);
+    });
+    refusal!("remote update signature reason", |f: &mut UpdateFixture| {
+        f.update_remote()["commit"]["verification"]["reason"] = json!("invalid");
+    });
+    refusal!("remote update parent order", |f: &mut UpdateFixture| {
+        f.update_remote()["parents"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+    });
+    refusal!("remote update tree", |f: &mut UpdateFixture| {
+        f.update_remote()["commit"]["tree"]["sha"] =
+            json!("1111111111111111111111111111111111111111");
+    });
+}
+
+#[test]
+fn update_branch_associations_are_complete_unique_and_exhaustive() {
+    let mut missing = UpdateFixture::new();
+    missing.update_pulls().as_array_mut().unwrap().clear();
+    missing.assert_refused("missing update association");
+
+    let mut malformed = UpdateFixture::new();
+    malformed
+        .update_pulls()
+        .as_array_mut()
+        .unwrap()
+        .push(Value::Null);
+    malformed.assert_refused("malformed update association");
+
+    let mut ambiguous = UpdateFixture::new();
+    let mut duplicate = ambiguous.update_pulls()[0].clone();
+    duplicate["number"] = json!(405);
+    ambiguous
+        .update_pulls()
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    ambiguous.assert_refused("multiple completed update associations");
+
+    let mut terminal_failure = UpdateFixture::new();
+    let mut claimed_terminal = terminal_failure.update_pulls()[0].clone();
+    claimed_terminal["number"] = json!(405);
+    claimed_terminal["merge_commit_sha"] = json!(terminal_failure.update.clone());
+    terminal_failure
+        .update_pulls()
+        .as_array_mut()
+        .unwrap()
+        .push(claimed_terminal);
+    terminal_failure.assert_refused("failed terminal proof reinterpreted as update");
+
+    let mut paginated = UpdateFixture::new();
+    let path = format!(
+        "{ROOT}/commits/{}/pulls?per_page=100&page=1",
+        paginated.update
+    );
+    let real = paginated.api.responses[&path][0].clone();
+    let mut first = vec![real.clone()];
+    first.extend((2..=100).map(|number| json!({"number":number,"merge_commit_sha":null})));
+    paginated.api.responses.insert(path, json!(first));
+    paginated.api.responses.insert(
+        format!(
+            "{ROOT}/commits/{}/pulls?per_page=100&page=2",
+            paginated.update
+        ),
+        json!([real]),
+    );
+    paginated.assert_refused("later-page duplicate update association");
+}
+
+#[test]
+fn update_branch_pull_request_summary_and_detail_are_bound() {
+    macro_rules! refusal {
+        ($label:literal, $change:expr) => {{
+            let mut fixture = UpdateFixture::new();
+            ($change)(&mut fixture);
+            fixture.assert_refused($label);
+        }};
+    }
+
+    refusal!("summary number", |f: &mut UpdateFixture| {
+        f.update_pulls()[0]["number"] = json!(405);
+    });
+    refusal!("summary repository name", |f: &mut UpdateFixture| {
+        f.update_pulls()[0]["head"]["repo"]["full_name"] = json!("elsewhere/repository");
+    });
+    refusal!("summary repository id", |f: &mut UpdateFixture| {
+        f.update_pulls()[0]["base"]["repo"]["id"] = json!(124);
+    });
+    refusal!("summary head", |f: &mut UpdateFixture| {
+        let other = f.prior_head.clone();
+        f.update_pulls()[0]["head"]["sha"] = json!(other);
+    });
+    refusal!("summary base", |f: &mut UpdateFixture| {
+        f.update_pulls()[0]["base"]["ref"] = json!("topic");
+    });
+    refusal!("detail number", |f: &mut UpdateFixture| {
+        f.pr()["number"] = json!(405);
+    });
+    refusal!("detail merge identity", |f: &mut UpdateFixture| {
+        let other = f.update.clone();
+        f.pr()["merge_commit_sha"] = json!(other);
+    });
+    refusal!("detail actor", |f: &mut UpdateFixture| {
+        f.pr()["merged_by"]["login"] = json!("other[bot]");
+    });
+    refusal!("detail open state", |f: &mut UpdateFixture| {
+        f.pr()["state"] = json!("open");
+    });
+    refusal!("detail unmerged state", |f: &mut UpdateFixture| {
+        f.pr()["merged"] = json!(false);
+    });
+    refusal!("detail fork", |f: &mut UpdateFixture| {
+        f.pr()["head"]["repo"]["full_name"] = json!("elsewhere/repository");
+    });
+    refusal!("detail repository id", |f: &mut UpdateFixture| {
+        f.pr()["base"]["repo"]["id"] = json!(124);
+    });
+    refusal!("detail nondefault base", |f: &mut UpdateFixture| {
+        f.pr()["base"]["ref"] = json!("topic");
+    });
+    refusal!("detail accepted head", |f: &mut UpdateFixture| {
+        let other = f.prior_head.clone();
+        f.pr()["head"]["sha"] = json!(other);
+    });
+}
+
+#[test]
+fn final_merge_is_exactly_authenticated_and_bound_to_the_same_pull_request() {
+    macro_rules! refusal {
+        ($label:literal, $change:expr) => {{
+            let mut fixture = UpdateFixture::new();
+            ($change)(&mut fixture);
+            fixture.assert_refused($label);
+        }};
+    }
+
+    refusal!("local final merge author", |f: &mut UpdateFixture| {
+        let parents = f.merge_parents();
+        let tree = f.tree.clone();
+        f.replace_final_raw(
+            &tree,
+            &parents,
+            "Human <human@example.invalid> 1700000000 +0000",
+            "GitHub <noreply@github.com> 1700000000 +0000",
+        );
+    });
+    refusal!("local final merge committer", |f: &mut UpdateFixture| {
+        let parents = f.merge_parents();
+        let tree = f.tree.clone();
+        f.replace_final_raw(
+            &tree,
+            &parents,
+            &format!("{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000"),
+            "Human <human@example.invalid> 1700000000 +0000",
+        );
+    });
+    refusal!("remote final merge SHA", |f: &mut UpdateFixture| {
+        let other = f.update.clone();
+        f.merge_remote()["sha"] = json!(other);
+    });
+    refusal!("remote final merge author", |f: &mut UpdateFixture| {
+        f.merge_remote()["author"]["login"] = json!("other[bot]");
+    });
+    refusal!("remote final merge committer", |f: &mut UpdateFixture| {
+        f.merge_remote()["committer"]["login"] = json!("other[bot]");
+    });
+    refusal!("remote final merge signature", |f: &mut UpdateFixture| {
+        f.merge_remote()["commit"]["verification"]["verified"] = json!(false);
+    });
+    refusal!(
+        "remote final merge parent order",
+        |f: &mut UpdateFixture| {
+            f.merge_remote()["parents"]
+                .as_array_mut()
+                .unwrap()
+                .swap(0, 1);
+        }
+    );
+    refusal!("remote final merge tree", |f: &mut UpdateFixture| {
+        f.merge_remote()["commit"]["tree"]["sha"] =
+            json!("1111111111111111111111111111111111111111");
+    });
+    refusal!(
+        "missing final merge association",
+        |f: &mut UpdateFixture| {
+            f.merge_pulls().as_array_mut().unwrap().clear();
+        }
+    );
+    refusal!(
+        "ambiguous final merge association",
+        |f: &mut UpdateFixture| {
+            let mut duplicate = f.merge_pulls()[0].clone();
+            duplicate["number"] = json!(405);
+            f.merge_pulls().as_array_mut().unwrap().push(duplicate);
+        }
+    );
+    refusal!(
+        "different completed final association",
+        |f: &mut UpdateFixture| {
+            let mut different = f.merge_pulls()[0].clone();
+            different["number"] = json!(405);
+            different["merge_commit_sha"] = json!("1111111111111111111111111111111111111111");
+            f.merge_pulls().as_array_mut().unwrap().push(different);
+        }
+    );
+    refusal!("final merge tied to another PR", |f: &mut UpdateFixture| {
+        f.merge_pulls()[0]["number"] = json!(405);
+    });
+    refusal!("final merge summary repository", |f: &mut UpdateFixture| {
+        f.merge_pulls()[0]["base"]["repo"]["full_name"] = json!("elsewhere/repository");
+    });
+    refusal!("final merge summary head", |f: &mut UpdateFixture| {
+        let other = f.prior_head.clone();
+        f.merge_pulls()[0]["head"]["sha"] = json!(other);
+    });
+    refusal!("final merge summary base", |f: &mut UpdateFixture| {
+        f.merge_pulls()[0]["base"]["ref"] = json!("topic");
+    });
+    refusal!("unpublished final merge", |f: &mut UpdateFixture| {
+        f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(f.update);
+    });
+
+    let mut changed_tree = UpdateFixture::new();
+    let blob = git(
+        changed_tree.dir.path(),
+        &["hash-object", "-w", "--stdin"],
+        b"changed final tree\n",
+    );
+    let tree = git(
+        changed_tree.dir.path(),
+        &["mktree"],
+        format!("100644 blob {blob}\tchanged\n").as_bytes(),
+    );
+    let parents = changed_tree.merge_parents();
+    changed_tree.replace_final(&tree, &parents);
+    changed_tree.assert_refused("final merge tree differs from accepted head");
+}
+
+#[test]
+fn missing_local_update_graph_objects_refuse() {
+    for object in ["prior", "base", "update", "merge", "tree"] {
+        let fixture = UpdateFixture::new();
+        let oid = match object {
+            "prior" => &fixture.prior_head,
+            "base" => &fixture.base,
+            "update" => &fixture.update,
+            "merge" => &fixture.merge,
+            "tree" => &fixture.tree,
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(
+            fixture
+                .dir
+                .path()
+                .join(".git/objects")
+                .join(&oid[..2])
+                .join(&oid[2..]),
+        )
+        .unwrap();
+        fixture.assert_refused(&format!("missing local {object} object"));
+    }
+}
+
+#[test]
+fn unsupported_update_branch_shapes_refuse() {
+    let mut direct_after_update = UpdateFixture::new();
+    let direct = commit(
+        direct_after_update.dir.path(),
+        &direct_after_update.tree,
+        &[&direct_after_update.update],
+        false,
+        "direct head after update",
+    );
+    let parents = [direct_after_update.base.clone(), direct.clone()];
+    direct_after_update.replace_final_with_head(
+        &direct_after_update.tree.clone(),
+        &parents,
+        &direct,
+    );
+    direct_after_update.assert_refused("direct head commit after update");
+
+    let mut multiple_updates = UpdateFixture::new();
+    let advanced_base = commit(
+        multiple_updates.dir.path(),
+        &multiple_updates.tree,
+        &[&multiple_updates.base],
+        false,
+        "base advances again",
+    );
+    let second_update = commit(
+        multiple_updates.dir.path(),
+        &multiple_updates.tree,
+        &[&multiple_updates.update, &advanced_base],
+        true,
+        "second update",
+    );
+    let final_parents = [advanced_base.clone(), second_update.clone()];
+    multiple_updates.replace_final_with_head(
+        &multiple_updates.tree.clone(),
+        &final_parents,
+        &second_update,
+    );
+    multiple_updates.prove_commit(
+        second_update.clone(),
+        &[multiple_updates.update.clone(), advanced_base],
+        multiple_updates.tree.clone(),
+    );
+    let pull = multiple_updates.pull_with_head(&second_update);
+    multiple_updates.api.responses.insert(
+        format!("{ROOT}/commits/{second_update}/pulls?per_page=100&page=1"),
+        json!([pull]),
+    );
+    multiple_updates.assert_refused("multiple branch updates");
+
+    let mut squash = UpdateFixture::new();
+    squash.replace_final(&squash.tree.clone(), &[squash.base.clone()]);
+    squash.assert_refused("squash final merge");
+
+    let mut rebase = UpdateFixture::new();
+    rebase.replace_final(&rebase.tree.clone(), &[rebase.update.clone()]);
+    rebase.assert_refused("rebase-shaped final merge");
+
+    let mut advanced_final_base = UpdateFixture::new();
+    let advanced = commit(
+        advanced_final_base.dir.path(),
+        &advanced_final_base.tree,
+        &[&advanced_final_base.base],
+        false,
+        "advanced final base",
+    );
+    advanced_final_base.replace_final(
+        &advanced_final_base.tree.clone(),
+        &[advanced, advanced_final_base.update.clone()],
+    );
+    advanced_final_base.assert_refused("advanced final base");
+}
+
 #[test]
 fn published_bot_merge_allows_a_new_exact_bot_descendant() {
     let f = Fixture::new();
