@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-03T08:52:15Z",
+  "actor": "human:timo",
+  "artifact": "story:release-artifact-validation",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Frozen implementation: full gate 152 passed, 7 existing ignored; independent focused pass 2: 11 passed; executable-byte and hidden-string mutations red then restored green"
+  }
+}

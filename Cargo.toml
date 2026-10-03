@@ -23,6 +23,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 jsonwebtoken = "9"
 tempfile = "3"
 libc = "0.2"
+# Parse the supported ELF release format without maintaining a second binary parser.
+object = { version = "0.40", default-features = false, features = ["elf", "read_core", "std"] }
 
 [profile.dev]
 debug = 0
