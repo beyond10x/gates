@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: task:verify-published-bot-merge-ancestry
 kind: task
 status: implemented
@@ -8,6 +8,10 @@ relations:
 - derived_from: story:public-shared-gates
 - derived_from: story:published-merge-delivery
 revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T04:20:09Z", actor: "agent:codex-ekr-completion-20260922", revision: 3, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T04:20:09Z", actor: "agent:codex-ekr-completion-20260922", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-22T04:20:09Z", actor: "agent:codex-ekr-completion-20260922", revision: 5, imported: true}
 ---
 ## Problem and authority
 

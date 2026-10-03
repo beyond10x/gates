@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-29T03:54:03Z",
+  "actor": "human:timo",
+  "artifact": "story:ancestor-receipt-reuse",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Gates correctness on main ea594906 (PR #25 merge), success",
+    "reference": "https://github.com/beyond10x/gates/actions/runs/36519086167"
+  }
+}

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: task:automation-authorship-ess-release
 kind: task
 status: implemented
@@ -7,6 +7,10 @@ title: Enforce automation authorship and release the repaired ESS pull requests
 relations:
 - derived_from: story:public-shared-gates
 revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-10T18:57:13Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-10T18:57:38Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-10T20:13:16Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":4,"deployment_result":1}}, imported: true}
 ---
 ## Context
 

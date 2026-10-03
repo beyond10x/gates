@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-29T03:48:01Z",
+  "actor": "human:timo",
+  "artifact": "story:ancestor-receipt-reuse",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:security-review-ancestor-receipt-reuse",
+    "review": "review-result:security-review-ancestor-receipt-reuse",
+    "outcome": "no-op"
+  }
+}

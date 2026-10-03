@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:published-merge-delivery
 kind: story
 status: implemented
@@ -30,6 +30,10 @@ scope:
 - confidence: cited
   path: tests/security.rs
 revision: 16
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-22T03:19:03Z", actor: "agent:codex-ekr-completion-20260922", revision: 10, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-22T03:19:03Z", actor: "agent:codex-ekr-completion-20260922", revision: 11, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-22T04:20:09Z", actor: "agent:codex-ekr-completion-20260922", revision: 16, decided_on: {"recorded":{"test_result":2,"review_outcome":1}}, imported: true}
 ---
 ## Problem and authority
 

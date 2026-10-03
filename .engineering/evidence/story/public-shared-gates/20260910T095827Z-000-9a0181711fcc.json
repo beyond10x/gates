@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-10T09:58:27Z",
+  "actor": "human:timo",
+  "artifact": "story:public-shared-gates",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo run --locked -- gate: 14 security tests, real Gitleaks, formatter and strict Clippy passed; private-pattern, signature, history and index mutations each failed their regression and were restored"
+  }
+}

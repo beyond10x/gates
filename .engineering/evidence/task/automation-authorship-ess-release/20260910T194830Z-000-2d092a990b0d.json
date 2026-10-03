@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-10T19:48:30Z",
+  "actor": "human:timo",
+  "artifact": "task:automation-authorship-ess-release",
+  "kind": "task",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/ess/actions/runs/34519741062",
+    "reference": "https://github.com/beyond10x/ess/commit/6b666e58f2e87dd8798d27f935e9a012203296a3"
+  }
+}
