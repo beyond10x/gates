@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.13 — unreleased
+
+- Admit a GitHub-created merge in the delivery range of a private enrolled repository. Until
+  now `published_merge::verify` refused every private repository ("remote repository is not
+  public"), because the App-only branch ruleset it reads is unavailable on that plan, so each
+  pull-request merge blocked later bot pushes until the policy baseline was moved past it.
+- The authenticated repository visibility selects the proof. Public repositories still require
+  the exact App-only branch authority; a public repository without it refuses, and the private
+  proof is never a fallback. Contradictory or other visibilities (`internal`) refuse.
+- On a private repository each merge must be the verified GitHub-signed two-parent merge of a
+  completed same-repository pull request whose `merge_commit_sha` is that merge, whose head is
+  the second parent and supplies the tree unchanged, and which was both opened and merged by the
+  exact bot account: login, `Bot` type and numeric id. Every head commit is still walked and
+  must carry the exact bot identity. Update-branch merges follow the same rule.
+- Squash merges are refused on private repositories. Their head commits are outside the walked
+  ancestry, and without a ruleset nothing proves who wrote them.
+- No policy field or receipt format changes. The version increment invalidates receipts
+  retained under 0.1.12, so the first check after upgrading scans in full once.
+
 ## 0.1.12 — 2026-10-03
 
 - Add `scan-artifact` for bounded ELF64 little-endian release executables. It validates the
