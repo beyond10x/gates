@@ -2041,9 +2041,11 @@ fn review_private_pull_request_from_another_repository_refuses() {
     }
 }
 
+type VisibilityCase = (&'static str, fn(&mut Value));
+
 #[test]
 fn review_private_visibility_edge_cases_refuse() {
-    let cases: [(&str, fn(&mut Value)); 4] = [
+    let cases: [VisibilityCase; 4] = [
         ("private flag with internal visibility", |root| {
             root["visibility"] = json!("internal")
         }),
