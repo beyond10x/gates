@@ -1,13 +1,19 @@
 //! Authenticated authority for historical GitHub App merges in delivery ancestry.
+//!
+//! A public repository proves App-only writes through its branch ruleset. A private repository
+//! on a plan without rulesets proves each merge through its pull-request record instead: opened
+//! and merged by the exact bot account, two parents only, head tree adopted unchanged.
 use crate::{
     BOT_EMAIL, BOT_NAME,
     git::{Git, exact_identity, is_oid, unique_header},
     policy::{Policy, valid_repository},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 const BOT_APP_ID: u64 = 4_579_525;
+/// The numeric account behind `BOT_NAME`; `BOT_EMAIL` carries the same number.
+const BOT_USER_ID: u64 = 316_511_680;
 const AUTHORITY_NAME: &str = "b10x-bot-branch-authority";
 
 /// Read evidence from the authenticated GitHub API. Production uses `Github`;
@@ -16,11 +22,24 @@ pub trait AuthenticatedRead {
     fn get(&self, path: &str) -> Result<Value>;
 }
 
+/// Which proof the authenticated repository visibility selects. It is never chosen by which
+/// evidence happens to answer: a public repository without its branch authority refuses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    /// The App-only branch ruleset proves only the App can write any branch.
+    Public,
+    /// No ruleset is available on the plan. Each pull request must instead be opened and merged
+    /// by the exact bot account, and only two-parent merges are admitted, so every head commit
+    /// stays inside the walked ancestry.
+    Private,
+}
+
 struct Authority {
     root: String,
     repository_id: u64,
     default_branch: String,
     published_head: String,
+    visibility: Visibility,
 }
 
 struct GithubCommit {
@@ -136,6 +155,14 @@ fn oid<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
     Ok(id)
 }
 
+fn bot_account(value: &Value, pointer: &str) -> bool {
+    value.pointer(pointer).is_some_and(|account| {
+        account.get("login").and_then(Value::as_str) == Some(BOT_NAME)
+            && account.get("type").and_then(Value::as_str) == Some("Bot")
+            && account.get("id").and_then(Value::as_u64) == Some(BOT_USER_ID)
+    })
+}
+
 fn pages(api: &impl AuthenticatedRead, path: &str) -> Result<Vec<Value>> {
     let separator = if path.contains('?') { '&' } else { '?' };
     let mut items = Vec::new();
@@ -183,57 +210,19 @@ impl Authority {
                 && string(&remote, "/full_name")? == repository,
             "remote repository identity mismatch"
         );
-        ensure!(
-            remote.get("private") == Some(&json!(false))
-                && string(&remote, "/visibility")? == "public",
-            "remote repository is not public"
-        );
+        let visibility = match (
+            remote.get("private"),
+            remote.get("visibility").and_then(Value::as_str),
+        ) {
+            (Some(Value::Bool(false)), Some("public")) => Visibility::Public,
+            (Some(Value::Bool(true)), Some("private")) => Visibility::Private,
+            _ => bail!("remote repository visibility is contradictory or unsupported"),
+        };
         let default_branch = string(&remote, "/default_branch")?.to_owned();
         git.read(&["check-ref-format", &format!("refs/heads/{default_branch}")])?;
 
-        let rulesets = pages(api, &format!("{root}/rulesets?includes_parents=true"))?;
-        for ruleset in &rulesets {
-            ensure!(
-                ruleset
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|id| id > 0)
-                    && !string(ruleset, "/name")?.is_empty(),
-                "branch authority list entry missing or malformed"
-            );
-        }
-        let matches: Vec<_> = rulesets
-            .iter()
-            .filter(|v| v.get("name").and_then(Value::as_str) == Some(AUTHORITY_NAME))
-            .collect();
-        ensure!(matches.len() == 1, "branch authority missing or ambiguous");
-        let id = matches[0]
-            .get("id")
-            .and_then(Value::as_u64)
-            .context("branch authority identity missing")?;
-        let authority = api.get(&format!("{root}/rulesets/{id}"))?;
-        let expected = json!({
-            "name":AUTHORITY_NAME,"target":"branch","enforcement":"active",
-            "bypass_actors":[{"actor_id":BOT_APP_ID,"actor_type":"Integration","bypass_mode":"always"}],
-            "conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
-            "rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]
-        });
-        ensure!(
-            authority.get("id").and_then(Value::as_u64) == Some(id),
-            "branch authority identity mismatch"
-        );
-        for key in [
-            "name",
-            "target",
-            "enforcement",
-            "bypass_actors",
-            "conditions",
-            "rules",
-        ] {
-            ensure!(
-                authority.get(key) == expected.get(key),
-                "exact App-only branch authority unavailable"
-            );
+        if visibility == Visibility::Public {
+            verify_branch_authority(api, &root)?;
         }
 
         let reference = api.get(&format!(
@@ -255,9 +244,60 @@ impl Authority {
             repository_id,
             default_branch,
             published_head,
+            visibility,
         })
     }
+}
 
+fn verify_branch_authority(api: &impl AuthenticatedRead, root: &str) -> Result<()> {
+    let rulesets = pages(api, &format!("{root}/rulesets?includes_parents=true"))?;
+    for ruleset in &rulesets {
+        ensure!(
+            ruleset
+                .get("id")
+                .and_then(Value::as_u64)
+                .is_some_and(|id| id > 0)
+                && !string(ruleset, "/name")?.is_empty(),
+            "branch authority list entry missing or malformed"
+        );
+    }
+    let matches: Vec<_> = rulesets
+        .iter()
+        .filter(|v| v.get("name").and_then(Value::as_str) == Some(AUTHORITY_NAME))
+        .collect();
+    ensure!(matches.len() == 1, "branch authority missing or ambiguous");
+    let id = matches[0]
+        .get("id")
+        .and_then(Value::as_u64)
+        .context("branch authority identity missing")?;
+    let authority = api.get(&format!("{root}/rulesets/{id}"))?;
+    let expected = json!({
+        "name":AUTHORITY_NAME,"target":"branch","enforcement":"active",
+        "bypass_actors":[{"actor_id":BOT_APP_ID,"actor_type":"Integration","bypass_mode":"always"}],
+        "conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        "rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]
+    });
+    ensure!(
+        authority.get("id").and_then(Value::as_u64) == Some(id),
+        "branch authority identity mismatch"
+    );
+    for key in [
+        "name",
+        "target",
+        "enforcement",
+        "bypass_actors",
+        "conditions",
+        "rules",
+    ] {
+        ensure!(
+            authority.get(key) == expected.get(key),
+            "exact App-only branch authority unavailable"
+        );
+    }
+    Ok(())
+}
+
+impl Authority {
     fn verify_github_commit(
         &self,
         git: &Git,
@@ -528,6 +568,14 @@ impl Authority {
         // This is weaker than the two-parent proof by exactly one property: the reviewed tree is
         // not re-derived locally. Admitted deliberately, because a repository whose default
         // branch has taken one squash merge can otherwise never deliver again.
+        //
+        // It rests on the branch authority: the squashed head commits are outside the walked
+        // ancestry, and only the ruleset proves the App alone wrote them. A private repository
+        // has no ruleset, so nothing proves who wrote that head, and the shape is refused there.
+        ensure!(
+            self.visibility == Visibility::Public,
+            "private repository admits only two-parent pull-request merges"
+        );
         ensure!(
             oid(&pr, "/base/sha")? == commit.parents[0],
             "squash merge parent is not the pull request base"
@@ -559,6 +607,19 @@ impl Authority {
             string(&pr, "/merged_by/login")? == BOT_NAME,
             "pull request was not merged by the exact bot"
         );
+        if self.visibility == Visibility::Private {
+            // Without a ruleset, the merge record is the authority. The `[bot]` login suffix is
+            // reserved for Apps; the type and numeric id bind it to this account, not to a
+            // reused name.
+            ensure!(
+                bot_account(&pr, "/merged_by"),
+                "pull request was not merged by the exact bot account"
+            );
+            ensure!(
+                bot_account(&pr, "/user"),
+                "pull request was not opened by the exact bot account"
+            );
+        }
         self.ensure_same_repository(&pr, repository)?;
         ensure!(
             string(&pr, "/base/ref")? == self.default_branch,
@@ -579,5 +640,16 @@ impl Authority {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bot_user_id_is_the_account_in_the_bot_email() {
+        assert!(
+            crate::BOT_EMAIL.starts_with(&format!("{}+", super::BOT_USER_ID)),
+            "BOT_USER_ID and BOT_EMAIL name different accounts"
+        );
     }
 }

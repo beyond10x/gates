@@ -1708,3 +1708,373 @@ fn branch_with_slash_is_encoded_as_api_path_data() {
     f.pr()["base"]["ref"] = json!("releases/main");
     f.verify().unwrap();
 }
+
+const BOT_USER_ID: u64 = 316_511_680;
+
+fn bot_account() -> Value {
+    json!({"login":BOT_NAME,"type":"Bot","id":BOT_USER_ID})
+}
+
+/// Turn public evidence into what GitHub returns for a private repository on a plan without
+/// rulesets: the repository says private, the ruleset endpoints do not answer, and every
+/// pull-request record carries the full account objects GitHub always returns.
+fn privatize(responses: &mut BTreeMap<String, Value>) {
+    let root = responses.get_mut(ROOT).unwrap();
+    root["private"] = json!(true);
+    root["visibility"] = json!("private");
+    responses.retain(|path, _| !path.contains("/rulesets"));
+    for (path, value) in responses.iter_mut() {
+        if !path.contains("/pulls") {
+            continue;
+        }
+        let records: Vec<&mut Value> = match value {
+            Value::Array(list) => list.iter_mut().collect(),
+            other => vec![other],
+        };
+        for record in records {
+            record["merged_by"] = bot_account();
+            record["user"] = bot_account();
+        }
+    }
+}
+
+impl Fixture {
+    fn private() -> Self {
+        let mut f = Self::new();
+        privatize(&mut f.api.responses);
+        f
+    }
+}
+
+#[test]
+fn private_repository_admits_the_bot_merge_of_a_bot_head_without_rulesets() {
+    let f = Fixture::private();
+    assert!(
+        f.api
+            .responses
+            .keys()
+            .all(|path| !path.contains("rulesets")),
+        "fixture must not offer the ruleset a private repository cannot have"
+    );
+    assert!(
+        f.verify().is_ok(),
+        "the App's merge of a bot head on a private repository must be admitted: {:?}",
+        f.verify()
+    );
+}
+
+#[test]
+fn private_repository_admits_an_exact_update_branch_then_final_merge() {
+    let mut f = UpdateFixture::new();
+    privatize(&mut f.api.responses);
+    for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+        .into_iter()
+        .zip(f.verify())
+    {
+        assert!(result.is_ok(), "{entrypoint} refused: {result:?}");
+    }
+    f.pr()["user"]["login"] = json!("someone");
+    f.assert_refused("private update merge opened by a person");
+}
+
+#[test]
+fn public_repository_still_requires_its_branch_authority() {
+    // The private proof must never become a fallback for a public repository whose ruleset is
+    // missing: the authenticated visibility selects the proof, not the evidence that happens to
+    // answer.
+    let mut f = Fixture::new();
+    f.api
+        .responses
+        .retain(|path, _| !path.contains("/rulesets"));
+    for (path, value) in f.api.responses.iter_mut() {
+        if path.contains("/pulls/") {
+            value["merged_by"] = bot_account();
+            value["user"] = bot_account();
+        }
+    }
+    assert!(
+        f.verify().is_err(),
+        "public repository admitted without rulesets"
+    );
+}
+
+macro_rules! private_refusal {
+    ($name:ident, $needle:expr, $change:expr) => {
+        #[test]
+        fn $name() {
+            let mut f = Fixture::private();
+            f.verify()
+                .expect("the unchanged private fixture is admitted");
+            $change(&mut f);
+            let error = f
+                .verify()
+                .expect_err("invalid private evidence admitted by both delivery paths");
+            assert!(
+                format!("{error:#}").contains($needle),
+                "refused for another reason: {error:#}"
+            );
+        }
+    };
+}
+
+private_refusal!(
+    private_merge_by_a_person_refuses,
+    "merged by the exact bot",
+    |f: &mut Fixture| f.pr()["merged_by"] = json!({"login":"someone","type":"User","id":1})
+);
+private_refusal!(
+    private_merge_by_a_user_account_named_like_the_bot_refuses,
+    "merged by the exact bot account",
+    |f: &mut Fixture| f.pr()["merged_by"]["type"] = json!("User")
+);
+private_refusal!(
+    private_merge_by_another_account_id_refuses,
+    "merged by the exact bot account",
+    |f: &mut Fixture| f.pr()["merged_by"]["id"] = json!(BOT_USER_ID + 1)
+);
+private_refusal!(
+    private_merge_without_account_id_refuses,
+    "merged by the exact bot account",
+    |f: &mut Fixture| f.pr()["merged_by"]["id"] = Value::Null
+);
+private_refusal!(
+    private_pull_request_opened_by_a_person_refuses,
+    "opened by the exact bot account",
+    |f: &mut Fixture| f.pr()["user"] = json!({"login":"someone","type":"User","id":1})
+);
+private_refusal!(
+    private_pull_request_without_opener_refuses,
+    "opened by the exact bot account",
+    |f: &mut Fixture| f.pr()["user"] = Value::Null
+);
+private_refusal!(
+    private_mismatched_merge_commit_sha_refuses,
+    "not this completed merge",
+    |f: &mut Fixture| {
+        let other = f.topic.clone();
+        f.pr()["merge_commit_sha"] = json!(other);
+    }
+);
+private_refusal!(
+    private_mismatched_head_sha_refuses,
+    "head is not the second merge parent",
+    |f: &mut Fixture| {
+        let other = f.baseline.clone();
+        f.pr()["head"]["sha"] = json!(other);
+    }
+);
+private_refusal!(
+    private_unverified_merge_signature_refuses,
+    "signature is not verified",
+    |f: &mut Fixture| f.remote_commit()["commit"]["verification"]["verified"] = json!(false)
+);
+private_refusal!(
+    private_unpublished_merge_refuses,
+    "not on the authenticated published default branch",
+    |f: &mut Fixture| {
+        let baseline = f.baseline.clone();
+        f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(baseline);
+    }
+);
+private_refusal!(
+    private_flag_with_public_visibility_refuses,
+    "visibility",
+    |f: &mut Fixture| f.api.responses.get_mut(ROOT).unwrap()["visibility"] = json!("public")
+);
+private_refusal!(
+    public_flag_with_private_visibility_refuses,
+    "visibility",
+    |f: &mut Fixture| f.api.responses.get_mut(ROOT).unwrap()["private"] = json!(false)
+);
+private_refusal!(
+    internal_visibility_refuses,
+    "visibility",
+    |f: &mut Fixture| f.api.responses.get_mut(ROOT).unwrap()["visibility"] = json!("internal")
+);
+private_refusal!(
+    missing_private_flag_refuses,
+    "visibility",
+    |f: &mut Fixture| f.api.responses.get_mut(ROOT).unwrap()["private"] = Value::Null
+);
+
+#[test]
+fn private_head_with_a_forged_or_foreign_identity_refuses() {
+    // The App's merge record never vouches for the head it accepted: every head commit after the
+    // baseline is still walked and must carry the exact bot identity itself.
+    let mut f = Fixture::private();
+    let raw = format!(
+        "tree {}\nparent {}\nauthor someone <someone@example.invalid> 1700000000 +0000\ncommitter {BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000\n\nforeign head\n",
+        f.tree, f.baseline
+    );
+    let head = git(
+        f.dir.path(),
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        raw.as_bytes(),
+    );
+    let tree = f.tree.clone();
+    let baseline = f.baseline.clone();
+    f.replace_merge(&tree, &[&baseline, &head]);
+    privatize(&mut f.api.responses);
+    assert!(
+        f.verify().is_err(),
+        "foreign head admitted on a private repository"
+    );
+}
+
+#[test]
+fn private_squash_merge_refuses_because_its_head_is_not_walked() {
+    // A squash merge keeps no parent link to the head it accepted, so the head commits are never
+    // walked. On a public repository the branch authority proves only the App wrote them; a
+    // private repository has nothing that can, so the shape is refused there.
+    let mut f = Fixture::new();
+    let tree = f.tree.clone();
+    let baseline = f.baseline.clone();
+    f.replace_merge(&tree, &[baseline.as_str()]);
+    let merge = f.merge.clone();
+    f.api.responses.insert(format!("{ROOT}/commits/{merge}"), json!({
+        "sha":merge,"author":{"login":BOT_NAME},"committer":{"login":"web-flow"},
+        "commit":{"author":{"name":BOT_NAME,"email":BOT_EMAIL},"committer":{"name":"GitHub","email":"noreply@github.com"},"tree":{"sha":tree},"verification":{"verified":true,"reason":"valid"}},
+        "parents":[{"sha":baseline}]
+    }));
+    let pr = json!({"number":1,"state":"closed","merged":true,"merge_commit_sha":merge,"merged_by":{"login":BOT_NAME},"head":{"sha":f.topic,"repo":{"full_name":REPOSITORY,"id":123}},"base":{"ref":"main","sha":baseline,"repo":{"full_name":REPOSITORY,"id":123}}});
+    f.api.responses.insert(
+        format!("{ROOT}/commits/{merge}/pulls?per_page=100&page=1"),
+        json!([pr.clone()]),
+    );
+    f.api.responses.insert(format!("{ROOT}/pulls/1"), pr);
+    f.verify()
+        .expect("the same squash merge is admitted on a public repository");
+    privatize(&mut f.api.responses);
+    let error = f.verify().expect_err("private squash merge admitted");
+    assert!(
+        format!("{error:#}").contains("only two-parent"),
+        "refused for another reason: {error:#}"
+    );
+}
+
+#[test]
+fn every_private_remote_read_is_required_and_account_fields_fail_closed() {
+    let valid = Fixture::private();
+    for path in valid.api.responses.keys() {
+        let mut f = Fixture::private();
+        f.api.responses.remove(path);
+        assert!(f.verify().is_err(), "missing private read admitted: {path}");
+    }
+    for field in [
+        "/merged_by/login",
+        "/merged_by/type",
+        "/merged_by/id",
+        "/user/login",
+        "/user/type",
+        "/user/id",
+    ] {
+        let mut f = Fixture::private();
+        *f.pr().pointer_mut(field).unwrap() = Value::Null;
+        assert!(f.verify().is_err(), "missing private pr {field} admitted");
+    }
+}
+
+// Review probes for issue #29: each asserts a refusal the private proof promises.
+
+fn assert_private_refusal(f: &Fixture, needle: &str, what: &str) {
+    let error = f
+        .verify()
+        .expect_err(&format!("{what} admitted on a private repository"));
+    assert!(
+        format!("{error:#}").contains(needle),
+        "{what} refused for another reason: {error:#}"
+    );
+}
+
+#[test]
+fn review_private_octopus_merge_refuses() {
+    let mut f = Fixture::new();
+    let tree = f.tree.clone();
+    let baseline = f.baseline.clone();
+    let topic = f.topic.clone();
+    let other = commit(f.dir.path(), &tree, &[&baseline], false, "other");
+    f.replace_merge(&tree, &[&baseline, &topic, &other]);
+    privatize(&mut f.api.responses);
+    assert_private_refusal(&f, "one or two parents", "octopus merge");
+}
+
+#[test]
+fn review_private_rebase_merge_refuses() {
+    // A rebase merge writes one GitHub-committed single-parent commit per head commit; the last
+    // is the pull request's merge_commit_sha. None of them is a two-parent merge.
+    let mut f = Fixture::new();
+    let tree = f.tree.clone();
+    let baseline = f.baseline.clone();
+    let first = commit(f.dir.path(), &tree, &[&baseline], true, "rebased one");
+    let last = commit(f.dir.path(), &tree, &[&first], true, "rebased two");
+    f.candidate = commit(f.dir.path(), &tree, &[&last], false, "candidate");
+    f.merge = last.clone();
+    f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(last);
+    let pr = json!({"number":1,"state":"closed","merged":true,"merge_commit_sha":last,"merged_by":{"login":BOT_NAME},"head":{"sha":f.topic,"repo":{"full_name":REPOSITORY,"id":123}},"base":{"ref":"main","sha":baseline,"repo":{"full_name":REPOSITORY,"id":123}}});
+    for (sha, parent) in [(&first, &baseline), (&last, &first)] {
+        f.api.responses.insert(format!("{ROOT}/commits/{sha}"), json!({
+            "sha":sha,"author":{"login":BOT_NAME},"committer":{"login":"web-flow"},
+            "commit":{"author":{"name":BOT_NAME,"email":BOT_EMAIL},"committer":{"name":"GitHub","email":"noreply@github.com"},"tree":{"sha":tree},"verification":{"verified":true,"reason":"valid"}},
+            "parents":[{"sha":parent}]
+        }));
+        f.api.responses.insert(
+            format!("{ROOT}/commits/{sha}/pulls?per_page=100&page=1"),
+            json!([pr.clone()]),
+        );
+    }
+    f.api.responses.insert(format!("{ROOT}/pulls/1"), pr);
+    privatize(&mut f.api.responses);
+    assert!(
+        f.verify().is_err(),
+        "rebase merge admitted on a private repository"
+    );
+}
+
+#[test]
+fn review_private_pull_request_from_another_repository_refuses() {
+    for side in ["head", "base"] {
+        for (name, id) in [("other/repository", 123), (REPOSITORY, 999)] {
+            let mut f = Fixture::private();
+            f.pr()[side]["repo"] = json!({"full_name":name,"id":id});
+            assert_private_refusal(&f, "not same-repository", "foreign pull request record");
+        }
+    }
+}
+
+#[test]
+fn review_private_visibility_edge_cases_refuse() {
+    let cases: [(&str, fn(&mut Value)); 4] = [
+        ("private flag with internal visibility", |root| {
+            root["visibility"] = json!("internal")
+        }),
+        ("visibility field absent", |root| {
+            root.as_object_mut().unwrap().remove("visibility");
+        }),
+        ("private flag as a string", |root| {
+            root["private"] = json!("true")
+        }),
+        ("visibility in another case", |root| {
+            root["visibility"] = json!("Private")
+        }),
+    ];
+    for (what, change) in cases {
+        let mut f = Fixture::private();
+        change(f.api.responses.get_mut(ROOT).unwrap());
+        assert_private_refusal(&f, "visibility", what);
+    }
+}
+
+#[test]
+fn review_private_policy_repository_id_mismatch_refuses() {
+    let mut f = Fixture::private();
+    f.policy.repositories.get_mut(REPOSITORY).unwrap().id = "124".into();
+    assert_private_refusal(&f, "identity mismatch", "repository id other than the policy's");
+}
+
+#[test]
+fn review_private_update_branch_merged_by_a_person_refuses() {
+    let mut f = UpdateFixture::new();
+    privatize(&mut f.api.responses);
+    f.pr()["merged_by"] = json!({"login":BOT_NAME,"type":"User","id":BOT_USER_ID});
+    f.assert_refused("private update merge merged by a user account");
+}
