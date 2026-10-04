@@ -2068,7 +2068,11 @@ fn review_private_visibility_edge_cases_refuse() {
 fn review_private_policy_repository_id_mismatch_refuses() {
     let mut f = Fixture::private();
     f.policy.repositories.get_mut(REPOSITORY).unwrap().id = "124".into();
-    assert_private_refusal(&f, "identity mismatch", "repository id other than the policy's");
+    assert_private_refusal(
+        &f,
+        "identity mismatch",
+        "repository id other than the policy's",
+    );
 }
 
 #[test]
