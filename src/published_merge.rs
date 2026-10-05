@@ -2,7 +2,8 @@
 //!
 //! A public repository proves App-only writes through its branch ruleset. A private repository
 //! on a plan without rulesets proves each merge through its pull-request record instead: opened
-//! and merged by the exact bot account, two parents only, head tree adopted unchanged.
+//! and merged by the exact bot account, two parents only. On either, a two-parent merge's tree
+//! must be Git's own clean merge of its parents, recomputed locally.
 use crate::{
     BOT_EMAIL, BOT_NAME,
     git::{Git, exact_identity, is_oid, unique_header},
@@ -450,6 +451,18 @@ impl Authority {
                 && git.resolve(&format!("{update}^{{tree}}"))? == update_commit.tree,
             "final merge did not preserve the accepted update tree"
         );
+        // The final merge's local merge of (base, update) is trivially the update's tree, so the
+        // update's own merge of (prior head, base) is recomputed here: it adds nothing of its own
+        // only if Git merges those parents cleanly into exactly its tree.
+        let local = git.merge_tree(&update_commit.parents[0], &update_commit.parents[1])?;
+        ensure!(
+            local.clean,
+            "local merge of the branch update's parents conflicts"
+        );
+        ensure!(
+            local.tree == update_commit.tree,
+            "branch update tree is not the local merge of its parents"
+        );
         self.ensure_published(git, merge)?;
         self.verify_remote_commit(api, merge, &merge_commit)?;
         let merge_pulls = self.pull_associations(api, merge)?;
@@ -526,35 +539,21 @@ impl Authority {
                 oid(&pr, "/head/sha")? == commit.parents[1],
                 "pull request head is not the second merge parent"
             );
-            if git
-                .read(&[
-                    "merge-base",
-                    "--is-ancestor",
-                    &commit.parents[0],
-                    &commit.parents[1],
-                ])
-                .is_err()
-            {
-                // The head did not incorporate the base. That is only a hazard when the base
-                // carried something the head could then have dropped, and the merge tree below
-                // is the head's — so measure the base instead of assuming: admit it when the
-                // base's tree equals the fork point's, which is to say the base added nothing
-                // since the two sides parted.
-                //
-                // A repository whose default branch has taken one merge of a branch cut from
-                // before its tip can otherwise never deliver again, and the branch that produced
-                // this case was cut that way to satisfy this very guard.
-                let fork = git.text(&["merge-base", &commit.parents[0], &commit.parents[1]])?;
-                ensure!(is_oid(&fork), "invalid merge base");
-                ensure!(
-                    git.resolve(&format!("{}^{{tree}}", commit.parents[0]))?
-                        == git.resolve(&format!("{fork}^{{tree}}"))?,
-                    "pull request head did not incorporate its merge basis"
-                );
-            }
+            // Both parents are proved on their own: the base is walked ancestry, and every head
+            // commit carries the exact bot identity. The merge adds nothing of its own only if
+            // its tree is what Git merges from those two parents, so recompute that merge here
+            // rather than trust GitHub's. When the head already contains the base, the merge is
+            // the head's tree; when the base moved on after the head was cut, it carries both.
+            // A conflicted merge was resolved by somebody, so it refuses even when its tree is
+            // the very one Git wrote with the conflict in it.
+            let local = git.merge_tree(&commit.parents[0], &commit.parents[1])?;
             ensure!(
-                git.resolve(&format!("{}^{{tree}}", commit.parents[1]))? == commit.tree,
-                "merge changed the accepted pull request tree"
+                local.clean,
+                "local merge of the pull request base and head conflicts"
+            );
+            ensure!(
+                local.tree == commit.tree,
+                "merge tree is not the local merge of its base and pull request head"
             );
             return Ok(());
         }

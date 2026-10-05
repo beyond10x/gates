@@ -1321,10 +1321,11 @@ fn local_merge_tree_must_equal_pr_head_tree() {
     );
 }
 
-/// A stale PR basis is refused when the base carried content the head could have dropped.
+/// A stale PR basis is refused when the merge dropped content the base carried.
 ///
 /// The base advanced past the fork point with a new file, and the merge adopted the head's tree,
-/// so the base's file is gone from the merge. That is the hazard the basis check exists for.
+/// so the base's file is gone from the merge. Git's own merge of the two parents keeps it, so the
+/// recorded tree is not that merge.
 #[test]
 fn merge_basis_must_already_be_in_pr_head() {
     let mut f = Fixture::new();
@@ -1352,10 +1353,8 @@ fn merge_basis_must_already_be_in_pr_head() {
         .verify()
         .expect_err("a merge that dropped the base's content is refused");
     assert!(
-        error
-            .to_string()
-            .contains("did not incorporate its merge basis"),
-        "refused for the basis, not for another reason: {error:#}"
+        error.to_string().contains("is not the local merge"),
+        "refused for the dropped base content, not for another reason: {error:#}"
     );
 }
 
@@ -1950,6 +1949,351 @@ fn private_squash_merge_refuses_because_its_head_is_not_walked() {
         format!("{error:#}").contains("only two-parent"),
         "refused for another reason: {error:#}"
     );
+}
+
+fn tree_of(root: &Path, files: &[(&str, &[u8])]) -> String {
+    let mut listing = String::new();
+    for (name, content) in files {
+        let blob = git(root, &["hash-object", "-w", "--stdin"], content);
+        listing.push_str(&format!("100644 blob {blob}\t{name}\n"));
+    }
+    git(root, &["mktree"], listing.as_bytes())
+}
+
+/// The tree `git merge-tree` writes for two commits, conflicted or not, with the fixture's own
+/// worktree attributes in force.
+fn written_merge_tree(root: &Path, first: &str, second: &str) -> (String, bool) {
+    let output = Command::new("git")
+        .args(["merge-tree", "--write-tree", "--no-messages", first, second])
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let clean = match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!("merge-tree failed: {other:?}"),
+    };
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    (stdout.lines().next().unwrap().to_owned(), clean)
+}
+
+/// The shape every pull request merged after another one has: the base took a GitHub merge of
+/// pull request 2 after pull request 1's head was cut, so pull request 1's merge is a real merge
+/// whose tree carries both sides and equals neither parent's.
+struct MovedBase {
+    base: String,
+    head: String,
+}
+
+impl Fixture {
+    /// Pull request 2 adds `landed` and is merged by GitHub; pull request 1's head, cut from the
+    /// baseline before that, adds `head_file`.
+    fn moved_base(&mut self, head_file: (&str, &[u8])) -> MovedBase {
+        let root = self.dir.path().to_path_buf();
+        let base_tree = tree_of(&root, &[("landed", b"pull request 2\n")]);
+        let side = commit(
+            &root,
+            &base_tree,
+            &[&self.baseline],
+            false,
+            "pull request 2",
+        );
+        let base = commit(
+            &root,
+            &base_tree,
+            &[&self.baseline, &side],
+            true,
+            "merge pull request 2",
+        );
+        let head_tree = tree_of(&root, &[head_file]);
+        let head = commit(
+            &root,
+            &head_tree,
+            &[&self.baseline],
+            false,
+            "pull request 1",
+        );
+        // Pull request 2's merge is proved on its own terms, with its own tree.
+        let tree = std::mem::replace(&mut self.tree, base_tree);
+        self.prove_merge(base.clone(), self.baseline.clone(), side, 2);
+        self.tree = tree;
+        MovedBase { base, head }
+    }
+
+    /// GitHub merges pull request 1 onto the moved base and records `tree`.
+    fn merge_moved_base(&mut self, moved: &MovedBase, tree: &str) {
+        self.replace_merge(tree, &[&moved.base, &moved.head]);
+    }
+}
+
+#[test]
+fn a_merge_onto_a_base_that_moved_is_admitted_when_its_tree_is_the_local_merge() {
+    // Pull request 1's head was cut before pull request 2 landed, so GitHub's merge of it has
+    // a tree that is neither parent's. 0.1.13 refused it ("did not incorporate its merge basis")
+    // and every pull request merged after another one hit the same refusal.
+    for private in [false, true] {
+        let mut f = Fixture::new();
+        let moved = f.moved_base(("added", b"pull request 1\n"));
+        let merged = tree_of(
+            f.dir.path(),
+            &[
+                ("added", b"pull request 1\n"),
+                ("landed", b"pull request 2\n"),
+            ],
+        );
+        f.merge_moved_base(&moved, &merged);
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        assert!(
+            f.verify().is_ok(),
+            "the GitHub merge of a bot head onto a moved base must be admitted (private: \
+             {private}): {:?}",
+            f.verify()
+        );
+    }
+}
+
+#[test]
+fn a_merge_carrying_a_change_beyond_the_local_merge_refuses() {
+    // The merge tree is the computed merge plus one file nobody reviewed: authored by hand, not
+    // by the merge.
+    for private in [false, true] {
+        let mut f = Fixture::new();
+        let moved = f.moved_base(("added", b"pull request 1\n"));
+        let tampered = tree_of(
+            f.dir.path(),
+            &[
+                ("added", b"pull request 1\n"),
+                ("landed", b"pull request 2\n"),
+                ("unreviewed", b"not in either parent\n"),
+            ],
+        );
+        f.merge_moved_base(&moved, &tampered);
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        let error = f
+            .verify()
+            .expect_err("a merge tree beyond the local merge was admitted");
+        assert!(
+            error.to_string().contains("is not the local merge"),
+            "refused for another reason (private: {private}): {error:#}"
+        );
+    }
+}
+
+#[test]
+fn a_conflicting_merge_refuses_even_when_its_tree_is_the_conflicted_merge() {
+    // Both sides add the same path with different content. The recorded tree is the very tree
+    // git writes for that conflict, so tree equality alone would admit it; the conflict itself
+    // must refuse, because a conflicted merge was resolved by somebody.
+    let mut f = Fixture::private();
+    let moved = f.moved_base(("landed", b"pull request 1\n"));
+    let (conflicted, clean) = written_merge_tree(f.dir.path(), &moved.base, &moved.head);
+    assert!(!clean, "fixture must conflict");
+    f.merge_moved_base(&moved, &conflicted);
+    privatize(&mut f.api.responses);
+    let error = f.verify().expect_err("a conflicting merge was admitted");
+    assert!(
+        error.to_string().contains("conflicts"),
+        "refused for another reason: {error:#}"
+    );
+}
+
+#[test]
+fn worktree_attributes_cannot_steer_the_local_merge() {
+    // A `.gitattributes` in the checkout that runs the proof would let a union merge resolve a
+    // conflict silently. The local merge reads no attributes from the worktree.
+    let mut f = Fixture::private();
+    let moved = f.moved_base(("landed", b"pull request 1\n"));
+    std::fs::write(f.dir.path().join(".gitattributes"), "* merge=union\n").unwrap();
+    let (united, clean) = written_merge_tree(f.dir.path(), &moved.base, &moved.head);
+    assert!(clean, "fixture attributes must resolve the conflict");
+    f.merge_moved_base(&moved, &united);
+    privatize(&mut f.api.responses);
+    assert!(
+        f.verify().is_err(),
+        "worktree attributes steered the local merge"
+    );
+}
+
+#[test]
+fn repository_info_attributes_cannot_steer_the_local_merge() {
+    // `--attr-source` replaces the worktree's attributes and `core.attributesFile` is pinned,
+    // but `$GIT_DIR/info/attributes` is still read: a union (or any configured) merge driver
+    // there resolves the conflict and the local merge reports it clean.
+    let mut f = Fixture::private();
+    let moved = f.moved_base(("landed", b"pull request 1\n"));
+    let info = f.dir.path().join(".git").join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("attributes"), "* merge=union\n").unwrap();
+    let (united, clean) = written_merge_tree(f.dir.path(), &moved.base, &moved.head);
+    assert!(clean, "fixture attributes must resolve the conflict");
+    f.merge_moved_base(&moved, &united);
+    privatize(&mut f.api.responses);
+    assert!(
+        f.verify().is_err(),
+        "repository info/attributes steered the local merge"
+    );
+}
+
+/// A tree holding one directory `dir` with `files`.
+fn dir_tree(root: &Path, dir: &str, files: &[(&str, &[u8])]) -> String {
+    let inner = tree_of(root, files);
+    git(
+        root,
+        &["mktree"],
+        format!("040000 tree {inner}\t{dir}\n").as_bytes(),
+    )
+}
+
+impl Fixture {
+    /// Like `moved_base`, but every tree is chosen: a bot commit after the baseline carries
+    /// `common`, pull request 2 moves it to `base` and is merged by GitHub, and pull request 1's
+    /// head moves it to `head`.
+    fn moved_base_from(&mut self, common: &str, base: &str, head: &str) -> MovedBase {
+        let root = self.dir.path().to_path_buf();
+        let start = commit(&root, common, &[&self.baseline], false, "common");
+        let side = commit(&root, base, &[&start], false, "pull request 2");
+        let merged = commit(&root, base, &[&start, &side], true, "merge pull request 2");
+        let head = commit(&root, head, &[&start], false, "pull request 1");
+        let tree = std::mem::replace(&mut self.tree, base.to_owned());
+        self.prove_merge(merged.clone(), start, side, 2);
+        self.tree = tree;
+        MovedBase { base: merged, head }
+    }
+}
+
+#[test]
+fn repository_merge_config_cannot_make_a_conflicting_merge_clean() {
+    // Repository config that is not a merge driver still changes what a clean merge means.
+    // `merge.directoryRenames=true` moves a file added under a renamed directory without a
+    // conflict, and `merge.renormalize` with `core.autocrlf` discards a line-ending change that
+    // otherwise conflicts with an edit. Both are pinned to Git's default for the local merge.
+    type Case = (
+        &'static [(&'static str, &'static str)],
+        fn(&Path) -> [String; 3],
+    );
+    let cases: [Case; 2] = [
+        (&[("merge.directoryRenames", "true")], |root| {
+            [
+                dir_tree(root, "a", &[("x", b"x\n")]),
+                dir_tree(root, "b", &[("x", b"x\n")]),
+                dir_tree(root, "a", &[("x", b"x\n"), ("y", b"y\n")]),
+            ]
+        }),
+        (
+            &[("core.autocrlf", "true"), ("merge.renormalize", "true")],
+            |root| {
+                [
+                    tree_of(root, &[("f", b"line\r\n")]),
+                    tree_of(root, &[("f", b"line\n")]),
+                    tree_of(root, &[("f", b"line\r\nmore\r\n")]),
+                ]
+            },
+        ),
+    ];
+    for (config, trees) in cases {
+        for private in [false, true] {
+            let mut f = Fixture::new();
+            let root = f.dir.path().to_path_buf();
+            let [common, base, head] = trees(&root);
+            let moved = f.moved_base_from(&common, &base, &head);
+            let (_, clean) = written_merge_tree(&root, &moved.base, &moved.head);
+            assert!(!clean, "fixture must conflict under Git's defaults");
+            for (key, value) in config {
+                git(&root, &["config", key, value], b"");
+            }
+            let (steered, clean) = written_merge_tree(&root, &moved.base, &moved.head);
+            assert!(
+                clean,
+                "fixture config must resolve the conflict ({config:?})"
+            );
+            f.merge_moved_base(&moved, &steered);
+            if private {
+                privatize(&mut f.api.responses);
+            }
+            let error = f
+                .verify()
+                .expect_err("repository merge config made a conflicting merge clean");
+            assert!(
+                format!("{error:#}").contains("conflicts"),
+                "refused for another reason ({config:?}, private: {private}): {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn repository_merge_driver_config_cannot_steer_the_local_merge() {
+    // `merge.default` picks the driver for every path without a `merge` attribute, so a union
+    // default resolves the conflict; a `merge.<name>.driver` can shadow a built-in driver. The
+    // repository's own config is not overridden by the pinned global and system config.
+    for config in [
+        &[("merge.default", "union")][..],
+        &[("merge.steer.driver", "true")][..],
+    ] {
+        let mut f = Fixture::private();
+        let moved = f.moved_base(("landed", b"pull request 1\n"));
+        let root = f.dir.path().to_path_buf();
+        git(&root, &["config", "merge.default", "union"], b"");
+        let (united, clean) = written_merge_tree(&root, &moved.base, &moved.head);
+        assert!(clean, "fixture config must resolve the conflict");
+        git(&root, &["config", "--unset", "merge.default"], b"");
+        for (key, value) in config {
+            git(&root, &["config", key, value], b"");
+        }
+        f.merge_moved_base(&moved, &united);
+        privatize(&mut f.api.responses);
+        let error = f
+            .verify()
+            .expect_err("repository merge config steered the local merge");
+        assert!(
+            format!("{error:#}").contains("configured merge driver"),
+            "refused for another reason ({config:?}): {error:#}"
+        );
+    }
+}
+
+#[test]
+fn an_update_branch_merge_carrying_a_change_beyond_its_parents_refuses() {
+    // The update-branch commit is itself a GitHub two-parent merge (prior head, base). Its tree
+    // is bound only to the final merge's tree, and the final merge's local merge of (base,
+    // update) is trivially the update's tree, so nothing recomputes the update's own merge.
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000");
+    let github = "GitHub <noreply@github.com> 1700000000 +0000";
+    let mut control = UpdateFixture::new();
+    let parents = control.update_parents();
+    control.replace_update_raw(&bot, github, &parents);
+    for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+        .into_iter()
+        .zip(control.verify())
+    {
+        assert!(
+            result.is_ok(),
+            "control refused by {entrypoint}: {result:?}"
+        );
+    }
+
+    let mut f = UpdateFixture::new();
+    let root = f.dir.path().to_path_buf();
+    let accepted = git(&root, &["hash-object", "-w", "--stdin"], b"accepted\n");
+    let extra = git(
+        &root,
+        &["hash-object", "-w", "--stdin"],
+        b"in neither parent\n",
+    );
+    f.tree = git(
+        &root,
+        &["mktree"],
+        format!("100644 blob {accepted}\taccepted\n100644 blob {extra}\tunreviewed\n").as_bytes(),
+    );
+    let parents = f.update_parents();
+    f.replace_update_raw(&bot, github, &parents);
+    f.assert_refused("an update-branch merge whose tree is not the local merge of its parents");
 }
 
 #[test]
