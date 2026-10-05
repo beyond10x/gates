@@ -227,6 +227,15 @@ pub struct Git {
     pub root: PathBuf,
 }
 
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The tree `git merge-tree --write-tree` wrote for two commits. A conflicted merge still has a
+/// tree, carrying conflict markers; `clean` says whether it has none.
+pub struct LocalMerge {
+    pub tree: String,
+    pub clean: bool,
+}
+
 pub fn is_oid(value: &str) -> bool {
     value.len() == 40
         && value
@@ -346,6 +355,88 @@ impl Git {
 
     pub fn blob(&self, oid: &str) -> Result<Vec<u8>> {
         Objects::open(self)?.blob(oid, MAX_BLOB)
+    }
+
+    /// Git's own merge of two commits, computed in memory: no checkout, no index, and no
+    /// attributes from the worktree, so a checked-out `.gitattributes` cannot pick a merge driver.
+    pub fn merge_tree(&self, first: &str, second: &str) -> Result<LocalMerge> {
+        ensure!(is_oid(first) && is_oid(second), "invalid merge input");
+        self.ensure_no_merge_steering()?;
+        let args = ["merge-tree", "--write-tree", "--no-messages", first, second];
+        // Repository config can also change what a clean merge means (directory renames,
+        // renormalization, rename detection); pin each to Git's default.
+        let output = self
+            .command()
+            .args([
+                "-c",
+                "merge.directoryRenames=conflict",
+                "-c",
+                "merge.renormalize=false",
+                "-c",
+                "merge.renames=true",
+                "-c",
+                "diff.renames=true",
+            ])
+            .arg(format!("--attr-source={EMPTY_TREE}"))
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .context("Git plumbing failed")?;
+        let clean = match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            _ => return Err(self.refusal(&args, output.status)),
+        };
+        ensure!(
+            output.stdout.len() <= MAX_TOTAL,
+            "Git object output exceeds limit"
+        );
+        let tree = output
+            .stdout
+            .split(|b| *b == b'\n')
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())
+            .filter(|tree| is_oid(tree))
+            .context("Git merge-tree answered without a tree")?
+            .to_owned();
+        Ok(LocalMerge { tree, clean })
+    }
+
+    /// `--attr-source` and `core.attributesFile` do not cover `$GIT_DIR/info/attributes`, which
+    /// Git always reads, nor a merge driver named by configuration: `merge.default` applies to
+    /// every path without a `merge` attribute, and a `merge.<name>.driver` can shadow a built-in
+    /// driver of the same name. Either could resolve a conflict and report the merge clean.
+    fn ensure_no_merge_steering(&self) -> Result<()> {
+        let held = self.text(&["rev-parse", "--git-path", "info/attributes"])?;
+        let path = self.root.join(held);
+        ensure!(
+            !path.exists() || std::fs::read(path)?.is_empty(),
+            "repository info/attributes refused for a local merge"
+        );
+        let args = ["config", "-z", "--name-only", "--get-regexp", r"^merge\."];
+        let output = self
+            .command()
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .context("Git plumbing failed")?;
+        let names = match output.status.code() {
+            Some(0) => output.stdout,
+            Some(1) => Vec::new(),
+            _ => return Err(self.refusal(&args, output.status)),
+        };
+        let steered = names
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty())
+            .any(|name| {
+                let name = name.to_ascii_lowercase();
+                name == b"merge.default" || name.ends_with(b".driver")
+            });
+        ensure!(
+            !steered,
+            "configured merge driver refused for a local merge"
+        );
+        Ok(())
     }
 
     fn tree(&self, rev: &str) -> Result<BTreeMap<String, (String, String)>> {

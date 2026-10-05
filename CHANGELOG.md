@@ -1,6 +1,38 @@
 # Changelog
 
-## 0.1.13 — unreleased
+## 0.1.14 — unreleased
+
+- Admit a GitHub-created two-parent merge whose pull-request head was cut before the base moved
+  on. 0.1.13 admitted a merge only when it adopted the head's tree unchanged, so every pull
+  request merged after another one had landed refused later bot pushes with "pull request head
+  did not incorporate its merge basis" (beyond10x/atlas PR #65, merged onto PR #64).
+- The merge's tree must now equal Git's own merge of its two parents, recomputed locally with
+  `git merge-tree --write-tree`. The merge refuses when that local merge conflicts, even if the
+  recorded tree is the conflicted one, and when the recorded tree differs from it, so a merge
+  carrying any change of its own is refused. A head that already contains its base still merges
+  to the head's tree, so every merge 0.1.13 admitted is still admitted.
+- The local merge reads no attributes from the worktree (`--attr-source` is the empty tree), so
+  a checked-out `.gitattributes` cannot select a merge driver that resolves a conflict. It also
+  refuses a non-empty `$GIT_DIR/info/attributes`, which `--attr-source` does not replace, and a
+  repository-configured `merge.default` or `merge.<name>.driver`, either of which could resolve
+  a conflict and report the merge clean. Rename detection, directory renames and
+  renormalization are pinned to Git's defaults (`merge.directoryRenames=conflict`,
+  `merge.renormalize=false`, `merge.renames=true`, `diff.renames=true`), so repository config
+  cannot turn a conflicting merge clean either.
+- A GitHub update-branch commit is now held to the same proof: Git's merge of its two parents
+  (prior head, base) must be clean and equal its recorded tree. Before, its tree was bound only to
+  the final merge's tree, so an update commit carrying a change of its own was admitted.
+- The local merge needs Git 2.43.0 or later (`merge-tree --write-tree` since 2.38.0,
+  `--attr-source` since 2.41.0, and the `merge-tree` crash under `--attr-source` fixed in 2.43.0).
+- The proof applies to public and private repositories alike. Everything else is unchanged:
+  public repositories still require the exact App-only branch authority with no private
+  fallback, private repositories still require the exact bot account to open and merge the pull
+  request, refuse squash merges and walk every head commit for the exact bot identity, and
+  contradictory or other visibilities refuse.
+- No policy field or receipt format changes. The version increment invalidates receipts
+  retained under 0.1.13, so the first check after upgrading scans in full once.
+
+## 0.1.13 — 2026-10-04
 
 - Admit a GitHub-created merge in the delivery range of a private enrolled repository. Until
   now `published_merge::verify` refused every private repository ("remote repository is not
