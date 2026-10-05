@@ -2,9 +2,6 @@
 
 ## 0.1.14 — unreleased
 
-- Gates has no public website documentation any more: `b10x.docs.yaml`, the documentation
-  bundle, check and Pages façade workflows, and the README and AGENTS documentation blocks are
-  removed. The README is the documentation; `docs/adoption.md` stays as a repository document.
 - Admit a GitHub-created two-parent merge whose pull-request head was cut before the base moved
   on. 0.1.13 admitted a merge only when it adopted the head's tree unchanged, so every pull
   request merged after another one had landed refused later bot pushes with "pull request head
