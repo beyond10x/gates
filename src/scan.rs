@@ -184,6 +184,10 @@ pub struct Matchers {
     allow: Vec<regex::bytes::Regex>,
     homes: regex::bytes::Regex,
     format: regex::bytes::Regex,
+    /// A JSON array of hex strings under a `"components"` key, the shape ESS
+    /// writes an absolute path in, and one element of it.
+    components: regex::bytes::Regex,
+    component: regex::bytes::Regex,
 }
 
 /// Shortest literal that is re-checked across line breaks. Below it the joined
@@ -270,12 +274,25 @@ impl Matchers {
         // Format characters carry no meaning in a term and are what a word processor
         // or a wiki paste inserts. They are removed before matching, never reported.
         let format = regex::bytes::Regex::new(r"\p{Cf}")?;
+        // Compact or pretty-printed, and with its quotes and line breaks escaped
+        // when the record is itself carried inside a JSON string. The encoding
+        // marker beside the array is not required: a renamed one must not hide it.
+        let space = r"(?:[ \t\r\n]|\\+[nrt])*";
+        let quote = r#"\\*""#;
+        let item = format!("{quote}[0-9A-Fa-f]*{quote}");
+        let components = regex::bytes::Regex::new(&format!(
+            r"(?-u){quote}components{quote}{space}:{space}\[(?P<list>{space}{item}(?:{space},{space}{item})*{space})\]"
+        ))?;
+        let component =
+            regex::bytes::Regex::new(&format!("(?-u){quote}(?P<hex>[0-9A-Fa-f]*){quote}"))?;
         Ok(Self {
             private,
             wrapped,
             allow,
             homes,
             format,
+            components,
+            component,
         })
     }
 
@@ -327,14 +344,42 @@ impl Matchers {
         }) {
             rules.push("private-identifiers");
         }
-        if uncovered(&self.homes, bytes, false)
-            || stripped
-                .as_ref()
-                .is_some_and(|b| uncovered(&self.homes, b, false))
-        {
+        if self.personal(bytes) {
             rules.push("personal-paths");
         }
         rules
+    }
+
+    /// The `personal-paths` rule, for a line or a decoded path alike.
+    fn personal(&self, bytes: &[u8]) -> bool {
+        self.homes.is_match(bytes) || self.strip(bytes).is_some_and(|b| self.homes.is_match(&b))
+    }
+
+    /// First and last line of every `"components"` array whose decoded path is a
+    /// personal path. Each element is the hex of one segment with the leading `/`
+    /// stripped, so the path text never appears for a line scanner to see. An
+    /// element that does not decode contributes its own text.
+    pub fn hex_paths(&self, unit: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let (mut cursor, mut line) = (0, 1);
+        for array in self.components.captures_iter(unit) {
+            let mut path = Vec::new();
+            for item in self.component.captures_iter(&array["list"]) {
+                let hex = &item["hex"];
+                path.push(b'/');
+                path.extend(hex::decode(hex).unwrap_or_else(|_| hex.to_vec()));
+            }
+            if !self.personal(&path) {
+                continue;
+            }
+            let whole = array.get(0).expect("whole match");
+            line += newlines(&unit[cursor..whole.start()]);
+            let first = line;
+            line += newlines(&unit[whole.start()..whole.end()]);
+            cursor = whole.end();
+            spans.push((first, line));
+        }
+        spans
     }
 
     /// The line with Unicode format characters removed, when it has any. `None`
@@ -375,9 +420,18 @@ impl Matchers {
                 broken.push((line, "private-identifiers"));
             }
         }
+        for (line, _) in self.hex_paths(bytes) {
+            if !broken.contains(&(line, "personal-paths")) {
+                broken.push((line, "personal-paths"));
+            }
+        }
         broken.sort_unstable();
         broken
     }
+}
+
+fn newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b == b'\n').count()
 }
 
 pub fn run(
@@ -406,6 +460,7 @@ pub fn run(
         // still reads it; the private literal and path rules do not.
         let binary = unit.bytes.iter().take(8192).any(|b| *b == 0);
         let mut reported: Vec<usize> = Vec::new();
+        let mut paths: Vec<usize> = Vec::new();
         for (line, bytes) in unit.bytes.split(|v| *v == b'\n').enumerate() {
             if binary || inherited.contains(bytes) {
                 continue;
@@ -414,7 +469,35 @@ pub fn run(
                 if rule == "private-identifiers" {
                     reported.push(line + 1);
                 }
-                finding(policy, repository, &mut report, unit, line + 1, rule, bytes);
+                if finding(policy, repository, &mut report, unit, line + 1, rule, bytes)
+                    && rule == "personal-paths"
+                {
+                    paths.push(line + 1);
+                }
+            }
+        }
+        // A path written as hex-encoded segments carries no path text. It is
+        // reported on the line its key starts on and bound to every line it spans,
+        // so it is inherited only when all of them are, and an exception for the
+        // key line alone cannot admit different components.
+        if !binary {
+            let lines: Vec<&[u8]> = unit.bytes.split(|v| *v == b'\n').collect();
+            for (first, last) in matchers.hex_paths(&unit.bytes) {
+                let span = &lines[first - 1..last];
+                if paths.contains(&first) || span.iter().all(|v| inherited.contains(v)) {
+                    continue;
+                }
+                if finding(
+                    policy,
+                    repository,
+                    &mut report,
+                    unit,
+                    first,
+                    "personal-paths",
+                    &span.join(&b'\n'),
+                ) {
+                    paths.push(first);
+                }
             }
         }
         // A literal a soft wrap split over two lines is invisible to a line scanner.
@@ -498,7 +581,7 @@ fn finding(
     line: usize,
     rule: &str,
     content: &[u8],
-) {
+) -> bool {
     // Historical privacy findings are bounded to unchanged exact lines. Secret and
     // workflow exceptions bind the whole unit because those rules can span lines.
     let content_sha256 = digest(content);
@@ -507,7 +590,7 @@ fn finding(
             && (e.content_sha256.is_empty() || e.content_sha256 == content_sha256)
             && (e.line == 0 || e.line == line)
     }) {
-        return;
+        return false;
     }
     report
         .results
@@ -520,6 +603,7 @@ fn finding(
         line,
         content_sha256,
     });
+    true
 }
 
 fn workflow(bytes: &[u8]) -> (bool, bool) {
