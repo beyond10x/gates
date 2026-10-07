@@ -904,7 +904,9 @@ fn missing_local_update_graph_objects_refuse() {
 }
 
 #[test]
-fn unsupported_update_branch_shapes_refuse() {
+fn an_update_followed_by_a_bot_head_or_a_second_update_is_admitted() {
+    // Both shapes put the update below the pull request's final head on its first-parent line,
+    // with only a direct bot commit or another update of the same pull request above it.
     let mut direct_after_update = UpdateFixture::new();
     let direct = commit(
         direct_after_update.dir.path(),
@@ -919,7 +921,7 @@ fn unsupported_update_branch_shapes_refuse() {
         &parents,
         &direct,
     );
-    direct_after_update.assert_refused("direct head commit after update");
+    direct_after_update.assert_admitted("direct head commit after update");
 
     let mut multiple_updates = UpdateFixture::new();
     let advanced_base = commit(
@@ -952,8 +954,11 @@ fn unsupported_update_branch_shapes_refuse() {
         format!("{ROOT}/commits/{second_update}/pulls?per_page=100&page=1"),
         json!([pull]),
     );
-    multiple_updates.assert_refused("multiple branch updates");
+    multiple_updates.assert_admitted("multiple branch updates");
+}
 
+#[test]
+fn unsupported_update_branch_shapes_refuse() {
     let mut squash = UpdateFixture::new();
     squash.replace_final(&squash.tree.clone(), &[squash.base.clone()]);
     squash.assert_refused("squash final merge");
@@ -2427,4 +2432,227 @@ fn review_private_update_branch_merged_by_a_person_refuses() {
     privatize(&mut f.api.responses);
     f.pr()["merged_by"] = json!({"login":BOT_NAME,"type":"User","id":BOT_USER_ID});
     f.assert_refused("private update merge merged by a user account");
+}
+
+// A pull request GitHub updated more than once: `UpdateFixture::update` is the earlier update,
+// and the pull request's final head is a later commit on the first-parent line above it.
+
+impl UpdateFixture {
+    /// A direct bot commit on `parent`.
+    fn bot_commit(&self, parent: &str, message: &str) -> String {
+        commit(self.dir.path(), &self.tree, &[parent], false, message)
+    }
+
+    /// GitHub updates the pull request again: the new head merges `base` into `tip`, the bot
+    /// merges that head onto `base`, and every pull-request record names it as the head.
+    fn update_again(&mut self, tip: &str, base: &str) -> String {
+        let tree = self.tree.clone();
+        let head = commit(
+            self.dir.path(),
+            &tree,
+            &[tip, base],
+            true,
+            "GitHub update branch again",
+        );
+        self.replace_final_with_head(&tree, &[base.to_owned(), head.clone()], &head);
+        self.prove_commit(head.clone(), &[tip.to_owned(), base.to_owned()], tree);
+        let pull = self.pull_with_head(&head);
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{head}/pulls?per_page=100&page=1"),
+            json!([pull]),
+        );
+        head
+    }
+
+    fn assert_admitted(&self, what: &str) {
+        for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+            .into_iter()
+            .zip(self.verify())
+        {
+            assert!(result.is_ok(), "{what} refused by {entrypoint}: {result:?}");
+        }
+    }
+
+    fn assert_refused_for(&self, needle: &str, what: &str) {
+        for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+            .into_iter()
+            .zip(self.verify())
+        {
+            let error = result.expect_err(&format!("{what} admitted through {entrypoint}"));
+            assert!(
+                format!("{error:#}").contains(needle),
+                "{what} refused by {entrypoint} for another reason: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn twice_updated_pull_request_admits_the_earlier_update() {
+    // The observed graph: update 1 (prior head, base), update 2 (update 1, moved base), merge
+    // (moved base, update 2). The pull request's head is update 2, so update 1 is bound to the
+    // pull request only through the first-parent line from that head.
+    for private in [false, true] {
+        let mut f = UpdateFixture::new();
+        let base = f.bot_commit(&f.base, "base moves on");
+        let update = f.update.clone();
+        f.update_again(&update, &base);
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        f.assert_admitted(&format!(
+            "the earlier of two branch updates (private: {private})"
+        ));
+    }
+}
+
+#[test]
+fn earlier_update_with_bot_commit_between_is_admitted() {
+    for private in [false, true] {
+        let mut f = UpdateFixture::new();
+        let base = f.bot_commit(&f.base, "base moves on");
+        let between = f.bot_commit(&f.update, "bot commit between the updates");
+        f.update_again(&between, &base);
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        f.assert_admitted(&format!(
+            "an earlier update, a bot commit and a second update (private: {private})"
+        ));
+    }
+}
+
+#[test]
+fn earlier_update_off_the_first_parent_line_refuses() {
+    // The earlier update reached the default branch some other way, and the pull request's head
+    // took it in only as its base: following first parents from the head never meets it. The
+    // head, its merge and the base commit are each admitted on their own.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.update, "base carrying the earlier update");
+    let prior = f.prior_head.clone();
+    f.update_again(&prior, &base);
+    f.assert_refused_for(
+        "first-parent line",
+        "an update reachable from the head only through a base parent",
+    );
+}
+
+#[test]
+fn earlier_update_tied_to_another_pull_request_refuses() {
+    // The earlier update's association names pull request 405: a complete merged record that
+    // claims the same head and merge, while the head's own association is pull request 404.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let update = f.update.clone();
+    let head = f.update_again(&update, &base);
+    let mut other = f.pull_with_head(&head);
+    other["number"] = json!(405);
+    *f.update_pulls() = json!([other.clone()]);
+    f.api.responses.insert(format!("{ROOT}/pulls/405"), other);
+    f.assert_refused_for(
+        "another pull request",
+        "an earlier update associated with another pull request",
+    );
+}
+
+#[test]
+fn intermediate_non_bot_commit_refuses() {
+    // A commit between the two updates that is neither the exact bot's nor a GitHub update of the
+    // pull request. Binding the earlier update to the head exempts nothing on the way.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let raw = format!(
+        "tree {}\nparent {}\nauthor Human <human@example.invalid> 1700000000 +0000\ncommitter {BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000\n\nperson between the updates\n",
+        f.tree, f.update
+    );
+    let between = git(
+        f.dir.path(),
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        raw.as_bytes(),
+    );
+    f.update_again(&between, &base);
+    f.assert_refused("a person's commit between two branch updates");
+}
+
+#[test]
+fn earlier_update_with_its_own_change_refuses() {
+    // The earlier update's tree carries a file in neither of its parents. The second update and
+    // the final merge are clean merges that carry it on, so only the earlier update's own
+    // recomputed merge can refuse it.
+    let bot = format!("{BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000");
+    let github = "GitHub <noreply@github.com> 1700000000 +0000";
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let root = f.dir.path().to_path_buf();
+    let accepted = git(&root, &["hash-object", "-w", "--stdin"], b"accepted\n");
+    let extra = git(
+        &root,
+        &["hash-object", "-w", "--stdin"],
+        b"in neither parent\n",
+    );
+    f.tree = git(
+        &root,
+        &["mktree"],
+        format!("100644 blob {accepted}\taccepted\n100644 blob {extra}\tunreviewed\n").as_bytes(),
+    );
+    let parents = f.update_parents();
+    f.replace_update_raw(&bot, github, &parents);
+    let update = f.update.clone();
+    f.update_again(&update, &base);
+    f.assert_refused_for(
+        "is not the local merge of its parents",
+        "an earlier update carrying a change of its own",
+    );
+}
+
+#[test]
+fn intermediate_update_tied_to_another_pull_request_refuses() {
+    // Between the earlier update of pull request 404 and its head lies a GitHub update of pull
+    // request 405, which was merged on its own. Every commit is admitted by its own proof; only
+    // binding the earlier update to 404's head meets a commit that belongs to another pull
+    // request.
+    let mut f = UpdateFixture::new();
+    let other_base = f.bot_commit(&f.base, "pull request 405 base");
+    let tree = f.tree.clone();
+    let root = f.dir.path().to_path_buf();
+    let other_update = commit(
+        &root,
+        &tree,
+        &[&f.update, &other_base],
+        true,
+        "GitHub update of pull request 405",
+    );
+    let other_merge = commit(
+        &root,
+        &tree,
+        &[&other_base, &other_update],
+        true,
+        "GitHub merge of pull request 405",
+    );
+    let update = f.update.clone();
+    f.prove_commit(
+        other_update.clone(),
+        &[update, other_base.clone()],
+        tree.clone(),
+    );
+    f.prove_commit(
+        other_merge.clone(),
+        &[other_base, other_update.clone()],
+        tree,
+    );
+    let mut other = f.pull_with_head(&other_update);
+    other["number"] = json!(405);
+    other["merge_commit_sha"] = json!(other_merge);
+    for oid in [&other_update, &other_merge] {
+        f.api.responses.insert(
+            format!("{ROOT}/commits/{oid}/pulls?per_page=100&page=1"),
+            json!([other.clone()]),
+        );
+    }
+    f.api.responses.insert(format!("{ROOT}/pulls/405"), other);
+    f.update_again(&other_update, &other_merge);
+    f.assert_refused_for(
+        "belongs to another pull request",
+        "an update of another pull request between the earlier update and the head",
+    );
 }
