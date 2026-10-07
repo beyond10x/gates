@@ -151,9 +151,9 @@ fn adv_decoded_pass_scales_linearly_with_the_number_of_arrays() {
     let plain = format!("{}\n", ["", root[0], root[1], root[2]].join("/"));
     let (small, large) = (10_000, 80_000);
     let ratio = |a: Duration, b: Duration| b.as_secs_f64() / a.as_secs_f64().max(1e-9);
-    // Load from other processes only ever inflates a measurement. The small input
-    // is timed five times and the fastest kept, so contention cannot hide growth;
-    // the large input is timed once, where contention can only add to it.
+    // Load from other processes only ever inflates a measurement, so each side
+    // keeps its fastest run: five of the small input, three of the large. Timing
+    // the large input once let a loaded machine fail a linear pass.
     let scale = |text: &str, findings: bool| {
         let a = (0..5)
             .map(|_| {
@@ -163,8 +163,14 @@ fn adv_decoded_pass_scales_linearly_with_the_number_of_arrays() {
             })
             .min()
             .unwrap();
-        let (b, n) = timed(&p, &text.repeat(large));
-        assert_eq!(n, if findings { large } else { 0 });
+        let b = (0..3)
+            .map(|_| {
+                let (b, n) = timed(&p, &text.repeat(large));
+                assert_eq!(n, if findings { large } else { 0 });
+                b
+            })
+            .min()
+            .unwrap();
         (a, b, ratio(a, b))
     };
     let plain = scale(&plain, true);

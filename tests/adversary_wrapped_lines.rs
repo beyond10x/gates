@@ -333,6 +333,12 @@ fn fastest_of_five(f: impl Fn() -> Duration) -> Duration {
     (0..5).map(|_| f()).min().unwrap()
 }
 
+/// Load only ever inflates a run, so the large input keeps its fastest of three
+/// as well; timing it once let a loaded machine fail a linear pass.
+fn fastest_of_three(f: impl Fn() -> Duration) -> Duration {
+    (0..3).map(|_| f()).min().unwrap()
+}
+
 fn ratio(a: Duration, b: Duration) -> f64 {
     b.as_secs_f64() / a.as_secs_f64().max(1e-9)
 }
@@ -353,7 +359,10 @@ fn adv_wrapped_pass_scales_linearly_with_the_number_of_findings() {
         assert_eq!(report.results["private-identifiers"].findings, n);
         elapsed
     };
-    let (s, l) = (fastest_of_five(|| time(small)), time(large));
+    let (s, l) = (
+        fastest_of_five(|| time(small)),
+        fastest_of_three(|| time(large)),
+    );
     assert!(
         ratio(s, l) < 16.0,
         "8x the wrapped findings took {:.1}x the time ({s:?} -> {l:?})",
@@ -386,7 +395,10 @@ fn adv_text_scales_linearly_with_decoded_and_wrapped_findings() {
             assert_eq!(broken.len(), n, "{name}");
             elapsed
         };
-        let (s, l) = (fastest_of_five(|| time(small)), time(large));
+        let (s, l) = (
+            fastest_of_five(|| time(small)),
+            fastest_of_three(|| time(large)),
+        );
         assert!(
             ratio(s, l) < 16.0,
             "{name}: 8x the findings took {:.1}x the time ({s:?} -> {l:?})",
