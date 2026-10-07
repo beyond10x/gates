@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T08:12:36Z",
+  "actor": "human:timo",
+  "artifact": "story:update-branch-chain",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo run --locked -- gate (cargo test --locked, fmt --check, clippy -D warnings)",
+    "reference": "e397cb6: EXIT gate=0, 223 passed, 6 ignored, 229 listed"
+  }
+}

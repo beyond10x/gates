@@ -1185,8 +1185,6 @@ fn a_bounded_separator_class_catches_the_separators_it_was_bounded_for() {
     assert!(breaks(&policy, "fixture....alpha").is_empty());
 }
 
-#[ignore = "DEFECT: line-based scanning. All 30 interior split points of the literal evade; \
-            a soft-wrapped paragraph or a hyphenated line break carries the term out"]
 #[test]
 fn a_literal_split_across_a_line_break_is_still_caught() {
     let policy = rules(&[], &[]);
@@ -1496,6 +1494,226 @@ fn a_binary_unit_is_left_to_the_secret_scanner() {
     )
     .unwrap();
     assert_eq!(report.results["private-identifiers"].findings, 0);
+}
+
+// --- hex path components: an absolute path written as hex-encoded segments ---
+
+/// A path the way ESS records it: the hex of every segment after the leading `/`.
+/// Built at run time, so this source carries neither the path nor its encoding.
+fn hex_components(path: &str) -> Vec<String> {
+    path.trim_start_matches('/')
+        .split('/')
+        .map(hex::encode)
+        .collect()
+}
+
+/// An ESS `state.json` record whose root is `path`.
+fn state_record(path: &str, generated: &str) -> serde_json::Value {
+    serde_json::json!({
+        "payload": {
+            "generated": generated,
+            "root": {"components": hex_components(path), "encoding": "UnixBytes1"},
+        },
+        "version": 1,
+    })
+}
+
+fn compact(value: &serde_json::Value) -> String {
+    format!("{}\n", serde_json::to_string(value).unwrap())
+}
+
+fn pretty(value: &serde_json::Value) -> String {
+    format!("{}\n", serde_json::to_string_pretty(value).unwrap())
+}
+
+/// The line the `"components"` key sits on.
+fn components_line(text: &str) -> usize {
+    text.lines()
+        .position(|l| l.contains("\"components\""))
+        .unwrap()
+        + 1
+}
+
+/// The lines `personal-paths` was reported on.
+fn personal_path_lines(f: &Fixture, unit: Unit) -> Vec<usize> {
+    scan::run(&f.policy, REPOSITORY, &[unit], &mut CountScanner::default())
+        .unwrap()
+        .findings
+        .iter()
+        .filter(|v| v.rule == "personal-paths")
+        .map(|v| v.line)
+        .collect()
+}
+
+#[test]
+fn hex_path_components_compact_home_is_refused() {
+    let f = Fixture::new();
+    for root in [home(), format!("{}/work/out", home())] {
+        let record = compact(&state_record(&root, "1"));
+        assert!(
+            !record.contains(&root),
+            "the fixture carries the plain path"
+        );
+        assert_eq!(
+            personal_path_lines(&f, unit(&record)),
+            vec![1],
+            "missed: {record}"
+        );
+        // A binary unit stays out of the privacy rules, decoded or not.
+        let mut binary = vec![0u8];
+        binary.extend_from_slice(record.as_bytes());
+        assert!(personal_path_lines(&f, unit(&binary)).is_empty());
+    }
+}
+
+#[test]
+fn hex_path_components_pretty_home_is_refused() {
+    let f = Fixture::new();
+    let record = pretty(&state_record(&format!("{}/work/out", home()), "1"));
+    let key = components_line(&record);
+    let lines: Vec<&str> = record.lines().collect();
+    let end = key - 1
+        + lines[key - 1..]
+            .iter()
+            .position(|l| l.trim_start().starts_with(']'))
+            .unwrap();
+    assert!(
+        key > 1 && end > key,
+        "fixture is not pretty-printed: {record}"
+    );
+    let report = scan::run(
+        &f.policy,
+        REPOSITORY,
+        &[unit(&record)],
+        &mut CountScanner::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .map(|v| (v.rule.as_str(), v.line))
+            .collect::<Vec<_>>(),
+        vec![("personal-paths", key)],
+        "{record}"
+    );
+    // The digest binds every line the array spans, so an exception written for
+    // the key line alone cannot admit whatever components follow it.
+    assert_eq!(
+        report.findings[0].content_sha256,
+        digest(lines[key - 1..=end].join("\n").as_bytes())
+    );
+}
+
+#[test]
+fn hex_path_components_macos_home_is_refused() {
+    let f = Fixture::new();
+    let root = format!("{}/work", ["", "Users", "fixture-person"].join("/"));
+    let record = compact(&state_record(&root, "1"));
+    assert_eq!(personal_path_lines(&f, unit(&record)), vec![1], "{record}");
+    let record = pretty(&state_record(&root, "1"));
+    assert_eq!(
+        personal_path_lines(&f, unit(&record)),
+        vec![components_line(&record)],
+        "{record}"
+    );
+}
+
+#[test]
+fn hex_path_components_relative_paths_are_admitted() {
+    let f = Fixture::new();
+    let ledger = serde_json::json!({
+        "entries": [
+            {"path": {"components": hex_components("docs"), "encoding": "UnixBytes1"}},
+            {"path": {"components": hex_components("src/home/x"), "encoding": "UnixBytes1"}},
+        ],
+    });
+    for record in [compact(&ledger), pretty(&ledger)] {
+        assert!(
+            personal_path_lines(&f, unit(&record)).is_empty(),
+            "false positive: {record}"
+        );
+    }
+}
+
+#[test]
+fn hex_path_components_of_digests_are_admitted() {
+    // Content-addressed arrays are hex too; they decode to bytes, not to a home.
+    let f = Fixture::new();
+    let digests = serde_json::json!({"components": [digest(b"first"), digest(b"second")]});
+    for record in [compact(&digests), pretty(&digests)] {
+        assert!(
+            personal_path_lines(&f, unit(&record)).is_empty(),
+            "false positive: {record}"
+        );
+    }
+}
+
+#[test]
+fn hex_path_components_regenerated_line_is_refused() {
+    let f = Fixture::new();
+    let root = format!("{}/work/out", home());
+    let previous = compact(&state_record(&root, "1"));
+    // Regenerating rewrites the one line the root sits on: a new line, refused.
+    let regenerated = compact(&state_record(&root, "2"));
+    assert_eq!(
+        personal_path_lines(&f, unit_with(&regenerated, Some(previous.clone()))),
+        vec![1]
+    );
+    // The exact line the previous version carried is inherited.
+    assert!(personal_path_lines(&f, unit_with(&previous, Some(previous.clone()))).is_empty());
+    // Pretty-printed, inheritance needs every line the array spans: a field changed
+    // elsewhere is inherited, a changed component is not.
+    let before = pretty(&state_record(&root, "1"));
+    let elsewhere = pretty(&state_record(&root, "2"));
+    assert!(personal_path_lines(&f, unit_with(&elsewhere, Some(before.clone()))).is_empty());
+    let moved = pretty(&state_record(&format!("{}/work/other", home()), "1"));
+    assert_eq!(
+        personal_path_lines(&f, unit_with(&moved, Some(before))),
+        vec![components_line(&moved)]
+    );
+}
+
+#[test]
+fn scan_text_refuses_hex_path_components() {
+    let private = tempfile::tempdir().unwrap();
+    let policy = private.path().join("policy.json");
+    b10x_gates::policy::private_write(&policy, &serde_json::to_vec(&rules(&[], &[])).unwrap())
+        .unwrap();
+    let root = format!("{}/work/out", home());
+    let record = compact(&state_record(&root, "1"));
+    // The same record pasted into a pull request body reaches `api --input` as a
+    // JSON string: one line, every quote and line break escaped.
+    let request =
+        serde_json::to_string(&serde_json::json!({"body": pretty(&state_record(&root, "1"))}))
+            .unwrap();
+    let scan = |name: &str, bytes: &str| {
+        let file = private.path().join(name);
+        fs::write(&file, bytes).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+            .arg("--policy")
+            .arg(&policy)
+            .arg("scan-text")
+            .arg(&file)
+            .output()
+            .unwrap()
+    };
+    for (name, bytes) in [("state.json", &record), ("request.json", &request)] {
+        let refused = scan(name, bytes);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{name} admitted");
+        assert!(stderr.contains("line 1 personal-paths"), "{name}: {stderr}");
+        assert!(
+            !stderr.contains(&root) && !stderr.contains(&hex::encode("fixture-person")),
+            "{name} echoed: {stderr}"
+        );
+    }
+    let admitted = scan("clean.json", &compact(&state_record("docs", "1")));
+    assert!(
+        admitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
 }
 
 #[test]

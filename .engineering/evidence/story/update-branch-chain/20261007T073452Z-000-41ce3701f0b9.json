@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T07:34:52Z",
+  "actor": "human:timo",
+  "artifact": "story:update-branch-chain",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "cargo test --locked --test published_merge twice_updated_pull_request_admits_the_earlier_update",
+    "reference": "base 9fd3fc5: refused 'updated pull request summary does not bind this accepted head' vs impl/update-branch-chain 9b05c62: admitted, 112 passed exit 0"
+  }
+}

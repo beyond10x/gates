@@ -4,8 +4,9 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
+    ops::Range,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -184,6 +185,10 @@ pub struct Matchers {
     allow: Vec<regex::bytes::Regex>,
     homes: regex::bytes::Regex,
     format: regex::bytes::Regex,
+    /// A JSON array of hex strings under a `"components"` key, the shape ESS
+    /// writes an absolute path in, and one element of it.
+    components: regex::bytes::Regex,
+    component: regex::bytes::Regex,
 }
 
 /// Shortest literal that is re-checked across line breaks. Below it the joined
@@ -270,12 +275,25 @@ impl Matchers {
         // Format characters carry no meaning in a term and are what a word processor
         // or a wiki paste inserts. They are removed before matching, never reported.
         let format = regex::bytes::Regex::new(r"\p{Cf}")?;
+        // Compact or pretty-printed, and with its quotes and line breaks escaped
+        // when the record is itself carried inside a JSON string. The encoding
+        // marker beside the array is not required: a renamed one must not hide it.
+        let space = r"(?:[ \t\r\n]|\\+[nrt])*";
+        let quote = r#"\\*""#;
+        let item = format!("{quote}[0-9A-Fa-f]*{quote}");
+        let components = regex::bytes::Regex::new(&format!(
+            r"(?-u){quote}components{quote}{space}:{space}\[(?P<list>{space}{item}(?:{space},{space}{item})*{space})\]"
+        ))?;
+        let component =
+            regex::bytes::Regex::new(&format!("(?-u){quote}(?P<hex>[0-9A-Fa-f]*){quote}"))?;
         Ok(Self {
             private,
             wrapped,
             allow,
             homes,
             format,
+            components,
+            component,
         })
     }
 
@@ -327,14 +345,52 @@ impl Matchers {
         }) {
             rules.push("private-identifiers");
         }
-        if uncovered(&self.homes, bytes, false)
-            || stripped
-                .as_ref()
-                .is_some_and(|b| uncovered(&self.homes, b, false))
-        {
+        if self.personal(bytes) {
             rules.push("personal-paths");
         }
         rules
+    }
+
+    /// The `personal-paths` rule, for a line or a decoded path alike.
+    fn personal(&self, bytes: &[u8]) -> bool {
+        self.homes.is_match(bytes) || self.strip(bytes).is_some_and(|b| self.homes.is_match(&b))
+    }
+
+    /// Every `"components"` array whose decoded path is a personal path: the line
+    /// its key starts on, and the byte range of every line it spans, the breaks
+    /// between them included. Each element is the hex of one segment with the
+    /// leading `/` stripped, so the path text never appears for a line scanner to
+    /// see. An element that does not decode contributes its own text.
+    pub fn hex_paths(&self, unit: &[u8]) -> Vec<(usize, Range<usize>)> {
+        let mut spans = Vec::new();
+        // `line` is the line `cursor` is on and `begin` where that line starts;
+        // `end` is the first line break at or after the previous hit, or the end
+        // of the unit. All three only move forward.
+        let (mut cursor, mut line, mut begin, mut end) = (0, 1, 0, 0);
+        for array in self.components.captures_iter(unit) {
+            let mut path = Vec::new();
+            for item in self.component.captures_iter(&array["list"]) {
+                let hex = &item["hex"];
+                path.push(b'/');
+                path.extend(hex::decode(hex).unwrap_or_else(|_| hex.to_vec()));
+            }
+            if !self.personal(&path) {
+                continue;
+            }
+            let whole = array.get(0).expect("whole match");
+            carry(unit, cursor..whole.start(), &mut line, &mut begin);
+            let (first, start) = (line, begin);
+            carry(unit, whole.range(), &mut line, &mut begin);
+            cursor = whole.end();
+            if end < cursor {
+                end = unit[cursor..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(unit.len(), |i| cursor + i);
+            }
+            spans.push((first, start..end));
+        }
+        spans
     }
 
     /// The line with Unicode format characters removed, when it has any. `None`
@@ -350,13 +406,20 @@ impl Matchers {
     /// Lines where a literal is present only once the unit's line breaks are
     /// ignored. Reported against the line the occurrence starts on.
     pub fn wrapped_lines(&self, unit: &[u8]) -> Vec<usize> {
-        let mut lines: Vec<usize> = self
-            .wrapped
-            .iter()
-            .flat_map(|w| w.find_iter(unit))
-            .filter(|m| unit[m.start()..m.end()].contains(&b'\n'))
-            .map(|m| unit.iter().take(m.start()).filter(|b| **b == b'\n').count() + 1)
-            .collect();
+        let mut lines: Vec<usize> = Vec::new();
+        // Matches of one pattern arrive in order, so the line count carries
+        // forward instead of being recounted from the start for every match.
+        for wrapped in &self.wrapped {
+            let (mut cursor, mut line) = (0, 1);
+            for m in wrapped.find_iter(unit) {
+                if !unit[m.start()..m.end()].contains(&b'\n') {
+                    continue;
+                }
+                line += newlines(&unit[cursor..m.start()]);
+                cursor = m.start();
+                lines.push(line);
+            }
+        }
         lines.sort_unstable();
         lines.dedup();
         lines
@@ -370,13 +433,34 @@ impl Matchers {
             .enumerate()
             .flat_map(|(i, line)| self.line(line).into_iter().map(move |r| (i + 1, r)))
             .collect();
+        let mut seen: HashSet<(usize, &'static str)> = broken.iter().copied().collect();
         for line in self.wrapped_lines(bytes) {
-            if !broken.contains(&(line, "private-identifiers")) {
+            if seen.insert((line, "private-identifiers")) {
                 broken.push((line, "private-identifiers"));
+            }
+        }
+        for (line, _) in self.hex_paths(bytes) {
+            if seen.insert((line, "personal-paths")) {
+                broken.push((line, "personal-paths"));
             }
         }
         broken.sort_unstable();
         broken
+    }
+}
+
+fn newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b == b'\n').count()
+}
+
+/// Moves a line position across `skipped`: counts its line breaks into `line`,
+/// and sets `begin` to just after the last of them.
+fn carry(unit: &[u8], skipped: Range<usize>, line: &mut usize, begin: &mut usize) {
+    let from = skipped.start;
+    let skipped = &unit[skipped];
+    *line += newlines(skipped);
+    if let Some(i) = skipped.iter().rposition(|b| *b == b'\n') {
+        *begin = from + i + 1;
     }
 }
 
@@ -405,19 +489,54 @@ pub fn run(
         // A compiled artifact, an archive or an image carries no prose. Gitleaks
         // still reads it; the private literal and path rules do not.
         let binary = unit.bytes.iter().take(8192).any(|b| *b == 0);
-        let mut reported: Vec<usize> = Vec::new();
+        // Sets, not lists: a unit can carry a finding on every one of its lines,
+        // and each later pass asks whether a line already has one.
+        let mut reported: HashSet<usize> = HashSet::new();
+        let mut paths: HashSet<usize> = HashSet::new();
         for (line, bytes) in unit.bytes.split(|v| *v == b'\n').enumerate() {
             if binary || inherited.contains(bytes) {
                 continue;
             }
             for rule in matchers.line(bytes) {
                 if rule == "private-identifiers" {
-                    reported.push(line + 1);
+                    reported.insert(line + 1);
                 }
-                finding(policy, repository, &mut report, unit, line + 1, rule, bytes);
+                if finding(policy, repository, &mut report, unit, line + 1, rule, bytes)
+                    && rule == "personal-paths"
+                {
+                    paths.insert(line + 1);
+                }
+            }
+        }
+        // A path written as hex-encoded segments carries no path text. It is
+        // reported on the line its key starts on and bound to every line it spans,
+        // so it is inherited only when all of them are, and an exception for the
+        // key line alone cannot admit different components.
+        if !binary {
+            for (first, span) in matchers.hex_paths(&unit.bytes) {
+                let span = &unit.bytes[span];
+                if paths.contains(&first)
+                    || span.split(|v| *v == b'\n').all(|v| inherited.contains(v))
+                {
+                    continue;
+                }
+                if finding(
+                    policy,
+                    repository,
+                    &mut report,
+                    unit,
+                    first,
+                    "personal-paths",
+                    span,
+                ) {
+                    paths.insert(first);
+                }
             }
         }
         // A literal a soft wrap split over two lines is invisible to a line scanner.
+        // Its lines arrive ascending, so one forward walk over the unit finds each.
+        let mut rest = unit.bytes.split(|v| *v == b'\n');
+        let mut taken = 0;
         for line in if binary {
             Vec::new()
         } else {
@@ -426,11 +545,8 @@ pub fn run(
             if reported.contains(&line) {
                 continue;
             }
-            let bytes = unit
-                .bytes
-                .split(|v| *v == b'\n')
-                .nth(line - 1)
-                .unwrap_or(&[]);
+            let bytes = rest.nth(line - 1 - taken).unwrap_or(&[]);
+            taken = line;
             finding(
                 policy,
                 repository,
@@ -498,7 +614,7 @@ fn finding(
     line: usize,
     rule: &str,
     content: &[u8],
-) {
+) -> bool {
     // Historical privacy findings are bounded to unchanged exact lines. Secret and
     // workflow exceptions bind the whole unit because those rules can span lines.
     let content_sha256 = digest(content);
@@ -507,7 +623,7 @@ fn finding(
             && (e.content_sha256.is_empty() || e.content_sha256 == content_sha256)
             && (e.line == 0 || e.line == line)
     }) {
-        return;
+        return false;
     }
     report
         .results
@@ -520,6 +636,7 @@ fn finding(
         line,
         content_sha256,
     });
+    true
 }
 
 fn workflow(bytes: &[u8]) -> (bool, bool) {

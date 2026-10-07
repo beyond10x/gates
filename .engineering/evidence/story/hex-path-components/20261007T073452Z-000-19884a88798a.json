@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T07:34:52Z",
+  "actor": "human:timo",
+  "artifact": "story:hex-path-components",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "b10x-gates scan-text on a synthetic UnixBytes1 root decoding to the fixture-person home",
+    "reference": "installed 0.1.14: '1 file(s) carry no private rule' exit 0 vs impl/hex-path-components 7e2dccb: 'breaks 1 private rule(s): line 1 personal-paths' exit 1"
+  }
+}

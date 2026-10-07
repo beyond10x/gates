@@ -429,10 +429,22 @@ impl Authority {
         ensure!(merge != update, "branch update cannot be its final merge");
         self.ensure_same_repository(summary, repository)?;
         ensure!(
-            string(summary, "/base/ref")? == self.default_branch
-                && oid(summary, "/head/sha")? == update,
+            string(summary, "/base/ref")? == self.default_branch,
             "updated pull request summary does not bind this accepted head"
         );
+        let head = oid(summary, "/head/sha")?;
+        if head != update {
+            return self.verify_earlier_update(
+                git,
+                api,
+                repository,
+                update,
+                update_commit,
+                number,
+                merge,
+                head,
+            );
+        }
         let pull = self.completed_pull_request(api, repository, number, merge)?;
         ensure!(
             oid(&pull, "/head/sha")? == update,
@@ -476,6 +488,121 @@ impl Authority {
             Some(number),
             true,
         )
+    }
+
+    /// An update that is not the pull request's final head: GitHub updated the branch again, or
+    /// the bot pushed on top, before the merge. The update must lie on the first-parent line of
+    /// the authenticated head, and every commit after it on that line must be the bot's own or
+    /// another GitHub update of this same pull request. Each of those commits is still proved on
+    /// its own by the delivery walk; this binds the update to the pull request and exempts
+    /// nothing. The final merge is then proved as for an update that is the final head.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_earlier_update(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        repository: &str,
+        update: &str,
+        update_commit: &GithubCommit,
+        number: u64,
+        merge: &str,
+        head: &str,
+    ) -> Result<()> {
+        let pull = self.completed_pull_request(api, repository, number, merge)?;
+        ensure!(
+            oid(&pull, "/head/sha")? == head,
+            "pull request head is not the summary's head"
+        );
+        ensure!(
+            git.resolve(&format!("{head}^{{commit}}"))? == head,
+            "pull request head object unavailable"
+        );
+        self.verify_head_line(git, api, update, head, number, merge)?;
+        let local = git.merge_tree(&update_commit.parents[0], &update_commit.parents[1])?;
+        ensure!(
+            local.clean,
+            "local merge of the branch update's parents conflicts"
+        );
+        ensure!(
+            local.tree == update_commit.tree,
+            "branch update tree is not the local merge of its parents"
+        );
+
+        let merge_commit = github_commit(git, merge)?;
+        ensure!(
+            merge_commit.parents.len() == 2
+                && merge_commit.parents[1] == head
+                && merge_commit.parents[0] != head,
+            "final merge parents are not a base and the pull request head"
+        );
+        self.ensure_published(git, merge)?;
+        self.verify_remote_commit(api, merge, &merge_commit)?;
+        let merge_pulls = self.pull_associations(api, merge)?;
+        self.verify_terminal_merge(
+            git,
+            api,
+            repository,
+            merge,
+            &merge_commit,
+            &merge_pulls,
+            Some(number),
+            true,
+        )
+    }
+
+    /// Following first parents from `head` must reach `update`, and every commit after `update`
+    /// up to and including `head` must be an exact direct-bot commit or a GitHub update (exact bot
+    /// author, exact GitHub committer, two distinct parents) whose only completed pull request is
+    /// this one.
+    fn verify_head_line(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        update: &str,
+        head: &str,
+        number: u64,
+        merge: &str,
+    ) -> Result<()> {
+        // The first-parent walk from the head stops at the first commit reachable from the update.
+        // When the update is on that line, that commit is the update itself, so the last commit
+        // listed has it as its first parent; when it is not, the walk stops somewhere else.
+        let listed = git.text(&["rev-list", "--first-parent", &format!("{update}..{head}")])?;
+        let line: Vec<&str> = listed.lines().collect();
+        ensure!(
+            line.iter().all(|commit| is_oid(commit)),
+            "invalid ancestry object"
+        );
+        let last = line
+            .last()
+            .context("branch update is not on the first-parent line of the pull request head")?;
+        ensure!(
+            git.resolve(&format!("{last}^1"))? == update,
+            "branch update is not on the first-parent line of the pull request head"
+        );
+        for commit in line {
+            if git.verify_bot(&[commit.to_owned()]).is_ok() {
+                continue;
+            }
+            let shape = github_commit(git, commit).context(
+                "a commit on the pull request head line is neither the bot's nor a branch update",
+            )?;
+            ensure!(
+                shape.parents.len() == 2 && shape.parents[0] != shape.parents[1],
+                "a commit on the pull request head line is neither the bot's nor a branch update"
+            );
+            let pulls = self.pull_associations(api, commit)?;
+            let completed: Vec<_> = pulls
+                .iter()
+                .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str).is_some())
+                .collect();
+            ensure!(
+                completed.len() == 1
+                    && completed[0].get("number").and_then(Value::as_u64) == Some(number)
+                    && oid(completed[0], "/merge_commit_sha")? == merge,
+                "a branch update on the pull request head line belongs to another pull request"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

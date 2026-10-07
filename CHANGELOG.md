@@ -1,10 +1,38 @@
 # Changelog
 
-## 0.1.14 — unreleased
+## 0.1.15 — unreleased
 
+- `personal-paths` decodes hex-encoded path components. A JSON `"components"` array of hex
+  strings, the form ESS writes for the absolute output directory in
+  `.ess-output/state.json` (`"encoding": "UnixBytes1"`), is decoded component by component,
+  joined as an absolute path and held to the same home-path rule as text, so an encoded Linux or
+  macOS home directory is refused like the plain one. Until now `686f6d65` passed as hex while
+  `home` was refused. Compact and pretty-printed JSON are both read; the finding is reported on
+  the line the `"components"` key opens, and its content digest covers every line the array
+  spans. The marker is not required, and a relative array such as a ledger entry is not a home
+  path. The delivery verbs refuse the same arrays. The encoding does not say whether an array
+  is absolute, so a relative array whose first segment is `home` or `Users` is refused too.
+- The privacy line passes stay linear in the number of findings per unit. The soft-wrap pass
+  recounted line breaks from the start of the unit for every match and looked each finding up
+  in a growing list (60x the time for 8x the input); it now carries the count forward and uses
+  sets. Findings, their lines and their order are unchanged.
+- A repository whose commits after its adoption baseline carry such a record is refused on its
+  next full scan once it adopts this version, because every commit since the baseline is
+  scanned: move its baseline past the commit that stopped tracking the record first.
+- Admit an earlier GitHub update-branch commit of a pull request updated more than once. The
+  update must lie on the first-parent line of the merged head, every commit between them must be
+  a direct bot commit or a GitHub update of the same pull request, its own tree must be the clean
+  local merge of its parents, and the pull request's merge passes the terminal-merge proof.
+  Until now only the final update could bind, so a pull request updated twice refused every
+  later bot push with "updated pull request summary does not bind this accepted head".
 - Gates has no public website documentation any more: `b10x.docs.yaml`, the documentation
   bundle, check and Pages façade workflows, and the README and AGENTS documentation blocks are
   removed. The README is the documentation; `docs/adoption.md` stays as a repository document.
+- No policy field or receipt format changes. The version increment invalidates receipts
+  retained under 0.1.14, so the first check after upgrading scans in full once.
+
+## 0.1.14 — 2026-10-05
+
 - Admit a GitHub-created two-parent merge whose pull-request head was cut before the base moved
   on. 0.1.13 admitted a merge only when it adopted the head's tree unchanged, so every pull
   request merged after another one had landed refused later bot pushes with "pull request head
