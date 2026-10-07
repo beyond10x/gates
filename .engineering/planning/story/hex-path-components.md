@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:hex-path-components
 kind: story
-status: active
+status: implemented
 title: Refuse home paths written as hex-encoded path components
 summary: personal-paths decodes JSON components arrays of hex strings and refuses a decoded home path.
 relations:
@@ -14,10 +14,11 @@ scope:
   path: tests/adversary_hex_paths.rs
 - confidence: cited
   path: tests/security.rs
-revision: 8
+revision: 9
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T06:19:53Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-07T06:19:53Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-07T08:12:36Z", actor: "human:timo", revision: 9, decided_on: {"recorded":{"test_result":1,"review_outcome":2,"verification":1}}}
 ---
 ## Problem
 
