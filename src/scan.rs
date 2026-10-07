@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::PathBuf,
     process::{Command, Stdio},
@@ -395,13 +395,20 @@ impl Matchers {
     /// Lines where a literal is present only once the unit's line breaks are
     /// ignored. Reported against the line the occurrence starts on.
     pub fn wrapped_lines(&self, unit: &[u8]) -> Vec<usize> {
-        let mut lines: Vec<usize> = self
-            .wrapped
-            .iter()
-            .flat_map(|w| w.find_iter(unit))
-            .filter(|m| unit[m.start()..m.end()].contains(&b'\n'))
-            .map(|m| unit.iter().take(m.start()).filter(|b| **b == b'\n').count() + 1)
-            .collect();
+        let mut lines: Vec<usize> = Vec::new();
+        // Matches of one pattern arrive in order, so the line count carries
+        // forward instead of being recounted from the start for every match.
+        for wrapped in &self.wrapped {
+            let (mut cursor, mut line) = (0, 1);
+            for m in wrapped.find_iter(unit) {
+                if !unit[m.start()..m.end()].contains(&b'\n') {
+                    continue;
+                }
+                line += newlines(&unit[cursor..m.start()]);
+                cursor = m.start();
+                lines.push(line);
+            }
+        }
         lines.sort_unstable();
         lines.dedup();
         lines
@@ -415,13 +422,14 @@ impl Matchers {
             .enumerate()
             .flat_map(|(i, line)| self.line(line).into_iter().map(move |r| (i + 1, r)))
             .collect();
+        let mut seen: HashSet<(usize, &'static str)> = broken.iter().copied().collect();
         for line in self.wrapped_lines(bytes) {
-            if !broken.contains(&(line, "private-identifiers")) {
+            if seen.insert((line, "private-identifiers")) {
                 broken.push((line, "private-identifiers"));
             }
         }
         for (line, _) in self.hex_paths(bytes) {
-            if !broken.contains(&(line, "personal-paths")) {
+            if seen.insert((line, "personal-paths")) {
                 broken.push((line, "personal-paths"));
             }
         }
@@ -459,29 +467,35 @@ pub fn run(
         // A compiled artifact, an archive or an image carries no prose. Gitleaks
         // still reads it; the private literal and path rules do not.
         let binary = unit.bytes.iter().take(8192).any(|b| *b == 0);
-        let mut reported: Vec<usize> = Vec::new();
-        let mut paths: Vec<usize> = Vec::new();
+        // Sets, not lists: a unit can carry a finding on every one of its lines,
+        // and each later pass asks whether a line already has one.
+        let mut reported: HashSet<usize> = HashSet::new();
+        let mut paths: HashSet<usize> = HashSet::new();
         for (line, bytes) in unit.bytes.split(|v| *v == b'\n').enumerate() {
             if binary || inherited.contains(bytes) {
                 continue;
             }
             for rule in matchers.line(bytes) {
                 if rule == "private-identifiers" {
-                    reported.push(line + 1);
+                    reported.insert(line + 1);
                 }
                 if finding(policy, repository, &mut report, unit, line + 1, rule, bytes)
                     && rule == "personal-paths"
                 {
-                    paths.push(line + 1);
+                    paths.insert(line + 1);
                 }
             }
         }
+        let lines: Vec<&[u8]> = if binary {
+            Vec::new()
+        } else {
+            unit.bytes.split(|v| *v == b'\n').collect()
+        };
         // A path written as hex-encoded segments carries no path text. It is
         // reported on the line its key starts on and bound to every line it spans,
         // so it is inherited only when all of them are, and an exception for the
         // key line alone cannot admit different components.
         if !binary {
-            let lines: Vec<&[u8]> = unit.bytes.split(|v| *v == b'\n').collect();
             for (first, last) in matchers.hex_paths(&unit.bytes) {
                 let span = &lines[first - 1..last];
                 if paths.contains(&first) || span.iter().all(|v| inherited.contains(v)) {
@@ -496,7 +510,7 @@ pub fn run(
                     "personal-paths",
                     &span.join(&b'\n'),
                 ) {
-                    paths.push(first);
+                    paths.insert(first);
                 }
             }
         }
@@ -509,11 +523,7 @@ pub fn run(
             if reported.contains(&line) {
                 continue;
             }
-            let bytes = unit
-                .bytes
-                .split(|v| *v == b'\n')
-                .nth(line - 1)
-                .unwrap_or(&[]);
+            let bytes = lines.get(line - 1).copied().unwrap_or(&[]);
             finding(
                 policy,
                 repository,
