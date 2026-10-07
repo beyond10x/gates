@@ -2656,3 +2656,317 @@ fn intermediate_update_tied_to_another_pull_request_refuses() {
         "an update of another pull request between the earlier update and the head",
     );
 }
+
+// Adversary cases for the earlier-update path. Each is named `adversary_unit2_*`, so the suite
+// can be counted with and without them.
+
+impl UpdateFixture {
+    /// Deliver a branch cut from the earlier update itself, stacked on the pull request before
+    /// its later commits. The head line and the final merge stay published but leave the
+    /// delivered range, so the delivery walk never proves them on their own: only the earlier
+    /// update's own proof judges the commits above it.
+    fn adv_cut_candidate_from_update(&mut self) {
+        let update = self.update.clone();
+        self.candidate = self.bot_commit(&update, "stacked work cut from the earlier update");
+    }
+
+    fn adv_associate(&mut self, oid: &str, pulls: Value) {
+        self.api.responses.insert(
+            format!("{ROOT}/commits/{oid}/pulls?per_page=100&page=1"),
+            pulls,
+        );
+    }
+}
+
+fn adv_twice_updated(private: bool) -> UpdateFixture {
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let update = f.update.clone();
+    f.update_again(&update, &base);
+    if private {
+        privatize(&mut f.api.responses);
+    }
+    f
+}
+
+#[test]
+fn adversary_unit2_twice_updated_pull_request_carrying_real_changes_is_admitted() {
+    // The observed graph with content on every side instead of one shared tree: the pull request
+    // adds a file, the base takes a file before each update, and each GitHub update and the final
+    // merge carry exactly Git's merge of their parents.
+    for private in [false, true] {
+        let mut f = UpdateFixture::new();
+        let root = f.dir.path().to_path_buf();
+        let accepted: (&str, &[u8]) = ("accepted", b"accepted\n");
+        let feature: (&str, &[u8]) = ("feature", b"pull request change\n");
+        let first: (&str, &[u8]) = ("first-base", b"base change before the first update\n");
+        let second: (&str, &[u8]) = ("second-base", b"base change before the second update\n");
+        let head = commit(
+            &root,
+            &tree_of(&root, &[accepted, feature]),
+            &[&f.prior_head],
+            false,
+            "pull request change",
+        );
+        let base1 = commit(
+            &root,
+            &tree_of(&root, &[accepted, first]),
+            &[&f.base],
+            false,
+            "base before the first update",
+        );
+        let update1_tree = tree_of(&root, &[accepted, feature, first]);
+        let update1 = commit(&root, &update1_tree, &[&head, &base1], true, "update 1");
+        let base2 = commit(
+            &root,
+            &tree_of(&root, &[accepted, first, second]),
+            &[&base1],
+            false,
+            "base before the second update",
+        );
+        let final_tree = tree_of(&root, &[accepted, feature, first, second]);
+        let update2 = commit(&root, &final_tree, &[&update1, &base2], true, "update 2");
+        let merge = commit(&root, &final_tree, &[&base2, &update2], true, "merge");
+        f.candidate = commit(&root, &final_tree, &[&merge], false, "candidate");
+        f.update = update1.clone();
+        f.merge = merge.clone();
+        f.prove_commit(update1.clone(), &[head, base1], update1_tree);
+        f.prove_commit(
+            update2.clone(),
+            &[update1.clone(), base2.clone()],
+            final_tree.clone(),
+        );
+        f.prove_commit(merge.clone(), &[base2, update2.clone()], final_tree);
+        let pull = f.pull_with_head(&update2);
+        for oid in [&update1, &update2, &merge] {
+            f.adv_associate(oid, json!([pull.clone()]));
+        }
+        f.api.responses.insert(format!("{ROOT}/pulls/404"), pull);
+        f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(merge);
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        f.assert_admitted(&format!(
+            "a twice-updated pull request carrying real changes (private: {private})"
+        ));
+    }
+}
+
+#[test]
+fn adversary_unit2_branch_cut_from_an_earlier_update_is_admitted() {
+    // The control for the cases below: the earlier update is published and bound to its pull
+    // request, and the candidate built on it carries nothing above it.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let between = f.bot_commit(&f.update, "bot commit between the updates");
+    f.update_again(&between, &base);
+    f.adv_cut_candidate_from_update();
+    f.assert_admitted("a branch cut from an earlier update");
+}
+
+#[test]
+fn adversary_unit2_person_commit_above_an_earlier_update_refuses_outside_the_range() {
+    // `intermediate_non_bot_commit_refuses` puts the person's commit inside the delivered range,
+    // where the delivery walk refuses it on its own, so it stays green with the head-line
+    // identity check deleted. Here the head line is outside the range and the person's commit
+    // carries the pull request's own association: only that identity check can refuse it.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let raw = format!(
+        "tree {}\nparent {}\nauthor Human <human@example.invalid> 1700000000 +0000\ncommitter {BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000\n\nperson between the updates\n",
+        f.tree, f.update
+    );
+    let between = git(
+        f.dir.path(),
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        raw.as_bytes(),
+    );
+    let head = f.update_again(&between, &base);
+    let pull = f.pull_with_head(&head);
+    f.adv_associate(&between, json!([pull]));
+    f.adv_cut_candidate_from_update();
+    f.assert_refused_for(
+        "neither the bot's nor a branch update",
+        "a person's commit above an earlier update, outside the delivered range",
+    );
+}
+
+#[test]
+fn adversary_unit2_one_parent_github_commit_above_an_earlier_update_refuses() {
+    // A GitHub-committed bot commit with one parent is not a branch update, whatever its
+    // association says. Outside the delivered range only the head-line shape check sees it.
+    let mut f = UpdateFixture::new();
+    let base = f.bot_commit(&f.base, "base moves on");
+    let tree = f.tree.clone();
+    let edit = commit(f.dir.path(), &tree, &[&f.update], true, "one-parent edit");
+    let head = f.update_again(&edit, &base);
+    let pull = f.pull_with_head(&head);
+    f.adv_associate(&edit, json!([pull]));
+    f.adv_cut_candidate_from_update();
+    f.assert_refused_for(
+        "neither the bot's nor a branch update",
+        "a one-parent GitHub commit above an earlier update, outside the delivered range",
+    );
+}
+
+#[test]
+fn adversary_unit2_head_line_update_shared_with_a_second_merged_pull_request_refuses() {
+    // The middle update carries this pull request's association and a second completed one.
+    let mut f = UpdateFixture::new();
+    let first_base = f.bot_commit(&f.base, "base moves on");
+    let second_base = f.bot_commit(&first_base, "base moves again");
+    let tree = f.tree.clone();
+    let middle = commit(
+        f.dir.path(),
+        &tree,
+        &[&f.update, &first_base],
+        true,
+        "second GitHub update",
+    );
+    let head = f.update_again(&middle, &second_base);
+    let pull = f.pull_with_head(&head);
+    f.adv_associate(&middle, json!([pull.clone()]));
+    f.adv_cut_candidate_from_update();
+    f.assert_admitted("three updates, the candidate cut from the first");
+    let mut other = pull.clone();
+    other["number"] = json!(405);
+    other["merge_commit_sha"] = json!(second_base);
+    f.adv_associate(&middle, json!([pull, other]));
+    f.assert_refused_for(
+        "belongs to another pull request",
+        "a head-line update shared with a second merged pull request",
+    );
+}
+
+#[test]
+fn adversary_unit2_head_line_associations_are_read_to_the_last_page() {
+    for duplicate in [false, true] {
+        let mut f = UpdateFixture::new();
+        let first_base = f.bot_commit(&f.base, "base moves on");
+        let second_base = f.bot_commit(&first_base, "base moves again");
+        let tree = f.tree.clone();
+        let middle = commit(
+            f.dir.path(),
+            &tree,
+            &[&f.update, &first_base],
+            true,
+            "second GitHub update",
+        );
+        let head = f.update_again(&middle, &second_base);
+        let pull = f.pull_with_head(&head);
+        let mut page = vec![pull.clone()];
+        page.extend((1000..1099).map(|number| json!({"number":number,"merge_commit_sha":null})));
+        f.adv_associate(&middle, json!(page));
+        f.api.responses.insert(
+            format!("{ROOT}/commits/{middle}/pulls?per_page=100&page=2"),
+            if duplicate { json!([pull]) } else { json!([]) },
+        );
+        f.adv_cut_candidate_from_update();
+        if duplicate {
+            f.assert_refused_for(
+                "belongs to another pull request",
+                "a second completed association on the head line's second page",
+            );
+        } else {
+            f.assert_admitted("a head-line association list read across two pages");
+        }
+    }
+}
+
+#[test]
+fn adversary_unit2_pull_request_head_below_the_update_refuses() {
+    // The pull request's head is the update's own first parent, and its merge is (base, head);
+    // a bot join publishes the update beside it. Following first parents from the head lists no
+    // commit at all, which must refuse rather than pass an empty line.
+    let mut f = UpdateFixture::new();
+    let prior = f.prior_head.clone();
+    let base = f.base.clone();
+    let update = f.update.clone();
+    let tree = f.tree.clone();
+    f.replace_final_with_head(&tree, &[base, prior.clone()], &prior);
+    let join = commit(
+        f.dir.path(),
+        &tree,
+        &[&f.merge, &update],
+        false,
+        "bot join carrying the update",
+    );
+    f.candidate = join.clone();
+    f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(join);
+    f.assert_refused_for("first-parent line", "a pull request head below the update");
+}
+
+#[test]
+fn adversary_unit2_earlier_update_with_an_unpublished_merge_refuses() {
+    // The default branch took the branch cut from the earlier update, not the pull request's
+    // merge, while GitHub still reports the pull request merged at that commit.
+    let mut f = adv_twice_updated(false);
+    f.adv_cut_candidate_from_update();
+    let candidate = f.candidate.clone();
+    f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(candidate);
+    f.assert_refused_for(
+        "not on the authenticated published default branch",
+        "an earlier update whose pull request merge is not published",
+    );
+}
+
+#[test]
+fn adversary_unit2_earlier_update_pull_request_records_stay_bound() {
+    // Each record the earlier update leans on, forged one at a time on the twice-updated graph.
+    adv_twice_updated(false).assert_admitted("public control");
+    adv_twice_updated(true).assert_admitted("private control");
+    type Forge = fn(&mut UpdateFixture);
+    let cases: &[(&str, bool, Forge)] = &[
+        ("detail from a fork", false, |f| {
+            f.pr()["head"]["repo"]["full_name"] = json!("elsewhere/repository")
+        }),
+        ("detail of another repository id", false, |f| {
+            f.pr()["base"]["repo"]["id"] = json!(124)
+        }),
+        ("detail head is the earlier update", false, |f| {
+            let update = f.update.clone();
+            f.pr()["head"]["sha"] = json!(update)
+        }),
+        ("detail unmerged", false, |f| {
+            f.pr()["merged"] = json!(false)
+        }),
+        ("detail merged by another account", false, |f| {
+            f.pr()["merged_by"]["login"] = json!("other[bot]")
+        }),
+        ("detail into another branch", false, |f| {
+            f.pr()["base"]["ref"] = json!("release")
+        }),
+        ("summary from a fork", false, |f| {
+            f.update_pulls()[0]["head"]["repo"]["full_name"] = json!("elsewhere/repository")
+        }),
+        ("summary into another branch", false, |f| {
+            f.update_pulls()[0]["base"]["ref"] = json!("release")
+        }),
+        ("summary without its head", false, |f| {
+            f.update_pulls()[0]["head"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sha");
+        }),
+        (
+            "update shared with a second merged pull request",
+            false,
+            |f| {
+                let mut other = f.update_pulls()[0].clone();
+                other["number"] = json!(405);
+                f.update_pulls().as_array_mut().unwrap().push(other);
+            },
+        ),
+        ("private pull request opened by a person", true, |f| {
+            f.pr()["user"] = json!({"login":"person","type":"User","id":1})
+        }),
+        ("private pull request merged by a user account", true, |f| {
+            f.pr()["merged_by"] = json!({"login":BOT_NAME,"type":"User","id":BOT_USER_ID})
+        }),
+    ];
+    for (what, private, forge) in cases {
+        let mut f = adv_twice_updated(*private);
+        forge(&mut f);
+        f.assert_refused(what);
+    }
+}
