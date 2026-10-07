@@ -1185,8 +1185,6 @@ fn a_bounded_separator_class_catches_the_separators_it_was_bounded_for() {
     assert!(breaks(&policy, "fixture....alpha").is_empty());
 }
 
-#[ignore = "DEFECT: line-based scanning. All 30 interior split points of the literal evade; \
-            a soft-wrapped paragraph or a hyphenated line break carries the term out"]
 #[test]
 fn a_literal_split_across_a_line_break_is_still_caught() {
     let policy = rules(&[], &[]);

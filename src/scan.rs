@@ -6,6 +6,7 @@ use serde_yaml::Value;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    ops::Range,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -355,13 +356,17 @@ impl Matchers {
         self.homes.is_match(bytes) || self.strip(bytes).is_some_and(|b| self.homes.is_match(&b))
     }
 
-    /// First and last line of every `"components"` array whose decoded path is a
-    /// personal path. Each element is the hex of one segment with the leading `/`
-    /// stripped, so the path text never appears for a line scanner to see. An
-    /// element that does not decode contributes its own text.
-    pub fn hex_paths(&self, unit: &[u8]) -> Vec<(usize, usize)> {
+    /// Every `"components"` array whose decoded path is a personal path: the line
+    /// its key starts on, and the byte range of every line it spans, the breaks
+    /// between them included. Each element is the hex of one segment with the
+    /// leading `/` stripped, so the path text never appears for a line scanner to
+    /// see. An element that does not decode contributes its own text.
+    pub fn hex_paths(&self, unit: &[u8]) -> Vec<(usize, Range<usize>)> {
         let mut spans = Vec::new();
-        let (mut cursor, mut line) = (0, 1);
+        // `line` is the line `cursor` is on and `begin` where that line starts;
+        // `end` is the first line break at or after the previous hit, or the end
+        // of the unit. All three only move forward.
+        let (mut cursor, mut line, mut begin, mut end) = (0, 1, 0, 0);
         for array in self.components.captures_iter(unit) {
             let mut path = Vec::new();
             for item in self.component.captures_iter(&array["list"]) {
@@ -373,11 +378,17 @@ impl Matchers {
                 continue;
             }
             let whole = array.get(0).expect("whole match");
-            line += newlines(&unit[cursor..whole.start()]);
-            let first = line;
-            line += newlines(&unit[whole.start()..whole.end()]);
+            carry(unit, cursor..whole.start(), &mut line, &mut begin);
+            let (first, start) = (line, begin);
+            carry(unit, whole.range(), &mut line, &mut begin);
             cursor = whole.end();
-            spans.push((first, line));
+            if end < cursor {
+                end = unit[cursor..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(unit.len(), |i| cursor + i);
+            }
+            spans.push((first, start..end));
         }
         spans
     }
@@ -442,6 +453,17 @@ fn newlines(bytes: &[u8]) -> usize {
     bytes.iter().filter(|b| **b == b'\n').count()
 }
 
+/// Moves a line position across `skipped`: counts its line breaks into `line`,
+/// and sets `begin` to just after the last of them.
+fn carry(unit: &[u8], skipped: Range<usize>, line: &mut usize, begin: &mut usize) {
+    let from = skipped.start;
+    let skipped = &unit[skipped];
+    *line += newlines(skipped);
+    if let Some(i) = skipped.iter().rposition(|b| *b == b'\n') {
+        *begin = from + i + 1;
+    }
+}
+
 pub fn run(
     policy: &Policy,
     repository: &str,
@@ -486,19 +508,16 @@ pub fn run(
                 }
             }
         }
-        let lines: Vec<&[u8]> = if binary {
-            Vec::new()
-        } else {
-            unit.bytes.split(|v| *v == b'\n').collect()
-        };
         // A path written as hex-encoded segments carries no path text. It is
         // reported on the line its key starts on and bound to every line it spans,
         // so it is inherited only when all of them are, and an exception for the
         // key line alone cannot admit different components.
         if !binary {
-            for (first, last) in matchers.hex_paths(&unit.bytes) {
-                let span = &lines[first - 1..last];
-                if paths.contains(&first) || span.iter().all(|v| inherited.contains(v)) {
+            for (first, span) in matchers.hex_paths(&unit.bytes) {
+                let span = &unit.bytes[span];
+                if paths.contains(&first)
+                    || span.split(|v| *v == b'\n').all(|v| inherited.contains(v))
+                {
                     continue;
                 }
                 if finding(
@@ -508,13 +527,16 @@ pub fn run(
                     unit,
                     first,
                     "personal-paths",
-                    &span.join(&b'\n'),
+                    span,
                 ) {
                     paths.insert(first);
                 }
             }
         }
         // A literal a soft wrap split over two lines is invisible to a line scanner.
+        // Its lines arrive ascending, so one forward walk over the unit finds each.
+        let mut rest = unit.bytes.split(|v| *v == b'\n');
+        let mut taken = 0;
         for line in if binary {
             Vec::new()
         } else {
@@ -523,7 +545,8 @@ pub fn run(
             if reported.contains(&line) {
                 continue;
             }
-            let bytes = lines.get(line - 1).copied().unwrap_or(&[]);
+            let bytes = rest.nth(line - 1 - taken).unwrap_or(&[]);
+            taken = line;
             finding(
                 policy,
                 repository,
