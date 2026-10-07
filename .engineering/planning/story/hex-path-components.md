@@ -7,7 +7,14 @@ title: Refuse home paths written as hex-encoded path components
 summary: personal-paths decodes JSON components arrays of hex strings and refuses a decoded home path.
 relations:
 - derived_from: story:public-shared-gates
-revision: 4
+scope:
+- confidence: cited
+  path: src/scan.rs
+- confidence: cited
+  path: tests/adversary_hex_paths.rs
+- confidence: cited
+  path: tests/security.rs
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T06:19:53Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-07T06:19:53Z", actor: "human:timo", revision: 3}
@@ -72,6 +79,10 @@ refusal tests fail (mutation evidence).
 
 ## Scope
 
-- `src/scan.rs`: `Matchers` (decoder, `text`), `run` (per-unit decoded pass).
-- `tests/security.rs`: the tests above.
-- `README.md` (What is checked), `CHANGELOG.md`, `Cargo.toml`/`Cargo.lock` version.
+- `src/scan.rs`: `Matchers` (decoder, `hex_paths`, `personal`, `text`, `wrapped_lines`), `run`
+  (decoded pass, set-based line lookups), `finding` (returns whether it recorded). Cited from
+  commits `7e2dccb` and `a9413a7`.
+- `tests/security.rs`: the acceptance tests. Cited.
+- `tests/adversary_hex_paths.rs`: added by the adversary, pass 1. Cited. Not in the original
+  scope.
+- `README.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`: the coordinator's closing commit.

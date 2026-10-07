@@ -7,7 +7,12 @@ title: Admit an earlier GitHub update commit of a pull request updated more than
 summary: verify_update_branch binds an update that is not the final head through the first-parent line to the merged head.
 relations:
 - derived_from: story:github-update-branch-provenance
-revision: 3
+scope:
+- confidence: cited
+  path: src/published_merge.rs
+- confidence: cited
+  path: tests/published_merge.rs
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T06:22:45Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-07T06:22:45Z", actor: "human:timo", revision: 3}
