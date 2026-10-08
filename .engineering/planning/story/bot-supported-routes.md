@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-supported-routes
 kind: story
-status: active
+status: implemented
 title: Print the supported route when the bot refuses merge, rebase or a branch deletion
 summary: The bot argument check names the merge route and the API deletion route before minting a token.
 relations:
@@ -16,10 +16,11 @@ scope:
   path: src/main.rs
 - confidence: cited
   path: tests/bot_routes.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:41:15Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-08T09:41:15Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-08T10:13:46Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1,"review_outcome":1}}}
 ---
 ## Problem
 

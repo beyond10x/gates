@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-refusal-causes
 kind: story
-status: active
+status: implemented
 title: Name the cause in every delivery refusal
 summary: Protected-file, API 4xx, nothing-staged refusals name their cause; a succeeded API write is reported as success.
 relations:
@@ -16,10 +16,11 @@ scope:
   path: src/policy.rs
 - confidence: cited
   path: tests/delivery_refusals.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:41:14Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-08T09:41:14Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-08T10:13:46Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1,"review_outcome":1}}}
 ---
 ## Problem
 

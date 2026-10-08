@@ -7,7 +7,7 @@ title: 'Wave: delivery refusals name their cause and route'
 relations:
 - informed_by: story:bot-refusal-causes
 - informed_by: story:bot-supported-routes
-revision: 1
+revision: 2
 ---
 ## Wave: delivery refusals name their cause and their route
 
@@ -49,12 +49,23 @@ are archived as a patch and left in place, and no unit touches the primary check
 
 ## Units
 
-| unit | story | branch | tree id | build dir | scratch | stage |
-|---|---|---|---|---|---|---|
-| 1 | `story:bot-refusal-causes` | `impl/bot-refusal-causes` | `gates-unit-causes` | tree `target/` | tree `target/scratch/` | planned |
-| 2 | `story:bot-supported-routes` | `impl/bot-supported-routes` | `gates-unit-routes` | tree `target/` | tree `target/scratch/` | planned |
+| unit | story | branch | commits | tree id | stage |
+|---|---|---|---|---|---|
+| 1 | `story:bot-refusal-causes` | `impl/bot-refusal-causes` | `33cb228` | `gates-unit-causes` | merged `a641169`; tree finished, archived |
+| 2 | `story:bot-supported-routes` | `impl/bot-supported-routes` | `1d04735` | `gates-unit-routes` | merged `3bf4987`; tree finished, archived |
+| fix 1 | both | `review/refusal-causes` | `46778b5` | `gates-review-causes` | merged `dd18130`; tree finished, archived |
+
+`git merge-tree --write-tree --merge-base=2671c7d 33cb228 1d04735` wrote a clean tree before the
+first merge. Measured build: about 1G per tree (974M and 945M).
 
 ## Reviews
 
-Unit 1 changes what leaves the process on a failed API call: one security-reviewer pass.
-Unit 2 adds a check that runs before a credential is minted: covered by the same pass.
+| pass | findings | outcome |
+|---|---|---|
+| `review-result:refusal-causes-security-1` | 3 introduced (push `--m` is `--mirror`; two false "nothing staged"), 3 pre-existing guard bypasses (`-nm`, `--no-verif`, `--receive-pack`/`--upload-pack`/`--e=`), 2 INFEASIBLE | all 6 fixed in `46778b5` with the reviewer's 10 tests; repository-config deletion documented in the README as outside an argument check; a 2xx non-JSON body is now a success |
+
+## Gate
+
+Package gate on `9ee5a9b` (release content): `cargo fmt --all --check` 0, `cargo clippy -p
+b10x-gates --all-targets --locked -- -D warnings` 0, `cargo test -p b10x-gates --locked` 259
+passed, 6 ignored, 265 listed. The closing store commit changes only `.engineering/`.
