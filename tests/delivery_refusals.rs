@@ -300,3 +300,21 @@ fn gh_unsupported_command_is_named() {
         "{text}"
     );
 }
+
+/// A 2xx whose body is empty or not JSON is a write that succeeded: `api` must not
+/// report it as failed, or the caller repeats a write that already happened.
+#[test]
+fn api_success_with_empty_or_non_json_body_is_success() {
+    for (status, body) in [
+        (201, &b""[..]),
+        (200, &b"<html>accepted</html>"[..]),
+        (202, &b"not json"[..]),
+        (204, &b""[..]),
+    ] {
+        let value = delivery::success_body_for_test(status, body)
+            .unwrap_or_else(|e| panic!("{status} {body:?} reported as failed: {e:#}"));
+        assert_eq!(value, serde_json::Value::Null, "{status} {body:?}");
+    }
+    let value = delivery::success_body_for_test(201, br#"{"number":7}"#).unwrap();
+    assert_eq!(value, json!({"number": 7}));
+}

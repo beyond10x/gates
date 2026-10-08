@@ -188,29 +188,14 @@ impl Github {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok());
             return Err(ApiFailure::new(status, body).into());
         }
-        if status.as_u16() == 204 {
-            return Ok((status, Value::Null));
-        }
-        response
-            .json()
-            .map(|value| (status, value))
-            .map_err(|_| anyhow::anyhow!("GitHub response invalid"))
+        // A body that cannot be read after a 2xx is the same as an empty one.
+        let bytes = response.bytes().unwrap_or_default();
+        success_body(status, &bytes).map(|value| (status, value))
     }
 
     pub fn git(&self, root: &Path, args: &[String]) -> Result<()> {
-        ensure!(
-            args.first()
-                .is_some_and(|a| matches!(a.as_str(), "commit" | "tag" | "push" | "fetch")),
-            "bot Git command must be commit, tag, push or fetch"
-        );
-        ensure!(
-            !args.iter().any(|a| a == "--no-verify"
-                || a == "-n"
-                || a == "-c"
-                || a.starts_with("--config-env")
-                || a.starts_with("--exec")),
-            "bot delivery cannot bypass hooks or inject Git configuration"
-        );
+        // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
+        crate::bot_args::check(args, None)?;
         let status = Command::new("git").current_dir(root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", BOT_NAME).env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
@@ -227,7 +212,7 @@ impl Github {
         }
         let verb = &args[0];
         let nothing_staged = if verb == "commit" && !commit_names_changes(args) {
-            index_equals_head(root)
+            index_equals_head(root) && !merge_in_progress(root)
         } else {
             false
         };
@@ -511,6 +496,19 @@ impl ApiFailure {
     }
 }
 
+/// The value of a 2xx answer. A body that is empty or not JSON is still a write that
+/// succeeded, so it is `Null`, never an error a caller would retry; a caller that
+/// needs a field fails closed on its absence.
+fn success_body(status: StatusCode, bytes: &[u8]) -> Result<Value> {
+    debug_assert!(status.is_success());
+    Ok(serde_json::from_slice(bytes).unwrap_or(Value::Null))
+}
+
+#[doc(hidden)]
+pub fn success_body_for_test(status: u16, bytes: &[u8]) -> Result<Value> {
+    success_body(StatusCode::from_u16(status).expect("valid status"), bytes)
+}
+
 #[doc(hidden)]
 pub fn api_failure_for_test(status: u16, body: &[u8], matchers: &Matchers) -> String {
     ApiFailure::new(
@@ -590,9 +588,10 @@ fn exit(status: std::process::ExitStatus) -> String {
 }
 
 /// Whether a `commit` names what it commits some other way than the index: a
-/// pathspec after `--` or from a file, `-a`/`--all`, an empty or amended commit,
-/// or an interactive selection. Only without any of these can an empty index be
-/// the reason Git refused.
+/// pathspec, with or without `--`, or from a file, `-a`/`--all`, an empty or
+/// amended commit, or an interactive selection. Only without any of these can an
+/// empty index be the reason Git refused. An argument that is neither an option
+/// nor an option's value is a pathspec.
 fn commit_names_changes(args: &[String]) -> bool {
     const VALUED_LONG: [&str; 10] = [
         "--message",
@@ -641,9 +640,26 @@ fn commit_names_changes(args: &[String]) -> bool {
                     break;
                 }
             }
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return true;
         }
     }
     false
+}
+
+/// A merge commits the whole index even when its tree equals HEAD, so an index equal
+/// to HEAD is not "nothing staged" while one is in progress.
+fn merge_in_progress(root: &Path) -> bool {
+    Command::new("git")
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Asked of Git after it refused, in the same repository, rather than read from
