@@ -286,9 +286,30 @@ fn execute(args: Args) -> Result<()> {
         let body = raw
             .map(|v| serde_json::from_slice::<serde_json::Value>(&v))
             .transpose()?;
-        let response = Github::bot()?.api(method.parse()?, path, body.as_ref())?;
-        policy::private_write(output, &serde_json::to_vec(&response)?)?;
-        println!("bot API operation completed; response retained locally");
+        // Refuse an unusable output before the request, so a write that succeeds
+        // remotely is never followed by a refusal the caller would retry.
+        policy::output_directory(output)?;
+        let (status, response) = Github::bot()?
+            .api_response(method.parse()?, path, body.as_ref())
+            .map_err(|error| api_failure(error, args.policy.as_deref()))?;
+        let written = serde_json::to_vec(&response)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| policy::private_write(output, &bytes));
+        let vetted = match written {
+            Ok(()) => None,
+            Err(_) => matchers(args.policy.as_deref()).ok(),
+        };
+        let report = delivery::api_success_report(
+            status.as_u16(),
+            &response,
+            output,
+            written,
+            vetted.as_ref(),
+        )?;
+        println!("{}", report.stdout);
+        if let Some(stderr) = report.stderr {
+            eprintln!("b10x-gates: {stderr}");
+        }
         return Ok(());
     }
     if let Action::ScanText { path } = &args.command {
@@ -551,6 +572,15 @@ fn matchers(path: Option<&std::path::Path>) -> Result<scan::Matchers> {
         None => policy::root()?.join("policy.json"),
     };
     scan::Matchers::build(&Policy::load(&path)?)
+}
+
+/// GitHub's own message for a refused `api` request, once the private-rule matchers
+/// have read it. Without a trusted policy the refusal stays status only.
+fn api_failure(error: anyhow::Error, policy: Option<&std::path::Path>) -> anyhow::Error {
+    match error.downcast_ref::<delivery::ApiFailure>() {
+        Some(failure) => anyhow::anyhow!(failure.render(matchers(policy).ok().as_ref())),
+        None => error,
+    }
 }
 
 /// Refuse without echoing the matched text, as every other scanner here does.
