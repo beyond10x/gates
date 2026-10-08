@@ -132,3 +132,80 @@ fn existing_guards_still_refuse() {
         );
     }
 }
+
+/// Git takes any unique prefix of a long option: `git push --e=<command>` is
+/// `--exec`, `--m` is `--mirror`. Every prefix of a deleting, hook-skipping or
+/// command-running option is refused, and so is `n` in a cluster before any short
+/// option that takes a value.
+#[test]
+fn abbreviated_and_clustered_guards_are_refused() {
+    for line in [
+        "push --e=elsewhere origin main",
+        "push --ex=elsewhere origin main",
+        "push --rece=elsewhere origin main",
+        "push --r origin main",
+        "fetch --u=elsewhere origin",
+        "fetch --upl elsewhere origin",
+        "fetch --config-e=x origin",
+        "commit --con=x -m change",
+        "commit --no-v -m change",
+        "push --no-verify=yes origin main",
+        "commit -an -m change",
+        "commit -anm change",
+        "push -fn origin main",
+        "tag -n",
+    ] {
+        let text = refusal(line, None);
+        assert!(
+            text.contains("bot delivery cannot bypass hooks or inject Git configuration"),
+            "{line}: {text}"
+        );
+    }
+    for line in [
+        "push --m origin",
+        "push --mi origin",
+        "push --d origin x",
+        "push --p origin",
+        "push --pr origin",
+    ] {
+        let text = refusal(line, None);
+        assert!(
+            text.contains("cannot delete a remote branch"),
+            "{line}: {text}"
+        );
+    }
+}
+
+/// `n` as part of a value is not `--no-verify`.
+#[test]
+fn n_inside_a_value_passes() {
+    for line in [
+        "commit -mn",
+        "commit -am change",
+        "commit -m change -- n",
+        "push -on origin main",
+        "push -o n origin main",
+        "push --no-verbose origin main",
+        "commit --no-edit --amend",
+    ] {
+        check(&args(line), None).unwrap_or_else(|e| panic!("`{line}` refused: {e:#}"));
+    }
+}
+
+/// `Github::git` runs the same check, so a form the bot refuses never reaches Git
+/// through the library either.
+#[test]
+fn library_git_runs_the_same_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let github = b10x_gates::delivery::Github::from_token("synthetic-token".into()).unwrap();
+    for (line, expected) in [
+        ("push --m origin", "cannot delete a remote branch"),
+        ("commit -nm change", "cannot bypass hooks"),
+        ("push --e=elsewhere origin main", "cannot bypass hooks"),
+        ("merge feature", "git merge --no-ff --no-commit"),
+    ] {
+        let text = format!("{:#}", github.git(dir.path(), &args(line)).unwrap_err());
+        assert!(text.contains(expected), "{line}: {text}");
+        assert!(!text.contains("failed (exit"), "{line} reached Git: {text}");
+    }
+}

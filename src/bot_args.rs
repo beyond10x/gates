@@ -2,7 +2,7 @@
 //!
 //! The bot runs `commit`, `tag`, `push` and `fetch` only. Everything else is refused
 //! with the supported route in the text, so an agent does not have to find it alone.
-//! `Github::git` keeps its own guard as a second check.
+//! `Github::git` runs this same check again, so the two cannot drift.
 use anyhow::{Result, bail};
 
 const SUPPORTED: &str = "bot Git command must be commit, tag, push or fetch";
@@ -35,16 +35,46 @@ pub fn check(args: &[String], repository: Option<&str>) -> Result<()> {
             delete_route(repository, "<branch>")
         ),
     }
-    if args.iter().any(|a| {
-        a == "--no-verify"
-            || a == "-n"
-            || a == "-c"
-            || a.starts_with("--config-env")
-            || a.starts_with("--exec")
-    }) {
+    // Every argument is read, including those after `--`: when unsure, refuse.
+    if args[1..].iter().any(|a| guarded(verb, a)) {
         bail!("{GUARD}");
     }
     Ok(())
+}
+
+/// Long options that run a caller-chosen command or inject configuration. Git takes
+/// any unique prefix of a long option, so every non-empty prefix is refused:
+/// `git push --e=<command>` is `--exec`.
+const EXECUTING_OPTIONS: [&str; 4] = ["receive-pack", "upload-pack", "exec", "config-env"];
+/// Short options whose value is the rest of the cluster, per verb: an `n` after one
+/// of them is part of a value, an `n` before it is `--no-verify`.
+fn short_valued(verb: &str) -> Option<&'static str> {
+    match verb {
+        "commit" => Some("mFCct"),
+        "push" => Some("o"),
+        _ => None,
+    }
+}
+
+/// One argument that would bypass hooks or inject Git configuration.
+fn guarded(verb: &str, argument: &str) -> bool {
+    if argument == "-n" || argument == "-c" {
+        return true;
+    }
+    if let Some(long) = argument.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or("");
+        return name.starts_with("config-env")
+            || name.starts_with("exec")
+            || (name.len() >= "no-v".len() && "no-verify".starts_with(name))
+            || (!name.is_empty() && EXECUTING_OPTIONS.iter().any(|o| o.starts_with(name)));
+    }
+    let (Some(cluster), Some(valued)) = (argument.strip_prefix('-'), short_valued(verb)) else {
+        return false;
+    };
+    cluster
+        .chars()
+        .take_while(|c| !valued.contains(*c))
+        .any(|c| c == 'n')
 }
 
 fn delete_route(repository: &str, branch: &str) -> String {
@@ -74,7 +104,7 @@ fn push(args: &[String], repository: &str) -> Result<()> {
         }
         if let Some(long) = argument.strip_prefix("--") {
             let name = long.split('=').next().unwrap_or("");
-            if name.len() >= 2 && DELETING_OPTIONS.iter().any(|o| o.starts_with(name)) {
+            if !name.is_empty() && DELETING_OPTIONS.iter().any(|o| o.starts_with(name)) {
                 deleting_option = true;
             }
             skip_value = VALUED_OPTIONS.contains(&argument);
