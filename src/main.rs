@@ -225,6 +225,8 @@ fn execute(args: Args) -> Result<()> {
         return Ok(());
     }
     if let Action::Bot { args: command } = &args.command {
+        // Refuse an unsupported operation before any credential is minted.
+        b10x_gates::bot_args::check(command, args.repository.as_deref())?;
         return Github::bot()?.git(&args.repo, command);
     }
     if let Action::Gh { args: command } = &args.command {
