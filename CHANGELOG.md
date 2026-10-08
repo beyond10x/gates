@@ -1,6 +1,37 @@
 # Changelog
 
-## 0.1.15 — unreleased
+## 0.1.16 — unreleased
+
+- Delivery refusals name their cause. A protected file's refusal names its path and what is
+  wrong: missing, not a regular file, a symlink, its mode and the mode it needs with the `chmod`
+  that fixes it, its owner, or a parent or output directory writable by others. A failed bot Git
+  verb names itself and Git's exit status, and a commit with an index equal to `HEAD` and no
+  other source of changes says "nothing staged". An unsupported `gh` command names itself and the
+  supported list; a failed `gh` child names its exit status.
+- `api` carries GitHub's message for a 4xx answer: the status, `message` and each `errors` entry,
+  after the private-rule and personal-path matchers have read both the raw and the shown text.
+  On a match, or without a trusted policy, the message is withheld and the status still printed.
+  Control characters are removed and each message is cut to 300 bytes. A 5xx or non-JSON answer,
+  and every caller without a policy, stays status only.
+- `api` checks its output directory before the request, and reports a remote write that
+  succeeded as success (exit 0), with its status, number and vetted URL, when the response file
+  cannot be written or the answer carries no JSON body. A retry is what made a created pull
+  request answer 422.
+- `bot` checks its arguments before it mints a token and prints the supported route:
+  `merge`, `pull`, `rebase`, `cherry-pick` and `am` name `git merge --no-ff --no-commit <branch>`
+  followed by `b10x-gates bot -- commit -F -`; a `push` that deletes a remote ref (`--delete`,
+  `-d`, `--prune`, `--mirror`, any prefix Git accepts for them, `:<branch>` and `+:<branch>`)
+  names `b10x-gates api --method DELETE --path /repos/<owner>/<repo>/git/refs/heads/<branch>`.
+  No verb is added; `.engineering/planning/design/bot-verbs.md` proposes which could be.
+- The bot's hook and configuration guard closes three bypasses that predate this release: an
+  abbreviated `--no-verify` (`--no-verif`), `-n` inside a commit short cluster (`-nm`), and
+  `--receive-pack`, `--upload-pack` and every prefix Git accepts for `--exec` (`--e=`), which ran
+  a caller-chosen command with the bot token in its environment. `Github::git` and the argument
+  check now share one guard.
+- No policy field or receipt format changes. The version increment invalidates receipts retained
+  under 0.1.15, so the first check after upgrading scans in full once.
+
+## 0.1.15 — 2026-10-07
 
 - `personal-paths` decodes hex-encoded path components. A JSON `"components"` array of hex
   strings, the form ESS writes for the absolute output directory in

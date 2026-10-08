@@ -1,5 +1,6 @@
 //! Common security gates. Candidate repositories are read only as Git objects.
 pub mod artifact;
+pub mod bot_args;
 pub mod delivery;
 pub mod evidence;
 pub mod git;

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-08T10:13:39Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-supported-routes",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo fmt/clippy/test -p b10x-gates --locked on 9ee5a9b: 259 passed, 6 ignored, 265 listed"
+  }
+}
