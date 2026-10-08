@@ -186,18 +186,25 @@ pub fn protect(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = fs::symlink_metadata(path).context("protected file unavailable")?;
-        ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
-            "protected file must be a regular file"
-        );
+        let meta = fs::symlink_metadata(path).map_err(|e| unavailable(path, &e))?;
+        regular(path, &meta)?;
         let probe = tempfile::tempfile()?;
+        let uid = probe.metadata()?.uid();
         ensure!(
-            meta.uid() == probe.metadata()?.uid(),
-            "refusing to change permissions on another user's file"
+            meta.uid() == uid,
+            "refusing to change permissions on another user's file: {} is owned by uid {}, \
+             this process runs as uid {uid}",
+            path.display(),
+            meta.uid()
         );
         if meta.permissions().mode() & 0o077 != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+                anyhow::anyhow!(
+                    "protected file {} could not be narrowed to mode 0600: {}",
+                    path.display(),
+                    e.kind()
+                )
+            })?;
         }
     }
     let _ = path;
@@ -205,11 +212,8 @@ pub fn protect(path: &Path) -> Result<()> {
 }
 
 pub fn protected_read(path: &Path) -> Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(path).context("protected file unavailable")?;
-    ensure!(
-        meta.is_file() && !meta.file_type().is_symlink(),
-        "protected file must be a regular file"
-    );
+    let meta = fs::symlink_metadata(path).map_err(|e| unavailable(path, &e))?;
+    regular(path, &meta)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -220,42 +224,155 @@ pub fn protected_read(path: &Path) -> Result<Vec<u8>> {
         let probe = tempfile::tempfile()?;
         let uid = probe.metadata()?.uid();
         ensure!(
-            meta.uid() == uid
-                && user.is_none_or(|v| v == uid)
-                && meta.permissions().mode() & 0o077 == 0,
-            "protected file ownership or permissions invalid"
+            meta.uid() == uid,
+            "protected file {} is owned by uid {}, expected uid {uid}",
+            path.display(),
+            meta.uid()
         );
-        let parent = path.parent().context("protected file parent missing")?;
-        let parent_meta = fs::metadata(parent)?;
+        if let Some(user) = user.filter(|v| *v != uid) {
+            bail!(
+                "protected file {} cannot be trusted: the UID environment variable says uid \
+                 {user}, this process runs as uid {uid}",
+                path.display()
+            );
+        }
+        let mode = meta.permissions().mode();
         ensure!(
-            parent_meta.uid() == uid && parent_meta.permissions().mode() & 0o022 == 0,
-            "protected directory is writable by another user"
+            mode & 0o077 == 0,
+            "protected file {path} has mode {:04o}, needs 0600 or stricter (chmod 600 {path})",
+            mode & 0o7777,
+            path = path.display()
+        );
+        let parent = path.parent().with_context(|| {
+            format!("protected file {} has no parent directory", path.display())
+        })?;
+        let parent_meta = fs::metadata(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "protected directory {} unavailable: {}",
+                parent.display(),
+                cause(&e)
+            )
+        })?;
+        ensure!(
+            parent_meta.uid() == uid,
+            "protected directory {} is owned by uid {}, expected uid {uid}",
+            parent.display(),
+            parent_meta.uid()
+        );
+        let parent_mode = parent_meta.permissions().mode();
+        ensure!(
+            parent_mode & 0o022 == 0,
+            "protected directory {dir} has mode {:04o}, writable by group or others \
+             (chmod go-w {dir})",
+            parent_mode & 0o7777,
+            dir = parent.display()
         );
     }
-    let bytes = fs::read(path).context("protected file read failed")?;
+    let bytes = fs::read(path).map_err(|e| {
+        anyhow::anyhow!(
+            "protected file {} read failed: {}",
+            path.display(),
+            cause(&e)
+        )
+    })?;
     if bytes.len() > 4 * 1024 * 1024 {
-        bail!("protected file exceeds limit");
+        bail!("protected file {} exceeds 4 MiB", path.display());
     }
     Ok(bytes)
 }
 
-pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let parent = path.parent().context("output parent missing")?;
-    fs::create_dir_all(parent)?;
+/// Prepare the directory `path` will be written into: create it if absent, and
+/// refuse it when another user could write it. `private_write` runs the same check,
+/// so a caller may run it before work whose result must not be lost.
+pub fn output_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("output {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "output directory {} cannot be created: {}",
+            parent.display(),
+            cause(&e)
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         // Do not change caller-owned parents; newly created configuration roots are handled by enrollment.
+        let mode = fs::metadata(parent)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "output directory {} unavailable: {}",
+                    parent.display(),
+                    cause(&e)
+                )
+            })?
+            .permissions()
+            .mode();
         ensure!(
-            fs::metadata(parent)?.permissions().mode() & 0o022 == 0,
-            "output directory is writable by another user"
+            mode & 0o022 == 0,
+            "output directory {dir} has mode {:04o}, writable by another user; needs 0700 \
+             (chmod 700 {dir})",
+            mode & 0o7777,
+            dir = parent.display()
         );
     }
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(path)
-        .map_err(|_| anyhow::anyhow!("protected output persist failed"))?;
     Ok(())
+}
+
+pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    output_directory(path)?;
+    let parent = path.parent().context("output parent missing")?;
+    let failed = |e: std::io::Error| {
+        anyhow::anyhow!(
+            "output {} could not be written: {}",
+            path.display(),
+            cause(&e)
+        )
+    };
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(failed)?;
+    file.write_all(bytes).map_err(failed)?;
+    file.as_file().sync_all().map_err(failed)?;
+    file.persist(path).map_err(|e| {
+        anyhow::anyhow!(
+            "protected output persist failed: {} could not be replaced: {}",
+            path.display(),
+            cause(&e.error)
+        )
+    })?;
+    Ok(())
+}
+
+/// The I/O error kind alone. The operating system's message can carry a path the
+/// caller did not name; the kind cannot.
+fn cause(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not found".into(),
+        kind => kind.to_string(),
+    }
+}
+
+fn unavailable(path: &Path, error: &std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "protected file {} unavailable: {}",
+        path.display(),
+        cause(error)
+    )
+}
+
+fn regular(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    let kind = if meta.file_type().is_symlink() {
+        "a symlink"
+    } else if meta.is_dir() {
+        "a directory"
+    } else if !meta.is_file() {
+        "not a regular file"
+    } else {
+        return Ok(());
+    };
+    bail!(
+        "protected file {} is {kind}; it must be a regular file",
+        path.display()
+    )
 }
