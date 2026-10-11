@@ -227,6 +227,8 @@ fn execute(args: Args) -> Result<()> {
     if let Action::Bot { args: command } = &args.command {
         // Refuse an unsupported operation before any credential is minted.
         b10x_gates::bot_args::check(command, args.repository.as_deref())?;
+        // A merge or revert the repository state refuses is refused before it, too.
+        b10x_gates::delivery::preflight(&args.repo, command)?;
         return Github::bot()?.git(&args.repo, command);
     }
     if let Action::Gh { args: command } = &args.command {

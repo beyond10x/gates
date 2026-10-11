@@ -1,5 +1,6 @@
-format: ess/1
+format: ess/24
 system: gates
 version: v1
 domains:
   - gates.evidence
+  - gates.delivery

@@ -194,37 +194,7 @@ impl Github {
     }
 
     pub fn git(&self, root: &Path, args: &[String]) -> Result<()> {
-        // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
-        crate::bot_args::check(args, None)?;
-        let status = Command::new("git").current_dir(root)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", BOT_NAME).env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
-            .env("GIT_COMMITTER_NAME", BOT_NAME).env("GIT_COMMITTER_EMAIL", BOT_EMAIL)
-            .env("B10X_BOT_TOKEN", &self.token).env("B10X_BOT_PUSH", "1")
-            .args(["-c", &format!("user.name={BOT_NAME}"), "-c", &format!("user.email={BOT_EMAIL}"),
-                "-c", "url.https://github.com/.pushInsteadOf=git@github.com:",
-                "-c", "url.https://github.com/.pushInsteadOf=ssh://git@github.com/",
-                "-c", "credential.https://github.com.helper=",
-                "-c", "credential.https://github.com.helper=!f() { echo username=x-access-token; echo \"password=${B10X_BOT_TOKEN}\"; }; f"])
-            .args(args).status().context("bot Git failed")?;
-        if status.success() {
-            return Ok(());
-        }
-        let verb = &args[0];
-        let nothing_staged = if verb == "commit" && !commit_names_changes(args) {
-            index_equals_head(root) && !merge_in_progress(root)
-        } else {
-            false
-        };
-        bail!(
-            "{}bot Git {verb} failed ({}); Git's and the hooks' output is above",
-            if nothing_staged {
-                "nothing staged: git add the paths, or name them after --; "
-            } else {
-                ""
-            },
-            exit(status)
-        )
+        bot_git(root, args, Some(&self.token))
     }
 
     pub fn publish(
@@ -564,6 +534,262 @@ pub fn api_success_report(
              do not repeat it",
             output.display()
         )),
+    })
+}
+
+/// Run one bot Git command in `root` with the bot identity and environment.
+/// `credential` is the installation token `Github::git` supplies for `push` and
+/// `fetch`; without one, the credential variables are not set and nothing that runs
+/// here can reach the network as the bot.
+pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result<()> {
+    // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
+    crate::bot_args::check(args, None)?;
+    if matches!(args[0].as_str(), "merge" | "revert") {
+        // No credential enters a merge or revert: neither needs the network.
+        return integrate(root, &crate::bot_args::integration(args)?);
+    }
+    run_bot(root, args, bot_command(root, credential))
+}
+
+fn run_bot(root: &Path, args: &[String], mut command: Command) -> Result<()> {
+    let status = command.args(args).status().context("bot Git failed")?;
+    if status.success() {
+        return Ok(());
+    }
+    let verb = &args[0];
+    let nothing_staged = if verb == "commit" && !commit_names_changes(args) {
+        index_equals_head(root) && !merge_in_progress(root)
+    } else {
+        false
+    };
+    bail!(
+        "{}bot Git {verb} failed ({}); Git's and the hooks' output is above",
+        if nothing_staged {
+            "nothing staged: git add the paths, or name them after --; "
+        } else {
+            ""
+        },
+        exit(status)
+    )
+}
+
+/// `git` in `root` with the bot identity, no global or system configuration and,
+/// when a credential is given, the push rewrite and credential helper that use it.
+fn bot_command(root: &Path, credential: Option<&str>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", BOT_NAME)
+        .env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
+        .env("GIT_COMMITTER_NAME", BOT_NAME)
+        .env("GIT_COMMITTER_EMAIL", BOT_EMAIL)
+        .args([
+            "-c",
+            &format!("user.name={BOT_NAME}"),
+            "-c",
+            &format!("user.email={BOT_EMAIL}"),
+        ]);
+    if let Some(token) = credential {
+        command
+            .env("B10X_BOT_TOKEN", token)
+            .env("B10X_BOT_PUSH", "1")
+            .args([
+                "-c",
+                "url.https://github.com/.pushInsteadOf=git@github.com:",
+                "-c",
+                "url.https://github.com/.pushInsteadOf=ssh://git@github.com/",
+                "-c",
+                "credential.https://github.com.helper=",
+                "-c",
+                "credential.https://github.com.helper=!f() { echo username=x-access-token; echo \"password=${B10X_BOT_TOKEN}\"; }; f",
+            ]);
+    }
+    command
+}
+
+/// The bot environment for a merge or revert: no credential, and no configuration
+/// from the caller's environment, so the merge drivers read from `.git/config` are
+/// every driver Git can run.
+fn integration_command(root: &Path) -> Command {
+    let mut command = bot_command(root, None);
+    command
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT");
+    command
+}
+
+/// Git's answer in `root`, read in the merge or revert environment.
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = integration_command(root)
+        .args(args)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("bot Git failed")?;
+    ensure!(output.status.success(), "git {} failed", args.join(" "));
+    Ok(String::from_utf8(output.stdout)
+        .context("git output is not UTF-8")?
+        .trim_end_matches('\n')
+        .to_string())
+}
+
+/// The repository-state refusals of `gates.delivery.Merge` and `Revert`: a merge
+/// driver declared in the repository's own configuration, then an operation already
+/// in progress. `b10x-gates bot` runs this before minting a credential and the merge
+/// or revert runs it again. Any other verb passes.
+pub fn preflight(root: &Path, args: &[String]) -> Result<()> {
+    let verb = match args.first().map(String::as_str) {
+        Some("merge") => crate::bot_args::Verb::Merge,
+        Some("revert") => crate::bot_args::Verb::Revert,
+        _ => return Ok(()),
+    };
+    let dirs = git_output(root, &["rev-parse", "--git-dir", "--git-common-dir"])?;
+    let mut dirs = dirs.lines().map(|d| root.join(d));
+    let (Some(git_dir), Some(common_dir)) = (dirs.next(), dirs.next()) else {
+        bail!("bot {} cannot locate the Git directory", verb.name());
+    };
+    if verb == crate::bot_args::Verb::Merge {
+        merge_drivers(root, &git_dir, &common_dir)?;
+    }
+    let in_progress = [
+        ("MERGE_HEAD", "merge"),
+        ("REVERT_HEAD", "revert"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase or am"),
+        ("sequencer", "cherry-pick or revert sequence"),
+    ]
+    .into_iter()
+    .find(|(path, _)| git_dir.join(path).exists());
+    if let Some((_, operation)) = in_progress {
+        bail!(
+            "bot {} refused: {operation} in progress; finish or abort it first",
+            verb.name()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a merge when the repository's own configuration names a merge driver, a
+/// command Git would run during the merge. The files are parsed as data, with no
+/// include expanded; a file that includes another cannot be read that way and is
+/// refused too.
+fn merge_drivers(root: &Path, git_dir: &Path, common_dir: &Path) -> Result<()> {
+    let mut files = vec![
+        common_dir.join("config"),
+        common_dir.join("config.worktree"),
+    ];
+    if git_dir != common_dir {
+        files.push(git_dir.join("config.worktree"));
+    }
+    let mut drivers = Vec::new();
+    for file in files.iter().filter(|f| f.is_file()) {
+        let read = |pattern: &str| -> Result<Vec<String>> {
+            let output = Command::new("git")
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .arg("config")
+                .arg("--file")
+                .arg(file)
+                .args(["--no-includes", "--name-only", "--get-regexp", pattern])
+                .output()
+                .context("bot Git failed")?;
+            // Exit 1 is "no such key"; anything else is a file Git cannot parse.
+            match output.status.code() {
+                Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(String::from)
+                    .collect()),
+                Some(1) => Ok(Vec::new()),
+                _ => bail!(
+                    "bot merge refused: {} cannot be read as Git configuration",
+                    file.display()
+                ),
+            }
+        };
+        if !read(r"^include(if\..*)?\.path$")?.is_empty() {
+            bail!(
+                "bot merge refused: {} includes other configuration, which may name a merge \
+                 driver; remove the include to merge as the bot",
+                file.display()
+            );
+        }
+        drivers.extend(read(r"^merge\..+\.driver$")?.into_iter().map(|key| {
+            key.strip_prefix("merge.")
+                .and_then(|k| k.strip_suffix(".driver"))
+                .unwrap_or(&key)
+                .to_string()
+        }));
+    }
+    if !drivers.is_empty() {
+        bail!(
+            "bot merge refused: the repository configuration names the merge driver {}, a \
+             command the merge would run; remove `merge.<driver>.driver` to merge as the bot",
+            drivers
+                .iter()
+                .map(|d| format!("`{d}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `gates.delivery.Merge` and `Revert`: refuse what the repository state refuses, run
+/// Git's no-commit form, then commit the result as the bot.
+fn integrate(root: &Path, plan: &crate::bot_args::Integration) -> Result<()> {
+    use crate::bot_args::Verb;
+    let name = plan.verb.name();
+    let mut line = vec![name.to_string()];
+    line.extend(plan.options.iter().cloned());
+    preflight(root, &line)?;
+    let mut command = integration_command(root);
+    command.args(["-c", "merge.renormalize=false", name]);
+    command.args(&plan.options);
+    match plan.verb {
+        Verb::Merge => command.args(["--no-ff", "--no-commit"]),
+        Verb::Revert => command.arg("--no-commit"),
+    };
+    if plan.separated {
+        command.arg("--");
+    }
+    let status = command
+        .arg(&plan.revision)
+        .status()
+        .context("bot Git failed")?;
+    if !status.success() {
+        if !git_output(root, &["ls-files", "--unmerged"])?.is_empty() {
+            bail!(
+                "bot {name} stopped on a conflict, left in the index: resolve it, `git add` the \
+                 resolved paths, then run `b10x-gates bot -- commit -F -`; or run \
+                 `git {name} --abort`"
+            );
+        }
+        bail!(
+            "bot Git {name} failed ({}); Git's output is above",
+            exit(status)
+        );
+    }
+    if plan.verb == Verb::Merge && !merge_in_progress(root) {
+        // Already up to date: there is nothing to commit.
+        return Ok(());
+    }
+    let mut commit = vec!["commit".to_string()];
+    if plan.message.is_empty() {
+        commit.push("--no-edit".into());
+    } else {
+        commit.extend(plan.message.iter().cloned());
+    }
+    crate::bot_args::check(&commit, None)?;
+    run_bot(root, &commit, integration_command(root)).with_context(|| {
+        format!(
+            "the {name} is still in progress: fix what is reported, then run \
+             `b10x-gates bot -- commit -F -`; or run `git {name} --abort`"
+        )
     })
 }
 
