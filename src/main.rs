@@ -237,8 +237,14 @@ fn execute(args: Args) -> Result<()> {
             );
             return Ok(());
         }
-        // A merge or revert the repository state refuses is refused before it, too.
-        b10x_gates::delivery::preflight(&args.repo, command)?;
+        if command
+            .first()
+            .is_some_and(|verb| verb == "merge" || verb == "revert")
+        {
+            // Neither reaches the network, so no credential is minted: the bot runs
+            // them token-free, refusing what the repository state refuses first.
+            return delivery::bot_git(&args.repo, command, None);
+        }
         return Github::bot()?.git(&args.repo, command);
     }
     if let Action::Gh { args: command } = &args.command {

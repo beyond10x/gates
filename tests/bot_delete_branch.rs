@@ -65,6 +65,7 @@ impl Fake {
                 &format!("/repos/example/sample/compare/{TIP}...main"),
                 Some(comparison),
             )
+            .answer(&rules_path(encoded), Some(bot_authority()))
     }
 }
 
@@ -86,6 +87,50 @@ impl RemoteBranches for Fake {
         self.deletes.borrow_mut().push(path.to_string());
         Ok(())
     }
+}
+
+fn rules_path(encoded: &str) -> String {
+    format!("/repos/example/sample/rules/branches/{encoded}?per_page=100")
+}
+
+fn rule(kind: &str) -> Value {
+    json!({"type": kind, "ruleset_source_type": "Organization", "ruleset_id": 1})
+}
+
+/// The rules the organization's bot-authority ruleset puts on a non-default branch, as
+/// GitHub answered for beyond10x/gates: one `deletion` among them.
+fn bot_authority() -> Value {
+    Value::Array(
+        [
+            "creation",
+            "update",
+            "deletion",
+            "non_fast_forward",
+            "commit_author_email_pattern",
+            "committer_email_pattern",
+        ]
+        .into_iter()
+        .map(rule)
+        .collect(),
+    )
+}
+
+/// A merged branch `wave/one` whose rules are `rules` (`None` is a 404).
+fn ruled(rules: Option<Value>) -> Fake {
+    Fake::default()
+        .answer(
+            "/repos/example/sample",
+            Some(json!({"default_branch": "main"})),
+        )
+        .answer(
+            "/repos/example/sample/branches/wave/one",
+            Some(branch("wave/one", TIP, false)),
+        )
+        .answer(
+            &format!("/repos/example/sample/compare/{TIP}...main"),
+            Some(json!({"status": "ahead", "merge_base_commit": {"sha": TIP}})),
+        )
+        .answer(&rules_path("wave/one"), rules)
 }
 
 fn branch(name: &str, tip: &str, protected: bool) -> Value {
@@ -375,4 +420,66 @@ fn library_git_never_runs_delete_branch() {
     );
     assert!(text.contains("REST API"), "{text}");
     assert!(!text.contains("failed (exit"), "reached Git: {text}");
+}
+
+/// A branch no ruleset covers, or only the bot-authority one, is deleted; the rules
+/// are read before the DELETE.
+#[test]
+fn deletes_under_the_bot_authority_ruleset_alone() {
+    for rules in [json!([]), bot_authority()] {
+        let fake = ruled(Some(rules.clone()));
+        delete_remote_branch(&fake, &deletion("wave/one"))
+            .unwrap_or_else(|e| panic!("{rules}: {e:#}"));
+        assert!(
+            fake.reads.borrow().contains(&rules_path("wave/one")),
+            "{rules}"
+        );
+        assert_eq!(fake.deletes.borrow().len(), 1, "{rules}");
+    }
+}
+
+/// `protected` does not report rulesets, and the App bypasses them: a rule type the
+/// bot-authority ruleset does not carry marks a branch someone protects.
+#[test]
+fn refuses_a_ruleset_protected_branch() {
+    for kind in ["required_status_checks", "pull_request", "merge_queue"] {
+        let mut rules = bot_authority();
+        rules.as_array_mut().unwrap().push(rule(kind));
+        let text = refused(&ruled(Some(rules)), "wave/one");
+        assert!(text.contains("ruleset-protected"), "{kind}: {text}");
+        assert!(text.contains(&format!("`{kind}`")), "{kind}: {text}");
+    }
+    let text = refused(&ruled(Some(json!([{"ruleset_id": 1}]))), "wave/one");
+    assert!(text.contains("without a type"), "{text}");
+}
+
+/// A second `deletion` rule is a second ruleset restricting deletion.
+#[test]
+fn refuses_a_second_deletion_rule() {
+    let mut rules = bot_authority();
+    rules.as_array_mut().unwrap().push(rule("deletion"));
+    let text = refused(&ruled(Some(rules)), "wave/one");
+    assert!(text.contains("2 rulesets restrict its deletion"), "{text}");
+}
+
+/// A rules answer that is not a JSON array, or a 404, says nothing: refused.
+#[test]
+fn refuses_unlisted_rulesets() {
+    for answer in [
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"rules": []})),
+        Some(json!("deletion")),
+    ] {
+        let text = refused(&ruled(answer.clone()), "wave/one");
+        assert!(
+            text.contains("did not list the rulesets"),
+            "{answer:?}: {text}"
+        );
+    }
+    // A full page may hide the next one.
+    let page = Value::Array((0..100).map(|_| rule("update")).collect());
+    let text = refused(&ruled(Some(page)), "wave/one");
+    assert!(text.contains("more than one page"), "{text}");
 }

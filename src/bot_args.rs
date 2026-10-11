@@ -12,31 +12,67 @@ const GUARD: &str = "bot delivery cannot bypass hooks or inject Git configuratio
 const MERGE_ROUTE: &str =
     "run `b10x-gates bot -- merge <branch>`, which commits the merge as the bot";
 
-/// `merge` and `revert` long options the bot refuses, matched by every prefix: they
-/// choose a strategy or a resolution, skip the bot's own commit, resume or abandon an
-/// operation, bypass hooks or inject configuration (`gates.delivery.ForbiddenOption`).
-const FORBIDDEN_LONG: [&str; 17] = [
-    "strategy",
-    "strategy-option",
-    "squash",
-    "ff-only",
-    "ff",
-    "allow-unrelated-histories",
-    "commit",
-    "edit",
-    "continue",
-    "abort",
-    "quit",
-    "skip",
-    "no-verify",
-    "config-env",
-    "exec",
-    "receive-pack",
-    "upload-pack",
+/// How an admitted long option takes its value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arity {
+    /// No value; `--<option>=<value>` is refused.
+    Flag,
+    /// A value, inline after `=` or as the next argument.
+    Required,
+    /// An optional value, inline after `=` only (`--gpg-sign[=<keyid>]`).
+    Inline,
+}
+
+/// The long options `merge` admits, by exact name (`gates.delivery.Merge`). Every
+/// other one is refused, so nothing unlisted can choose a strategy or a resolution,
+/// skip the bot's own commit, resume or abandon an operation, bypass hooks, inject
+/// configuration or name a second commit. An abbreviation Git would accept is refused
+/// too: when unsure, refuse.
+const MERGE_LONG: [(&str, Arity); 24] = [
+    ("no-ff", Arity::Flag),
+    ("quiet", Arity::Flag),
+    ("verbose", Arity::Flag),
+    ("stat", Arity::Flag),
+    ("no-stat", Arity::Flag),
+    ("summary", Arity::Flag),
+    ("compact-summary", Arity::Flag),
+    ("signoff", Arity::Flag),
+    ("no-signoff", Arity::Flag),
+    ("message", Arity::Required),
+    ("file", Arity::Required),
+    ("into-name", Arity::Required),
+    ("cleanup", Arity::Required),
+    ("no-edit", Arity::Flag),
+    ("gpg-sign", Arity::Inline),
+    ("no-gpg-sign", Arity::Flag),
+    ("verify-signatures", Arity::Flag),
+    ("no-verify-signatures", Arity::Flag),
+    ("progress", Arity::Flag),
+    ("no-progress", Arity::Flag),
+    ("rerere-autoupdate", Arity::Flag),
+    ("no-rerere-autoupdate", Arity::Flag),
+    ("overwrite-ignore", Arity::Flag),
+    ("no-overwrite-ignore", Arity::Flag),
 ];
-/// Their short forms, one rule per letter for both verbs: `-s` is `--strategy` to
-/// `merge` and `--signoff` to `revert`, `-n` is `--no-stat` to `merge` and
-/// `--no-commit` to `revert`; the bot refuses each letter for both.
+/// The long options `revert` admits, by exact name (`gates.delivery.Revert`). `git
+/// revert` hands every option it does not know to its revision walker, where
+/// `--do-walk`, `--all`, `--tags`, `--stdin` or `--not` would revert more than the
+/// one revision; Git never abbreviates those, so only exact names are admitted.
+const REVERT_LONG: [(&str, Arity); 9] = [
+    ("mainline", Arity::Required),
+    ("cleanup", Arity::Required),
+    ("no-edit", Arity::Flag),
+    ("signoff", Arity::Flag),
+    ("gpg-sign", Arity::Inline),
+    ("no-gpg-sign", Arity::Flag),
+    ("rerere-autoupdate", Arity::Flag),
+    ("no-rerere-autoupdate", Arity::Flag),
+    ("reference", Arity::Flag),
+];
+/// Short letters refused by name for both verbs, ahead of the admitted ones: `-s` is
+/// `--strategy` to `merge` and `--signoff` to `revert`, `-n` is `--no-stat` to `merge`
+/// and `--no-commit` to `revert`, `-X`, `-e` and `-c` choose a resolution, an editor
+/// or configuration.
 const FORBIDDEN_SHORT: &str = "sXnec";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,10 +114,21 @@ pub fn integration(args: &[String]) -> Result<Integration> {
         _ => bail!("{SUPPORTED}"),
     };
     let name = verb.name();
-    // Long options whose value may be the next argument.
-    let valued_long: &[&str] = match verb {
-        Verb::Merge => &["message", "file", "into-name", "cleanup"],
-        Verb::Revert => &["mainline", "cleanup"],
+    let admitted_long: &[(&str, Arity)] = match verb {
+        Verb::Merge => &MERGE_LONG,
+        Verb::Revert => &REVERT_LONG,
+    };
+    // Admitted short letters: those taking a value, then flags.
+    let (valued_short, flag_short) = match verb {
+        Verb::Merge => ("mF", "qv"),
+        Verb::Revert => ("m", ""),
+    };
+    let admitted = || {
+        admitted_long
+            .iter()
+            .map(|(o, _)| format!("--{o}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let mut options = Vec::new();
     let mut message: Vec<String> = Vec::new();
@@ -102,26 +149,29 @@ pub fn integration(args: &[String]) -> Result<Integration> {
                 Some((option, value)) => (option, Some(value)),
                 None => (long, None),
             };
-            if FORBIDDEN_LONG.iter().any(|f| f.starts_with(option))
-                || option.starts_with("config-env")
-                || option.starts_with("exec")
-            {
-                bail!("bot {name} refuses `--{option}`");
-            }
-            let valued = valued_long.iter().find(|v| v.starts_with(option));
-            let value = match (valued, inline) {
-                (Some(_), Some(value)) => Some(value.to_string()),
-                (Some(_), None) => Some(
+            let Some(&(_, arity)) = admitted_long.iter().find(|(o, _)| *o == option) else {
+                bail!(
+                    "bot {name} refuses `--{}`: it admits only {}, each by its full name",
+                    option.escape_debug(),
+                    admitted()
+                );
+            };
+            let value = match (arity, inline) {
+                (Arity::Flag, Some(_)) => {
+                    bail!("bot {name} refuses `--{option}=`: `--{option}` takes no value")
+                }
+                (Arity::Required, Some(value)) => Some(value.to_string()),
+                (Arity::Required, None) => Some(
                     rest.next()
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("bot {name} `--{option}` needs a value"))?,
                 ),
-                (None, _) => None,
+                (Arity::Flag | Arity::Inline, _) => None,
             };
-            match (verb, valued.copied(), value) {
-                (Verb::Merge, Some("message"), Some(value)) => message.extend(["-m".into(), value]),
-                (Verb::Merge, Some("file"), Some(value)) => message.extend(["-F".into(), value]),
-                (_, Some(option), Some(value)) => {
+            match (verb, option, value) {
+                (Verb::Merge, "message", Some(value)) => message.extend(["-m".into(), value]),
+                (Verb::Merge, "file", Some(value)) => message.extend(["-F".into(), value]),
+                (_, option, Some(value)) => {
                     options.extend([format!("--{option}"), value]);
                 }
                 _ => options.push(argument.clone()),
@@ -129,18 +179,20 @@ pub fn integration(args: &[String]) -> Result<Integration> {
             continue;
         }
         // A short cluster: flags, then at most one option whose value is the rest of
-        // the cluster or, when nothing follows it, the next argument.
+        // the cluster or, when nothing follows it, the next argument. A letter refused
+        // by name is named ahead of one that is merely not admitted.
         let cluster = &argument[1..];
         let mut flags = String::new();
+        let mut unadmitted = None;
         for (i, letter) in cluster.char_indices() {
             if FORBIDDEN_SHORT.contains(letter) {
                 bail!("bot {name} refuses `-{letter}`");
             }
-            let required = matches!(
-                (verb, letter),
-                (Verb::Merge, 'm' | 'F') | (Verb::Revert, 'm')
-            );
+            let required = valued_short.contains(letter);
             if !required && letter != 'S' {
+                if !flag_short.contains(letter) {
+                    unadmitted.get_or_insert(letter);
+                }
                 flags.push(letter);
                 continue;
             }
@@ -162,6 +214,18 @@ pub fn integration(args: &[String]) -> Result<Integration> {
                 Verb::Revert => options.extend(["-m".into(), value]),
             }
             break;
+        }
+        if let Some(letter) = unadmitted {
+            bail!(
+                "bot {name} refuses `-{}`: it admits only {}{}, each by its full name",
+                letter.escape_debug(),
+                [valued_short, "S", flag_short]
+                    .concat()
+                    .chars()
+                    .map(|c| format!("-{c}, "))
+                    .collect::<String>(),
+                admitted()
+            );
         }
         if !flags.is_empty() {
             options.push(format!("-{flags}"));
