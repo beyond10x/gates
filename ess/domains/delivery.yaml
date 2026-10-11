@@ -6,7 +6,27 @@ summary: >-
   `commit-msg`. The host observes the facts each outcome reads before it runs Git:
   the options it refuses, the revisions named, the merge drivers the repository's own
   configuration declares (read as data) and any operation already in progress; Git's
-  result is observed after the no-commit run.
+  result is observed after the no-commit run. `delete-branch` is the one verb that
+  is not Git: it deletes a merged remote branch through the REST API as the App,
+  after reading the branch, its protection and its ancestry with the default branch.
+
+entities:
+  # A branch on the GitHub remote, as the App reads it: its tip, whether a branch
+  # protection rule covers it and whether it is the repository's default branch.
+  # `delete-branch` is the only way the bot removes one, and only once its tip is
+  # an ancestor of the default branch, so no commit becomes unreachable.
+  - name: gates.delivery.RemoteBranch
+    identity: {name: name, type: String}
+    fields:
+      - {name: tip, type: String}
+      - {name: protected, type: Boolean}
+      - {name: default, type: Boolean}
+    lifecycle:
+      initial: Present
+      states: [Present, Deleted]
+      terminal: [Deleted]
+      transitions:
+        - {name: delete, from: [Present], to: Deleted}
 
 types:
   - name: gates.delivery.Operation
@@ -18,6 +38,11 @@ types:
   - name: gates.delivery.Reversion
     kind: enum
     variants: [Clean, Conflicted]
+  # GitHub's `compare/<tip>...<default>` status: `Ahead` and `Identical` mean the
+  # tip is an ancestor of the default branch.
+  - name: gates.delivery.Ancestry
+    kind: enum
+    variants: [Ahead, Identical, Behind, Diverged]
 
 commands:
   - name: gates.delivery.Merge
@@ -97,7 +122,75 @@ commands:
           gates.delivery.BotCommitted:
             revision: input.revision
 
+  # `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, through
+  # the REST API as the App, never through `git push`. The argument shape and the
+  # name are refused before a credential is minted; the App then reads the default
+  # branch, the branch, the comparison of its tip with the default branch and the
+  # branch again, and deletes only `refs/heads/<branch>`.
+  - name: gates.delivery.DeleteBranch
+    input:
+      - {name: name, type: String}
+      - {name: argument_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: name_problems, type: 'List<String>'}
+      - {name: repository_given, type: Boolean}
+      - {name: ancestry, type: gates.delivery.Ancestry}
+      - {name: current_tip, type: String}
+    outcomes:
+      # `--repository <owner>/<repo>` names the remote; without it nothing is read.
+      - name: no-repository
+        when: repository_given == false
+        error: gates.delivery.RepositoryRequired
+      # No option at all (`--force`, `-f`, `--`): the verb takes exactly one branch.
+      - name: options-given
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      - name: not-one-branch
+        when: argument_count != 1
+        error: gates.delivery.NotOneBranch
+      # Empty; `refs/` other than `refs/heads/` (a tag is never addressed); `..`, `:`,
+      # `~`, `^`, `?`, `*`, `[`, `\`, `@{`, a space or a control character; an empty
+      # or dot-led component; a `.lock`, `/` or `.` ending.
+      - name: invalid-name
+        when: name_problems.count > 0
+        error: gates.delivery.InvalidBranchName
+      - name: default-branch
+        when_subject:
+          predicate: default == true
+        error: gates.delivery.DefaultBranch
+      - name: protected-branch
+        when_subject:
+          predicate: protected == true
+        error: gates.delivery.ProtectedBranch
+      # Deleting an unmerged tip would make its commits unreachable on the remote.
+      - name: unmerged
+        when: ancestry == Behind
+        error: gates.delivery.Unmerged
+      - name: diverged
+        when: ancestry == Diverged
+        error: gates.delivery.Unmerged
+      # The tip read again before the DELETE differs from the one compared.
+      - name: moved-tip
+        when_subject:
+          predicate: tip != input.current_tip
+        error: gates.delivery.TipMoved
+      - name: deleted
+        moves: gates.delivery.RemoteBranch.delete
+        instance: name
+        emits: [gates.delivery.BranchDeleted]
+        payload:
+          gates.delivery.BranchDeleted:
+            name: input.name
+            tip: input.current_tip
+      - name: unknown-branch
+        unknown_instance: true
+        error: gates.delivery.UnknownBranch
+        payload:
+          gates.delivery.UnknownBranch: {name: input.name}
+
 events:
+  - name: gates.delivery.BranchDeleted
+    fields: [{name: name, type: String}, {name: tip, type: String}]
   - name: gates.delivery.BotCommitted
     fields: [{name: revision, type: String}]
   - name: gates.delivery.NothingToMerge
@@ -114,3 +207,19 @@ errors:
     fields: [{name: in_progress, type: gates.delivery.Operation}]
   - name: gates.delivery.Conflicted
     fields: [{name: revision, type: String}]
+  - name: gates.delivery.RepositoryRequired
+    fields: []
+  - name: gates.delivery.NotOneBranch
+    fields: [{name: argument_count, type: Integer}]
+  - name: gates.delivery.InvalidBranchName
+    fields: [{name: name_problems, type: 'List<String>'}]
+  - name: gates.delivery.DefaultBranch
+    fields: [{name: name, type: String}]
+  - name: gates.delivery.ProtectedBranch
+    fields: [{name: name, type: String}]
+  - name: gates.delivery.Unmerged
+    fields: [{name: ancestry, type: gates.delivery.Ancestry}]
+  - name: gates.delivery.TipMoved
+    fields: [{name: current_tip, type: String}]
+  - name: gates.delivery.UnknownBranch
+    fields: [{name: name, type: String}]

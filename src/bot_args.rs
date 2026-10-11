@@ -1,11 +1,13 @@
 //! The argument check `b10x-gates bot` runs before any credential is minted.
 //!
-//! The bot runs `commit`, `tag`, `push`, `fetch`, `merge` and `revert` only. Everything
-//! else is refused with the supported route in the text, so an agent does not have to
-//! find it alone. `Github::git` runs this same check again, so the two cannot drift.
+//! The bot runs `commit`, `tag`, `push`, `fetch`, `merge` and `revert` as Git, and
+//! `delete-branch` through the REST API. Everything else is refused with the supported
+//! route in the text, so an agent does not have to find it alone. `Github::git` runs
+//! this same check again, so the two cannot drift.
 use anyhow::{Result, bail};
 
-const SUPPORTED: &str = "bot Git command must be commit, tag, push, fetch, merge or revert";
+const SUPPORTED: &str = "bot Git command must be commit, tag, push, fetch, merge or revert, \
+                         or the API verb delete-branch";
 const GUARD: &str = "bot delivery cannot bypass hooks or inject Git configuration";
 const MERGE_ROUTE: &str =
     "run `b10x-gates bot -- merge <branch>`, which commits the merge as the bot";
@@ -197,10 +199,16 @@ const VALUED_OPTIONS: [&str; 5] = ["-o", "--push-option", "--repo", "--receive-p
 
 /// Refuse a bot Git invocation that the bot does not run, naming the supported route.
 pub fn check(args: &[String], repository: Option<&str>) -> Result<()> {
+    let given = repository;
     let repository = repository.unwrap_or("<owner>/<repo>");
     let verb = args.first().map(String::as_str).unwrap_or("");
     match verb {
         "commit" | "tag" | "fetch" => {}
+        "delete-branch" => {
+            // Its own complete check: one branch, no option, a named repository.
+            delete_branch(args, given)?;
+            return Ok(());
+        }
         "push" => push(&args[1..], repository)?,
         "merge" | "revert" => {
             integration(args)?;
@@ -259,9 +267,13 @@ fn guarded(verb: &str, argument: &str) -> bool {
         .any(|c| c == 'n')
 }
 
+/// The guarded verb for a merged branch, then the raw API route, which stays the only
+/// way to delete an unmerged one.
 fn delete_route(repository: &str, branch: &str) -> String {
     format!(
-        "run `b10x-gates api --method DELETE --path \
+        "run `b10x-gates bot --repository {repository} -- delete-branch {branch}`, which \
+         deletes it only when its tip is merged into the default branch; for an unmerged \
+         branch, run `b10x-gates api --method DELETE --path \
          /repos/{repository}/git/refs/heads/{branch} --output <file>`, admitted only where \
          the policy admits that API write"
     )
@@ -330,4 +342,115 @@ fn push(args: &[String], repository: &str) -> Result<()> {
         "bot push cannot delete a remote branch; {}",
         routes.join("; ")
     )
+}
+
+/// A `delete-branch` the argument check admitted: a well-formed `<owner>/<repo>` and
+/// a branch name that addresses `refs/heads/<branch>` and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDeletion {
+    pub repository: String,
+    /// The branch name without `refs/heads/`.
+    pub branch: String,
+}
+
+/// The argument shape and name refusals of `gates.delivery.DeleteBranch`, all before
+/// any credential is minted: `--repository` given and well-formed, no option, exactly
+/// one branch, and a name that is a branch and nothing else.
+pub fn delete_branch(args: &[String], repository: Option<&str>) -> Result<BranchDeletion> {
+    if args.first().map(String::as_str) != Some("delete-branch") {
+        bail!("{SUPPORTED}");
+    }
+    let Some(repository) = repository else {
+        bail!(
+            "bot delete-branch needs --repository <owner>/<repo>: run \
+             `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`"
+        );
+    };
+    if !repository_shaped(repository) {
+        bail!(
+            "bot delete-branch needs --repository <owner>/<repo>, not `{}`",
+            repository.escape_debug()
+        );
+    }
+    let rest = &args[1..];
+    if rest.len() != 1 || rest.iter().any(|a| a.starts_with('-')) {
+        bail!(
+            "bot delete-branch takes exactly one branch and no option, {} argument(s) given: \
+             run `b10x-gates bot --repository {repository} -- delete-branch <branch>`",
+            rest.len()
+        );
+    }
+    let branch = branch_to_delete(&rest[0])?;
+    Ok(BranchDeletion {
+        repository: repository.to_string(),
+        branch,
+    })
+}
+
+/// `<owner>/<repo>`: two non-empty segments of ASCII letters, digits, `-`, `_` and `.`,
+/// neither a dot segment, so the repository can never change the request path.
+fn repository_shaped(repository: &str) -> bool {
+    let mut segments = repository.split('/');
+    let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    [owner, name].iter().all(|s| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    })
+}
+
+/// The branch a name addresses, or the cause it is refused. Only `refs/heads/` is
+/// addressed, so a tag is never deleted; the rest follows `git check-ref-format`.
+fn branch_to_delete(name: &str) -> Result<String> {
+    let refuse = |cause: &str| -> Result<String> {
+        bail!(
+            "bot delete-branch refuses the branch name `{}`: {cause}",
+            name.escape_debug()
+        )
+    };
+    let branch = match name.strip_prefix("refs/") {
+        Some(rest) => match rest.strip_prefix("heads/") {
+            Some(branch) => branch,
+            None if rest.starts_with("tags/") => {
+                return refuse("it names a tag, and the bot never deletes a tag");
+            }
+            None => return refuse("only `refs/heads/` is addressed"),
+        },
+        None => name,
+    };
+    if branch.is_empty() {
+        return refuse("it is empty");
+    }
+    if let Some(c) = branch
+        .chars()
+        .find(|c| c.is_control() || c.is_whitespace() || ":~^?*[\\".contains(*c))
+    {
+        return refuse(&format!("it contains `{}`", c.escape_debug()));
+    }
+    for sequence in ["..", "@{"] {
+        if branch.contains(sequence) {
+            return refuse(&format!("it contains `{sequence}`"));
+        }
+    }
+    if branch == "@" {
+        return refuse("`@` is not a branch");
+    }
+    for ending in [".lock", "/", "."] {
+        if branch.ends_with(ending) {
+            return refuse(&format!("it ends with `{ending}`"));
+        }
+    }
+    for segment in branch.split('/') {
+        if segment.is_empty() {
+            return refuse("it has an empty component");
+        }
+        if segment.starts_with('.') || segment.ends_with(".lock") {
+            return refuse("a component starts with `.` or ends with `.lock`");
+        }
+    }
+    Ok(branch.to_string())
 }
