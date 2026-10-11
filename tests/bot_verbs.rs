@@ -545,3 +545,191 @@ fn merge_refusals_come_before_credentials() {
         assert!(!stderr.contains("absent-bot.json"), "{line}: {stderr}");
     }
 }
+
+/// Only the admitted options pass, by their exact names: `git revert` hands every
+/// other option to its revision walker, and an unlisted `merge` option is refused
+/// too. The refusal names the option and runs no Git.
+#[test]
+fn merge_and_revert_refuse_every_unadmitted_option() {
+    let dir = repository();
+    let path = dir.path();
+    git(path, &["tag", "v1", "main~1"]);
+    let before = out(path, &["rev-parse", "HEAD"]);
+    for (line, named) in [
+        ("revert --do-walk HEAD", "`--do-walk`"),
+        ("revert --no-walk HEAD", "`--no-walk`"),
+        ("revert --all HEAD", "`--all`"),
+        ("revert --branches HEAD", "`--branches`"),
+        ("revert --tags HEAD", "`--tags`"),
+        ("revert --remotes HEAD", "`--remotes`"),
+        ("revert --glob=refs/tags/* HEAD", "`--glob`"),
+        ("revert --stdin HEAD", "`--stdin`"),
+        ("revert --not HEAD", "`--not`"),
+        ("revert --reflog HEAD", "`--reflog`"),
+        ("revert --main 1 HEAD", "`--main`"),
+        ("revert --no-signoff HEAD", "`--no-signoff`"),
+        ("revert --no-edit=x HEAD", "`--no-edit=`"),
+        ("revert -q HEAD", "`-q`"),
+        ("revert -3 HEAD", "`-3`"),
+        ("revert -i HEAD", "`-i`"),
+        ("merge --autostash feature", "`--autostash`"),
+        ("merge --log feature", "`--log`"),
+        ("merge --no-f feature", "`--no-f`"),
+        ("merge --into=x feature", "`--into`"),
+        ("merge --no-commit feature", "`--no-commit`"),
+        ("merge -r feature", "`-r`"),
+        ("merge -qr feature", "`-r`"),
+    ] {
+        let text = match check(&args(line), None) {
+            Ok(()) => panic!("`{line}` passed the bot argument check"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(text.contains(named), "{line}: {text}");
+        let text = refusal(path, line);
+        assert!(!text.contains("failed (exit"), "{line} reached Git: {text}");
+        assert_eq!(out(path, &["rev-parse", "HEAD"]), before, "{line}");
+    }
+}
+
+/// Every admitted option passes the argument check, in each form it takes.
+#[test]
+fn merge_and_revert_admit_each_listed_option() {
+    for line in [
+        "merge --no-ff --quiet --verbose --stat --no-stat --summary feature",
+        "merge --compact-summary --signoff --no-signoff --no-edit feature",
+        "merge --into-name main --cleanup strip --into-name=main --cleanup=strip feature",
+        "merge --gpg-sign --gpg-sign=key --no-gpg-sign -S -Skey feature",
+        "merge --verify-signatures --no-verify-signatures --progress --no-progress feature",
+        "merge --rerere-autoupdate --no-rerere-autoupdate feature",
+        "merge --overwrite-ignore --no-overwrite-ignore -qv -m message feature",
+        "merge -Ffile feature",
+        "revert --mainline 1 --mainline=1 -m1 --cleanup strip --cleanup=verbatim HEAD",
+        "revert --no-edit --signoff --gpg-sign --gpg-sign=key --no-gpg-sign -S HEAD",
+        "revert --rerere-autoupdate --no-rerere-autoupdate --reference HEAD",
+    ] {
+        check(&args(line), None).unwrap_or_else(|e| panic!("`{line}` refused: {e:#}"));
+    }
+}
+
+/// The one revision is resolved to its commit before Git runs; one that names no
+/// commit is refused with the cause.
+#[test]
+fn merge_and_revert_refuse_a_revision_naming_no_commit() {
+    let dir = repository();
+    let path = dir.path();
+    let before = out(path, &["rev-parse", "HEAD"]);
+    for line in [
+        "merge absent",
+        "revert absent",
+        "merge HEAD^{tree}",
+        "revert HEAD:base.txt",
+    ] {
+        let text = refusal(path, line);
+        assert!(text.contains("does not name one commit"), "{line}: {text}");
+        assert_eq!(out(path, &["rev-parse", "HEAD"]), before, "{line}");
+        assert!(!exists(path, "MERGE_HEAD"), "{line}");
+    }
+}
+
+/// Merging by hash keeps the message Git prepares for the name: a fetched branch is
+/// named as `git merge FETCH_HEAD` names it, and only its first for-merge line is
+/// merged.
+#[test]
+fn merge_of_fetch_head_merges_its_first_line_under_its_name() {
+    let dir = repository();
+    let path = dir.path();
+    git(path, &["branch", "other", "main~1"]);
+    git(path, &["switch", "-q", "other"]);
+    commit_file(path, "other.txt", "other\n", "add other");
+    git(path, &["switch", "-q", "main"]);
+    let feature = out(path, &["rev-parse", "feature"]);
+    let other = out(path, &["rev-parse", "other"]);
+    fs::write(
+        path.join(".git/FETCH_HEAD"),
+        format!("{feature}\t\tbranch 'feature' of example\n{other}\t\tbranch 'other' of example\n"),
+    )
+    .unwrap();
+    bot(path, "merge FETCH_HEAD").unwrap();
+    assert_eq!(
+        out(path, &["log", "-1", "--format=%P", "HEAD"])
+            .split(' ')
+            .count(),
+        2
+    );
+    assert_eq!(out(path, &["rev-parse", "HEAD^2"]), feature);
+    assert_eq!(
+        out(path, &["log", "-1", "--format=%s"]),
+        "Merge branch 'feature' of example"
+    );
+    assert_eq!(identity(path, "HEAD"), bot_identity());
+}
+
+/// Staged changes would ride inside the Revert commit: refused, naming the cause, and
+/// the index is left as it was.
+#[test]
+fn revert_refuses_staged_changes() {
+    let dir = repository();
+    let path = dir.path();
+    fs::write(path.join("staged.txt"), "staged\n").unwrap();
+    git(path, &["add", "staged.txt"]);
+    let before = out(path, &["rev-parse", "HEAD"]);
+    let text = refusal(path, "revert HEAD");
+    assert!(text.contains("index differs from HEAD"), "{text}");
+    assert!(text.contains("Revert commit"), "{text}");
+    assert_eq!(out(path, &["rev-parse", "HEAD"]), before);
+    assert_eq!(
+        out(path, &["diff", "--cached", "--name-only"]),
+        "staged.txt"
+    );
+    assert!(!exists(path, "REVERT_HEAD"));
+}
+
+/// A refusal names the configuration file relative to the Git directory, never by
+/// its local path, for each file the driver check reads.
+#[test]
+fn driver_refusals_name_the_file_not_its_path() {
+    let dir = repository();
+    let path = dir.path();
+    git(path, &["config", "extensions.worktreeConfig", "true"]);
+    git(path, &["config", "--worktree", "include.path", "x.config"]);
+    let text = refusal(path, "revert HEAD");
+    assert!(text.contains("`.git/config.worktree` includes"), "{text}");
+    assert!(!text.contains(path.to_str().unwrap()), "{text}");
+
+    let dir = repository();
+    let path = dir.path();
+    fs::write(path.join(".git/config"), "[core\n").unwrap();
+    let text = refusal(path, "merge feature");
+    assert!(!text.contains(path.to_str().unwrap()), "{text}");
+}
+
+/// `merge` and `revert` never use a credential, so the binary mints none: they run
+/// with the bot's credential configuration absent.
+#[test]
+fn merge_and_revert_mint_no_credential() {
+    let dir = repository();
+    let path = dir.path();
+    let config = path.join(".git").join("absent");
+    for line in ["merge feature", "revert -m 1 HEAD"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+            .args(["--repo".as_ref(), path.as_os_str()])
+            .args(["bot", "--"])
+            .args(args(line))
+            .env_remove("B10X_GATES_POLICY")
+            .env("XDG_CONFIG_HOME", &config)
+            .env("B10X_BOT_CONFIG", config.join("absent-bot.json"))
+            .env("B10X_BOT_KEY", config.join("absent-key.pem"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{line}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(identity(path, "HEAD"), bot_identity(), "{line}");
+    }
+    assert_eq!(
+        out(path, &["log", "-1", "--format=%s"]),
+        "Revert \"Merge branch 'feature'\""
+    );
+}
