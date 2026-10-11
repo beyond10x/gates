@@ -2,14 +2,16 @@
 format: aep.planning-md/3
 id: design:bot-verbs
 kind: design
-status: in_review
+status: implemented
 title: Which Git verbs the delivery bot could add
 summary: Proposes merge and revert, a guarded delete-branch, and no rebase, cherry-pick or pull, with the security argument for each.
 relations:
 - informed_by: story:bot-supported-routes
-revision: 2
+revision: 5
 transitions:
 - {from: "draft", to: "in_review", at: "2026-10-08T09:43:21Z", actor: "human:timo", revision: 2}
+- {from: "in_review", to: "approved", at: "2026-10-11T22:31:20Z", actor: "human:timo", revision: 4}
+- {from: "approved", to: "implemented", at: "2026-10-11T23:34:14Z", actor: "human:timo", revision: 5}
 ---
 ## Question
 
@@ -54,3 +56,18 @@ each row needs an owner's yes before a story is written.
 Add `merge` and `revert` first: both reduce to the bot's existing `commit` and close six of the
 eight refusals seen. Add `delete-branch` with the merged-tip guard second. Leave `rebase`,
 `cherry-pick` and `pull` out.
+
+## Decision
+
+The owner answered on 2026-10-11 and chose the recommendation as written:
+
+- add `merge` and `revert` now, each as the `--no-commit` form followed by the bot's own commit,
+  with the refusals listed above (`-s`/`--strategy`, `-X`, `--squash`, `--ff-only`,
+  `--allow-unrelated-histories`, and a merge driver named in `.git/config`);
+- add `delete-branch <branch>` second. It deletes only a remote branch whose tip is an ancestor of
+  the default branch, never the default branch, a protected branch or a tag, and it goes through
+  the REST API as the App;
+- never add `rebase`, `cherry-pick` or `pull`;
+- never add force push, tag deletion or a remote `reset`.
+
+Delivered by `story:bot-merge-revert` and `story:bot-delete-branch`.

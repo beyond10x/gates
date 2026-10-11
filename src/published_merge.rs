@@ -181,7 +181,7 @@ fn pages(api: &impl AuthenticatedRead, path: &str) -> Result<Vec<Value>> {
     anyhow::bail!("remote pagination incomplete")
 }
 
-fn encoded_segment(value: &str) -> String {
+pub(crate) fn encoded_segment(value: &str) -> String {
     value
         .bytes()
         .map(|b| {

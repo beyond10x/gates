@@ -1,0 +1,302 @@
+domain: gates.delivery
+summary: >-
+  The Git verbs `b10x-gates bot` runs as the bot. `merge` and `revert` run in their
+  no-commit form in the bot environment, then the bot commits the result, so the one
+  commit they create is authored and committed by the bot and passes `pre-commit` and
+  `commit-msg`. The host observes the facts each outcome reads before it runs Git:
+  the options it refuses, the revisions named, the merge drivers the repository's own
+  configuration declares (read as data) and any operation already in progress; Git's
+  result is observed after the no-commit run. `delete-branch` is the one verb that
+  is not Git: it deletes a merged remote branch through the REST API as the App,
+  after reading the branch, its protection, the rulesets that apply to it and its
+  ancestry with the default branch.
+
+entities:
+  # A branch on the GitHub remote, as the App reads it: its tip, whether a branch
+  # protection rule covers it and whether it is the repository's default branch.
+  # `delete-branch` is the only way the bot removes one, and only once its tip is
+  # an ancestor of the default branch, so no commit becomes unreachable.
+  - name: gates.delivery.RemoteBranch
+    identity: {name: name, type: String}
+    fields:
+      - {name: tip, type: String}
+      - {name: protected, type: Boolean}
+      - {name: default, type: Boolean}
+    lifecycle:
+      initial: Present
+      states: [Present, Deleted]
+      terminal: [Deleted]
+      transitions:
+        - {name: delete, from: [Present], to: Deleted}
+
+types:
+  - name: gates.delivery.Operation
+    kind: enum
+    variants: [None, Merge, Revert, CherryPick, Rebase]
+  - name: gates.delivery.Integration
+    kind: enum
+    variants: [Clean, Conflicted, UpToDate]
+  - name: gates.delivery.Reversion
+    kind: enum
+    variants: [Clean, Conflicted]
+  # GitHub's `compare/<tip>...<default>` status: `Ahead` and `Identical` mean the
+  # tip is an ancestor of the default branch.
+  - name: gates.delivery.Ancestry
+    kind: enum
+    variants: [Ahead, Identical, Behind, Diverged]
+
+commands:
+  - name: gates.delivery.Merge
+    input:
+      - {name: revision, type: String}
+      - {name: revision_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: resolved, type: Boolean}
+      - {name: merge_drivers, type: 'List<String>'}
+      - {name: in_progress, type: gates.delivery.Operation}
+      - {name: integration, type: gates.delivery.Integration}
+      - {name: merge_heads, type: Integer}
+    outcomes:
+      # Every option outside the admitted set, matched by its exact name (no
+      # abbreviation): admitted are --no-ff, --quiet/-q, --verbose/-v, --stat,
+      # --no-stat, --summary, --compact-summary, --signoff, --no-signoff,
+      # --message/-m, --file/-F, --into-name, --cleanup, --no-edit,
+      # --gpg-sign/-S, --no-gpg-sign, --verify-signatures, --no-verify-signatures,
+      # --progress, --no-progress, --rerere-autoupdate, --no-rerere-autoupdate,
+      # --overwrite-ignore and --no-overwrite-ignore. So -s/--strategy, -X,
+      # --squash, --ff-only, --ff, --allow-unrelated-histories, --commit, -e/--edit,
+      # --continue, --abort, --quit, --skip, --no-verify, -n, -c, --config-env,
+      # --exec and every unlisted option are refused before a credential is minted.
+      - name: forbidden-option
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      # Exactly one revision: no octopus merge, no range.
+      - name: not-one-revision
+        when: revision_count != 1
+        error: gates.delivery.NotOneRevision
+      # The revision must name one commit (`git rev-parse --verify
+      # <revision>^{commit}`); Git merges that commit's full hash, so `FETCH_HEAD`
+      # with several for-merge lines merges only the first.
+      - name: unresolved-revision
+        when: resolved == false
+        error: gates.delivery.UnresolvedRevision
+      # A `merge.<driver>.driver` key in `.git/config` or `config.worktree` would run
+      # a repository-chosen command during the merge.
+      - name: merge-driver-configured
+        when: merge_drivers.count > 0
+        error: gates.delivery.MergeDriverConfigured
+      - name: operation-in-progress
+        when: in_progress != None
+        error: gates.delivery.OperationInProgress
+      # The conflict stays in the index; the error names the route to finish:
+      # resolve, `git add`, `b10x-gates bot -- commit -F -`, or `git merge --abort`.
+      - name: conflict
+        when: integration == Conflicted
+        error: gates.delivery.Conflicted
+      # Read before the bot commits: `MERGE_HEAD` with more than one line would make
+      # the commit an octopus merge. The merge stays in progress for `--abort`.
+      - name: several-merge-heads
+        when: merge_heads > 1
+        error: gates.delivery.SeveralMergeHeads
+      - name: up-to-date
+        when: integration == UpToDate
+        emits: [gates.delivery.NothingToMerge]
+        payload:
+          gates.delivery.NothingToMerge:
+            revision: input.revision
+      # One commit with two parents, bot author and committer, the given message or
+      # Git's prepared one.
+      - name: committed
+        emits: [gates.delivery.BotCommitted]
+        payload:
+          gates.delivery.BotCommitted:
+            revision: input.revision
+
+  - name: gates.delivery.Revert
+    input:
+      - {name: revision, type: String}
+      - {name: revision_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: resolved, type: Boolean}
+      - {name: merge_drivers, type: 'List<String>'}
+      - {name: in_progress, type: gates.delivery.Operation}
+      - {name: index_differs, type: Boolean}
+      - {name: integration, type: gates.delivery.Reversion}
+    outcomes:
+      # Every option outside the admitted set, matched by its exact name: `git
+      # revert` hands options it does not know to its revision walker, where
+      # `--do-walk`, `--all`, `--tags` or `--stdin` would add commits. Admitted are
+      # --mainline/-m <parent>, --cleanup, --no-edit, --signoff, --gpg-sign/-S,
+      # --no-gpg-sign, --rerere-autoupdate, --no-rerere-autoupdate and --reference.
+      - name: forbidden-option
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      # Exactly one revision: no range such as `a..b`.
+      - name: not-one-revision
+        when: revision_count != 1
+        error: gates.delivery.NotOneRevision
+      # Git reverts the full hash of the one commit the revision names.
+      - name: unresolved-revision
+        when: resolved == false
+        error: gates.delivery.UnresolvedRevision
+      # A revert is a three-way merge: a configured merge driver would run as it
+      # does for `merge`.
+      - name: merge-driver-configured
+        when: merge_drivers.count > 0
+        error: gates.delivery.MergeDriverConfigured
+      - name: operation-in-progress
+        when: in_progress != None
+        error: gates.delivery.OperationInProgress
+      # `git revert --no-commit` reverts against the index as it stands, so a
+      # staged change would ride inside the bot's `Revert "…"` commit.
+      - name: staged-changes
+        when: index_differs == true
+        error: gates.delivery.StagedChanges
+      # The conflict stays in the index; the error names `git revert --abort`.
+      - name: conflict
+        when: integration == Conflicted
+        error: gates.delivery.Conflicted
+      # One commit, bot author and committer, Git's prepared `Revert "…"` message.
+      - name: committed
+        emits: [gates.delivery.BotCommitted]
+        payload:
+          gates.delivery.BotCommitted:
+            revision: input.revision
+
+  # `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, through
+  # the REST API as the App, never through `git push`. The argument shape and the
+  # name are refused before a credential is minted; the App then reads the default
+  # branch, the branch, the comparison of its tip with the default branch, the
+  # rulesets that apply to the branch and the branch again, and deletes only
+  # `refs/heads/<branch>`.
+  - name: gates.delivery.DeleteBranch
+    input:
+      - {name: name, type: String}
+      - {name: argument_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: name_problems, type: 'List<String>'}
+      - {name: repository_given, type: Boolean}
+      - {name: ancestry, type: gates.delivery.Ancestry}
+      - {name: rules_readable, type: Boolean}
+      - {name: unadmitted_rules, type: 'List<String>'}
+      - {name: deletion_rules, type: Integer}
+      - {name: current_tip, type: String}
+    outcomes:
+      # `--repository <owner>/<repo>` names the remote; without it nothing is read.
+      - name: no-repository
+        when: repository_given == false
+        error: gates.delivery.RepositoryRequired
+      # No option at all (`--force`, `-f`, `--`): the verb takes exactly one branch.
+      - name: options-given
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      - name: not-one-branch
+        when: argument_count != 1
+        error: gates.delivery.NotOneBranch
+      # Empty; `refs/` other than `refs/heads/` (a tag is never addressed); `..`, `:`,
+      # `~`, `^`, `?`, `*`, `[`, `\`, `@{`, a space or a control character; an empty
+      # or dot-led component; a `.lock`, `/` or `.` ending.
+      - name: invalid-name
+        when: name_problems.count > 0
+        error: gates.delivery.InvalidBranchName
+      - name: default-branch
+        when_subject:
+          predicate: default == true
+        error: gates.delivery.DefaultBranch
+      - name: protected-branch
+        when_subject:
+          predicate: protected == true
+        error: gates.delivery.ProtectedBranch
+      # Deleting an unmerged tip would make its commits unreachable on the remote.
+      - name: unmerged
+        when: ancestry == Behind
+        error: gates.delivery.Unmerged
+      - name: diverged
+        when: ancestry == Diverged
+        error: gates.delivery.Unmerged
+      # `GET /repos/<repo>/rules/branches/<branch>`: the rulesets that apply to the
+      # branch, which the `protected` field does not report and which the App, as a
+      # bypass actor, would pass. An answer that is not a JSON array (or a 404) says
+      # nothing, so it is refused.
+      - name: rules-unreadable
+        when: rules_readable == false
+        error: gates.delivery.RulesUnreadable
+      # Admitted rule types are those of the organization's bot-authority ruleset:
+      # creation, update, deletion, non_fast_forward, commit_author_email_pattern,
+      # committer_email_pattern, commit_message_pattern, committer_name_pattern and
+      # branch_name_pattern. Any other type (required_status_checks,
+      # pull_request, …) marks a branch someone protects.
+      - name: ruled-branch
+        when: unadmitted_rules.count > 0
+        error: gates.delivery.RuledBranch
+      # The bot-authority ruleset carries one `deletion` rule; a second one is a
+      # second ruleset restricting deletion.
+      - name: deletion-restricted
+        when: deletion_rules > 1
+        error: gates.delivery.DeletionRestricted
+      # The tip read again before the DELETE differs from the one compared.
+      - name: moved-tip
+        when_subject:
+          predicate: tip != input.current_tip
+        error: gates.delivery.TipMoved
+      - name: deleted
+        moves: gates.delivery.RemoteBranch.delete
+        instance: name
+        emits: [gates.delivery.BranchDeleted]
+        payload:
+          gates.delivery.BranchDeleted:
+            name: input.name
+            tip: input.current_tip
+      - name: unknown-branch
+        unknown_instance: true
+        error: gates.delivery.UnknownBranch
+        payload:
+          gates.delivery.UnknownBranch: {name: input.name}
+
+events:
+  - name: gates.delivery.BranchDeleted
+    fields: [{name: name, type: String}, {name: tip, type: String}]
+  - name: gates.delivery.BotCommitted
+    fields: [{name: revision, type: String}]
+  - name: gates.delivery.NothingToMerge
+    fields: [{name: revision, type: String}]
+
+errors:
+  - name: gates.delivery.ForbiddenOption
+    fields: [{name: forbidden_options, type: 'List<String>'}]
+  - name: gates.delivery.NotOneRevision
+    fields: [{name: revision_count, type: Integer}]
+  - name: gates.delivery.MergeDriverConfigured
+    fields: [{name: merge_drivers, type: 'List<String>'}]
+  - name: gates.delivery.OperationInProgress
+    fields: [{name: in_progress, type: gates.delivery.Operation}]
+  - name: gates.delivery.UnresolvedRevision
+    fields: [{name: revision, type: String}]
+  - name: gates.delivery.SeveralMergeHeads
+    fields: [{name: merge_heads, type: Integer}]
+  - name: gates.delivery.StagedChanges
+    fields: [{name: index_differs, type: Boolean}]
+  - name: gates.delivery.RulesUnreadable
+    fields: [{name: name, type: String}]
+  - name: gates.delivery.RuledBranch
+    fields: [{name: unadmitted_rules, type: 'List<String>'}]
+  - name: gates.delivery.DeletionRestricted
+    fields: [{name: deletion_rules, type: Integer}]
+  - name: gates.delivery.Conflicted
+    fields: [{name: revision, type: String}]
+  - name: gates.delivery.RepositoryRequired
+    fields: []
+  - name: gates.delivery.NotOneBranch
+    fields: [{name: argument_count, type: Integer}]
+  - name: gates.delivery.InvalidBranchName
+    fields: [{name: name_problems, type: 'List<String>'}]
+  - name: gates.delivery.DefaultBranch
+    fields: [{name: name, type: String}]
+  - name: gates.delivery.ProtectedBranch
+    fields: [{name: name, type: String}]
+  - name: gates.delivery.Unmerged
+    fields: [{name: ancestry, type: gates.delivery.Ancestry}]
+  - name: gates.delivery.TipMoved
+    fields: [{name: current_tip, type: String}]
+  - name: gates.delivery.UnknownBranch
+    fields: [{name: name, type: String}]

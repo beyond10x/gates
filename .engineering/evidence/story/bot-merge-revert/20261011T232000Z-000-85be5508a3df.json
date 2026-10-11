@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-11T23:20:00Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-merge-revert",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked on fix commit c539aee: 309 passed, 0 failed, 6 ignored; clippy -D warnings and fmt clean"
+  }
+}

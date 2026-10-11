@@ -1,6 +1,34 @@
 # Changelog
 
-## 0.1.16 — unreleased
+## 0.1.17 — unreleased
+
+- `bot -- merge <revision>` and `bot -- revert <revision>` run as the bot. Each takes exactly one
+  revision, resolved to one commit before Git runs, so a range, a second revision or a
+  `FETCH_HEAD` with several branches is refused. Git runs the `--no-commit` form, and the bot then
+  commits the result, so `pre-commit` and `commit-msg` run and the author and committer are the
+  bot. Long options are admitted by exact name from a list per verb; every other option is
+  refused, among them `-s`/`--strategy`, `-X`, `--squash`, `--ff-only`,
+  `--allow-unrelated-histories`, `--edit`, `-n` and the sequencer verbs. A merge driver or an
+  include in the repository's own configuration, an operation already in progress, a revert over
+  staged changes and a merge with more than one `MERGE_HEAD` are refused. Neither verb mints a
+  token. A conflict leaves the index and prints the finish and abort routes.
+- `bot --repository <owner>/<repo> -- delete-branch <branch>` deletes a remote branch through the
+  REST API as the App, only when it is not the default branch, not protected, carries no ruleset
+  rule beyond the organization's bot-authority and identity rules, and its tip is an ancestor of
+  the default branch and has not moved since it was read. Only `refs/heads/` is addressed, so a
+  tag is never deleted. The `push --delete` refusal names this verb; the API route stays the only
+  one for an unmerged branch. GitHub's ref deletion takes no expected tip, so a push landing in
+  the one request between the last read and the deletion is deleted with the branch.
+- `rebase`, `cherry-pick`, `pull` and `am` stay refused and name the merge verb as the route.
+- Every bot Git command drops `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` from its
+  environment. Before this release a caller could set `core.hooksPath` there and skip
+  `pre-commit` and `pre-push`, which the `-c` refusal exists to stop.
+- `ess/` moves to format `ess/24` and gains the `gates.delivery` domain: `Merge`, `Revert`,
+  `RemoteBranch` and `DeleteBranch`, with every refusal as an outcome.
+- No policy field or receipt format changes. The version increment invalidates receipts retained
+  under 0.1.16, so the first check after upgrading scans in full once.
+
+## 0.1.16 — 2026-10-08
 
 - Delivery refusals name their cause. A protected file's refusal names its path and what is
   wrong: missing, not a regular file, a symlink, its mode and the mode it needs with the `chmod`

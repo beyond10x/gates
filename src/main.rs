@@ -227,6 +227,24 @@ fn execute(args: Args) -> Result<()> {
     if let Action::Bot { args: command } = &args.command {
         // Refuse an unsupported operation before any credential is minted.
         b10x_gates::bot_args::check(command, args.repository.as_deref())?;
+        if command.first().is_some_and(|verb| verb == "delete-branch") {
+            // The REST API as the App, never Git; the shape was refused above.
+            let deletion =
+                b10x_gates::bot_args::delete_branch(command, args.repository.as_deref())?;
+            println!(
+                "{}",
+                delivery::delete_remote_branch(&Github::bot()?, &deletion)?
+            );
+            return Ok(());
+        }
+        if command
+            .first()
+            .is_some_and(|verb| verb == "merge" || verb == "revert")
+        {
+            // Neither reaches the network, so no credential is minted: the bot runs
+            // them token-free, refusing what the repository state refuses first.
+            return delivery::bot_git(&args.repo, command, None);
+        }
         return Github::bot()?.git(&args.repo, command);
     }
     if let Action::Gh { args: command } = &args.command {
