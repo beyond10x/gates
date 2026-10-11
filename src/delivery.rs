@@ -54,6 +54,143 @@ impl AuthenticatedRead for PushEvidence {
     }
 }
 
+/// The GitHub reads and the one write `delete-branch` makes, so the guard can be held
+/// to its outcomes without a credential.
+pub trait RemoteBranches {
+    /// A GET; `None` when GitHub answers 404.
+    fn read(&self, path: &str) -> Result<Option<Value>>;
+    /// A DELETE that succeeded.
+    fn delete(&self, path: &str) -> Result<()>;
+}
+
+impl RemoteBranches for Github {
+    fn read(&self, path: &str) -> Result<Option<Value>> {
+        match self.api_response(Method::GET, path, None) {
+            Ok((_, value)) => Ok(Some(value)),
+            Err(error)
+                if error
+                    .downcast_ref::<ApiFailure>()
+                    .is_some_and(|f| f.status() == StatusCode::NOT_FOUND) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn delete(&self, path: &str) -> Result<()> {
+        self.api_response(Method::DELETE, path, None).map(|_| ())
+    }
+}
+
+/// `gates.delivery.DeleteBranch` after the argument check: refuse the default branch,
+/// an unknown branch, a protected branch, a tip that is not an ancestor of the default
+/// branch and a tip that moved, then DELETE `refs/heads/<branch>` and nothing else.
+/// Returns the line to print. Every segment of every path is percent-encoded, so no
+/// name can change which resource is read or deleted.
+pub fn delete_remote_branch(
+    api: &impl RemoteBranches,
+    deletion: &crate::bot_args::BranchDeletion,
+) -> Result<String> {
+    let repository = &deletion.repository;
+    let branch = &deletion.branch;
+    let repo_path = format!(
+        "/repos/{}",
+        repository
+            .split('/')
+            .map(published_merge::encoded_segment)
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let encoded = |name: &str| {
+        name.split('/')
+            .map(published_merge::encoded_segment)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let read = |path: &str, what: &str| -> Result<Option<Value>> {
+        api.read(path).map_err(|error| {
+            anyhow::anyhow!("bot delete-branch could not read {what} of {repository}: {error}")
+        })
+    };
+    let default = read(&repo_path, "the repository")?
+        .with_context(|| format!("bot delete-branch: repository {repository} does not exist"))?;
+    let default = default["default_branch"]
+        .as_str()
+        .filter(|d| !d.is_empty())
+        .with_context(|| {
+            format!("bot delete-branch: GitHub named no default branch for {repository}")
+        })?
+        .to_string();
+    if *branch == default {
+        bail!("bot delete-branch refuses the default branch `{branch}` of {repository}");
+    }
+    let branch_path = format!("{repo_path}/branches/{}", encoded(branch));
+    let tip = |answer: Option<Value>| -> Result<(String, bool)> {
+        let Some(answer) = answer else {
+            bail!("bot delete-branch: remote branch `{branch}` does not exist in {repository}");
+        };
+        // GitHub answers a renamed branch with its new name; that is another branch.
+        let named = answer["name"].as_str().unwrap_or_default();
+        if named != branch {
+            bail!(
+                "bot delete-branch: GitHub answered for `{}`, not `{branch}`; the branch was \
+                 renamed or does not exist",
+                named.escape_debug()
+            );
+        }
+        let sha = answer["commit"]["sha"]
+            .as_str()
+            .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .with_context(|| format!("bot delete-branch: GitHub named no tip for `{branch}`"))?;
+        let protected = answer["protected"].as_bool().with_context(|| {
+            format!("bot delete-branch: GitHub did not say whether `{branch}` is protected")
+        })?;
+        Ok((sha.to_ascii_lowercase(), protected))
+    };
+    let (first, protected) = tip(read(&branch_path, "the branch")?)?;
+    if protected {
+        bail!("bot delete-branch refuses the protected branch `{branch}` of {repository}");
+    }
+    let comparison = read(
+        &format!("{repo_path}/compare/{first}...{}", encoded(&default)),
+        "the comparison with the default branch",
+    )?
+    .with_context(|| {
+        format!("bot delete-branch: GitHub cannot compare `{branch}` with `{default}`")
+    })?;
+    let status = comparison["status"].as_str().unwrap_or("missing");
+    let base = comparison["merge_base_commit"]["sha"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(status, "ahead" | "identical") || base != first {
+        bail!(
+            "bot delete-branch refuses `{branch}`: its tip {first} is not merged into `{default}` \
+             (comparison status {}); deleting it would make commits unreachable. For an \
+             unmerged branch only, run `b10x-gates api --method DELETE --path \
+             {repo_path}/git/refs/heads/{} --output <file>`, admitted only where the policy \
+             admits that API write",
+            status.escape_debug(),
+            encoded(branch)
+        );
+    }
+    let (second, _) = tip(read(&branch_path, "the branch again")?)?;
+    if second != first {
+        bail!(
+            "bot delete-branch refuses `{branch}`: its tip moved from {first} to {second} while \
+             it was checked; run it again"
+        );
+    }
+    api.delete(&format!("{repo_path}/git/refs/heads/{}", encoded(branch)))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "bot delete-branch: DELETE of refs/heads/{branch} in {repository} failed: {error}"
+            )
+        })?;
+    Ok(format!("deleted {branch} at {first}"))
+}
+
 impl Github {
     pub fn gh(&self, root: &Path, args: &[String]) -> Result<()> {
         const SUPPORTED: [&str; 6] = ["release", "pr", "run", "workflow", "api", "repo"];
@@ -401,6 +538,10 @@ impl ApiFailure {
         Self { status, body }
     }
 
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
     /// For a 4xx with a JSON body: the status, GitHub's `message` and each entry
     /// of `errors`, unless any of it breaks a private rule or carries a personal
     /// path. Everything else, and every refusal without matchers, is status only.
@@ -542,6 +683,13 @@ pub fn api_success_report(
 /// `fetch`; without one, the credential variables are not set and nothing that runs
 /// here can reach the network as the bot.
 pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result<()> {
+    if args.first().is_some_and(|verb| verb == "delete-branch") {
+        bail!(
+            "bot delete-branch is not a Git command: it runs through the REST API as \
+             `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, never \
+             through Git"
+        );
+    }
     // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
     crate::bot_args::check(args, None)?;
     if matches!(args[0].as_str(), "merge" | "revert") {
