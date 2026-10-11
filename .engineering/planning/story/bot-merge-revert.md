@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-merge-revert
 kind: story
-status: active
+status: implemented
 title: The bot runs merge and revert and commits the result as itself
 summary: merge and revert run in their no-commit form with forbidden options refused, then the bot commits.
 relations:
@@ -23,10 +23,11 @@ scope:
   path: tests/bot_routes.rs
 - confidence: cited
   path: tests/bot_verbs.rs
-revision: 7
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-11T22:31:25Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-11T22:34:11Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"review_outcome":4}}}
+- {from: "active", to: "implemented", at: "2026-10-11T23:34:14Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1,"review_outcome":7}}}
 ---
 ## Problem
 

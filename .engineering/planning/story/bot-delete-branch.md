@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-delete-branch
 kind: story
-status: active
+status: implemented
 title: The bot deletes a remote branch only when its tip is merged
 summary: delete-branch deletes a non-default, unprotected remote branch whose tip is an ancestor of the default branch, through the App.
 relations:
@@ -22,10 +22,11 @@ scope:
   path: tests/bot_delete_branch.rs
 - confidence: cited
   path: tests/bot_routes.rs
-revision: 6
+revision: 7
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-11T22:31:25Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-11T22:34:11Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"review_outcome":1}}}
+- {from: "active", to: "implemented", at: "2026-10-11T23:34:14Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1,"review_outcome":3}}}
 ---
 ## Problem
 

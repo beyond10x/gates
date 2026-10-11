@@ -2,15 +2,16 @@
 format: aep.planning-md/3
 id: design:bot-verbs
 kind: design
-status: approved
+status: implemented
 title: Which Git verbs the delivery bot could add
 summary: Proposes merge and revert, a guarded delete-branch, and no rebase, cherry-pick or pull, with the security argument for each.
 relations:
 - informed_by: story:bot-supported-routes
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "in_review", at: "2026-10-08T09:43:21Z", actor: "human:timo", revision: 2}
 - {from: "in_review", to: "approved", at: "2026-10-11T22:31:20Z", actor: "human:timo", revision: 4}
+- {from: "approved", to: "implemented", at: "2026-10-11T23:34:14Z", actor: "human:timo", revision: 5}
 ---
 ## Question
 
