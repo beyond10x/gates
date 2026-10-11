@@ -1,0 +1,116 @@
+domain: gates.delivery
+summary: >-
+  The Git verbs `b10x-gates bot` runs as the bot. `merge` and `revert` run in their
+  no-commit form in the bot environment, then the bot commits the result, so the one
+  commit they create is authored and committed by the bot and passes `pre-commit` and
+  `commit-msg`. The host observes the facts each outcome reads before it runs Git:
+  the options it refuses, the revisions named, the merge drivers the repository's own
+  configuration declares (read as data) and any operation already in progress; Git's
+  result is observed after the no-commit run.
+
+types:
+  - name: gates.delivery.Operation
+    kind: enum
+    variants: [None, Merge, Revert, CherryPick, Rebase]
+  - name: gates.delivery.Integration
+    kind: enum
+    variants: [Clean, Conflicted, UpToDate]
+  - name: gates.delivery.Reversion
+    kind: enum
+    variants: [Clean, Conflicted]
+
+commands:
+  - name: gates.delivery.Merge
+    input:
+      - {name: revision, type: String}
+      - {name: revision_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: merge_drivers, type: 'List<String>'}
+      - {name: in_progress, type: gates.delivery.Operation}
+      - {name: integration, type: gates.delivery.Integration}
+    outcomes:
+      # -s/--strategy, -X/--strategy-option, --squash, --ff-only, --ff,
+      # --allow-unrelated-histories, --commit, -e/--edit, --continue, --abort, --quit,
+      # --skip, --no-verify, -n, -c, --config-env and --exec, each long option by
+      # every prefix Git accepts. Refused before a credential is minted.
+      - name: forbidden-option
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      # Exactly one revision: no octopus merge, no range.
+      - name: not-one-revision
+        when: revision_count != 1
+        error: gates.delivery.NotOneRevision
+      # A `merge.<driver>.driver` key in `.git/config` or `config.worktree` would run
+      # a repository-chosen command during the merge.
+      - name: merge-driver-configured
+        when: merge_drivers.count > 0
+        error: gates.delivery.MergeDriverConfigured
+      - name: operation-in-progress
+        when: in_progress != None
+        error: gates.delivery.OperationInProgress
+      # The conflict stays in the index; the error names the route to finish:
+      # resolve, `git add`, `b10x-gates bot -- commit -F -`, or `git merge --abort`.
+      - name: conflict
+        when: integration == Conflicted
+        error: gates.delivery.Conflicted
+      - name: up-to-date
+        when: integration == UpToDate
+        emits: [gates.delivery.NothingToMerge]
+        payload:
+          gates.delivery.NothingToMerge:
+            revision: input.revision
+      # One commit with two parents, bot author and committer, the given message or
+      # Git's prepared one.
+      - name: committed
+        emits: [gates.delivery.BotCommitted]
+        payload:
+          gates.delivery.BotCommitted:
+            revision: input.revision
+
+  - name: gates.delivery.Revert
+    input:
+      - {name: revision, type: String}
+      - {name: revision_count, type: Integer}
+      - {name: forbidden_options, type: 'List<String>'}
+      - {name: in_progress, type: gates.delivery.Operation}
+      - {name: integration, type: gates.delivery.Reversion}
+    outcomes:
+      # The same forbidden options as `merge`; `-m <parent>` is the mainline.
+      - name: forbidden-option
+        when: forbidden_options.count > 0
+        error: gates.delivery.ForbiddenOption
+      # Exactly one revision: no range such as `a..b`.
+      - name: not-one-revision
+        when: revision_count != 1
+        error: gates.delivery.NotOneRevision
+      - name: operation-in-progress
+        when: in_progress != None
+        error: gates.delivery.OperationInProgress
+      # The conflict stays in the index; the error names `git revert --abort`.
+      - name: conflict
+        when: integration == Conflicted
+        error: gates.delivery.Conflicted
+      # One commit, bot author and committer, Git's prepared `Revert "…"` message.
+      - name: committed
+        emits: [gates.delivery.BotCommitted]
+        payload:
+          gates.delivery.BotCommitted:
+            revision: input.revision
+
+events:
+  - name: gates.delivery.BotCommitted
+    fields: [{name: revision, type: String}]
+  - name: gates.delivery.NothingToMerge
+    fields: [{name: revision, type: String}]
+
+errors:
+  - name: gates.delivery.ForbiddenOption
+    fields: [{name: forbidden_options, type: 'List<String>'}]
+  - name: gates.delivery.NotOneRevision
+    fields: [{name: revision_count, type: Integer}]
+  - name: gates.delivery.MergeDriverConfigured
+    fields: [{name: merge_drivers, type: 'List<String>'}]
+  - name: gates.delivery.OperationInProgress
+    fields: [{name: in_progress, type: gates.delivery.Operation}]
+  - name: gates.delivery.Conflicted
+    fields: [{name: revision, type: String}]

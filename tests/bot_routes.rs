@@ -14,19 +14,22 @@ fn refusal(line: &str, repository: Option<&str>) -> String {
 }
 
 #[test]
-fn merge_refusal_prints_no_commit_route() {
-    let text = refusal("merge feature", None);
-    assert!(text.contains("git merge --no-ff --no-commit"), "{text}");
-    assert!(text.contains("b10x-gates bot -- commit -F -"), "{text}");
-    assert!(text.contains("no pathspec"), "{text}");
+fn merge_and_revert_pass_the_check() {
+    for line in [
+        "merge feature",
+        "merge --no-ff -m change feature",
+        "revert HEAD",
+        "revert -m 1 HEAD",
+    ] {
+        check(&args(line), None).unwrap_or_else(|e| panic!("`{line}` refused: {e:#}"));
+    }
 }
 
 #[test]
 fn pull_refusal_prints_fetch_then_merge() {
     let text = refusal("pull origin main", None);
     assert!(text.contains("b10x-gates bot -- fetch origin"), "{text}");
-    assert!(text.contains("git merge --no-ff --no-commit"), "{text}");
-    assert!(text.contains("b10x-gates bot -- commit -F -"), "{text}");
+    assert!(text.contains("b10x-gates bot -- merge"), "{text}");
 }
 
 #[test]
@@ -34,14 +37,7 @@ fn rebase_refusal_prints_merge_route() {
     for verb in ["rebase main", "cherry-pick abc123", "am patch.mbox"] {
         let text = refusal(verb, None);
         assert!(text.contains("pre-push check"), "{verb}: {text}");
-        assert!(
-            text.contains("git merge --no-ff --no-commit"),
-            "{verb}: {text}"
-        );
-        assert!(
-            text.contains("b10x-gates bot -- commit -F -"),
-            "{verb}: {text}"
-        );
+        assert!(text.contains("b10x-gates bot -- merge"), "{verb}: {text}");
     }
 }
 
@@ -90,13 +86,10 @@ fn other_verbs_are_refused_with_the_supported_verbs() {
     ] {
         let text = refusal(line, None);
         assert!(
-            text.contains("commit, tag, push or fetch"),
+            text.contains("commit, tag, push, fetch, merge or revert"),
             "{line}: {text}"
         );
-        assert!(
-            text.contains("git merge --no-ff --no-commit"),
-            "{line}: {text}"
-        );
+        assert!(text.contains("b10x-gates bot -- merge"), "{line}: {text}");
         assert!(text.contains("--method DELETE"), "{line}: {text}");
     }
     assert!(check(&[], None).is_err());
@@ -202,7 +195,7 @@ fn library_git_runs_the_same_check() {
         ("push --m origin", "cannot delete a remote branch"),
         ("commit -nm change", "cannot bypass hooks"),
         ("push --e=elsewhere origin main", "cannot bypass hooks"),
-        ("merge feature", "git merge --no-ff --no-commit"),
+        ("merge --squash feature", "`--squash`"),
     ] {
         let text = format!("{:#}", github.git(dir.path(), &args(line)).unwrap_err());
         assert!(text.contains(expected), "{line}: {text}");
