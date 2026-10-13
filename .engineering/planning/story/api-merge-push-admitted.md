@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:api-merge-push-admitted
 kind: story
-status: active
+status: implemented
 title: A push cut from an API merge needs no baseline move
 summary: Prove with tests that the pre-push proof and check admit a branch and a tag cut from an App pull-request merge one past the baseline, and refuse a merge with an unbound parent.
 relations:
@@ -12,10 +12,11 @@ scope:
   path: src/published_merge.rs
 - confidence: inferred
   path: tests/published_merge.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T11:19:51Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-13T11:19:51Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-13T12:00:38Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Problem
 

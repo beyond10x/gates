@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-delete-branch-defaults
 kind: story
-status: active
+status: implemented
 title: delete-branch runs from the installed configuration and deletes a merged ruleset-only branch
 summary: Default the repository from the installed hooks and judge classic protection by protection.enabled, so a merged wave branch under the bot-authority ruleset can be deleted.
 relations:
@@ -18,10 +18,11 @@ scope:
   path: src/main.rs
 - confidence: inferred
   path: tests/bot_delete_branch.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T11:19:51Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-13T11:19:51Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-13T12:00:38Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 ## Problem
 

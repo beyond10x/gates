@@ -7,7 +7,7 @@ title: 'Wave: API merges need no baseline move; delete-branch deletes merged wav
 relations:
 - informed_by: story:api-merge-push-admitted
 - informed_by: story:bot-delete-branch-defaults
-revision: 1
+revision: 2
 ---
 ## Wave: API merges need no baseline move; delete-branch deletes merged wave branches
 
@@ -44,7 +44,27 @@ per tree. ESS specification valid with ess 0.59.0 before any change.
 
 ## Units
 
-| unit | branch | tree id | stage |
-|---|---|---|---|
-| 1 | `impl/api-merge-push-admitted` | `gates-unit-api-merge` | dispatched |
-| 2 | `impl/bot-delete-branch-defaults` | `gates-unit-delete-defaults` | dispatched |
+## Units
+
+| unit | branch | commits | tree id | stage |
+|---|---|---|---|---|
+| 1 | `impl/api-merge-push-admitted` | `d39db66` | `gates-unit-api-merge` | merged `9fa978d`; tree finished, archived |
+| 2 | `impl/bot-delete-branch-defaults` | `185e1b7` | `gates-unit-delete-defaults` | merged `e588927`; tree finished, archived |
+| adversary 1 | `review/merge-baseline-adversary` | `4589441` | `gates-review-adversary-mb` | merged into the fix round; tree finished, archived |
+| security 1 | `review/merge-baseline-security` | `b42d3d1` | `gates-review-security-mb` | merged into the fix round; tree finished, archived |
+| fix 1 | `fix/merge-baseline` | `89efff6` | `gates-fix-mb` | merged `1bb83d8`; tree finished, archived |
+
+Unit 1 verdict: admitted. The pre-push proof and `check` admit a branch and an annotated tag cut
+from a bot API merge one past the baseline, on public and private repositories, with no source
+change. Unit 2 cause, observed read-only on this repository: every branch lists
+`protected: true` while `/branches/main/protection` answers 404 "Branch not protected".
+
+## Reviews
+
+| pass | findings | outcome |
+|---|---|---|
+| `review-result:merge-baseline-adversary-1` | 1 note: a shallow repository with installed hooks reported as uninstalled | fixed in `89efff6` |
+| `review-result:merge-baseline-security-1` | 1 warning: rulesets judged by type only, so a second ruleset of admitted types was passed | fixed in `89efff6` |
+
+Release content: `92fc61d` (0.1.18). Measured build: about 1.1G per tree (1129 MiB discarded at
+unit 2's finish).
