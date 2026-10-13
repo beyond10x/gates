@@ -2970,3 +2970,256 @@ fn adversary_unit2_earlier_update_pull_request_records_stay_bound() {
         f.assert_refused(what);
     }
 }
+
+// A push cut from an API merge needs no baseline move (story:api-merge-push-admitted).
+//
+// A repository that merges its pull requests through the App takes, on `main`, a merge that
+// GitHub commits. The claim under test was that until the policy baseline moves past that
+// merge, the push guard refuses every branch cut from `main` and every tag. These tests hold
+// the baseline one merge behind and push a branch and an annotated tag cut from the merge.
+
+const RELEASE_BRANCH: &str = "refs/heads/release";
+const RELEASE_TAG: &str = "refs/tags/v1.0.0";
+
+struct NoSecrets;
+impl b10x_gates::scan::SecretScanner for NoSecrets {
+    fn scan(
+        &mut self,
+        _: &[b10x_gates::git::Unit],
+    ) -> Result<Vec<b10x_gates::scan::SecretFinding>> {
+        Ok(vec![])
+    }
+}
+
+/// The policy baseline `B`; a bot pull-request head `H` cut from it; the App's merge `M` with
+/// parents `(B, H)`, committed by GitHub and recording Git's clean local merge of its parents;
+/// the published default branch at `M`; then a new bot commit `C` on `M` (a branch cut from
+/// `main`) and an annotated tag on `C`. The baseline stays at `B`.
+struct ApiMergeCut {
+    f: Fixture,
+    head: String,
+    tag: String,
+}
+
+fn api_merge_cut(private: bool) -> ApiMergeCut {
+    let mut f = Fixture::new();
+    let root = f.dir.path().to_path_buf();
+    let baseline = f.baseline.clone();
+    let head_tree = tree_of(&root, &[("change", b"pull request 1\n")]);
+    let head = commit(&root, &head_tree, &[&baseline], false, "pull request 1");
+    let (merged, clean) = written_merge_tree(&root, &baseline, &head);
+    assert!(clean, "the fixture merge must be clean");
+    f.replace_merge(&merged, &[&baseline, &head]);
+    git(&root, &["update-ref", "refs/heads/main", &f.merge], b"");
+    let release_tree = tree_of(
+        &root,
+        &[("change", b"pull request 1\n"), ("release", b"1.0.0\n")],
+    );
+    f.candidate = commit(&root, &release_tree, &[&f.merge], false, "release 1.0.0");
+    git(&root, &["update-ref", RELEASE_BRANCH, &f.candidate], b"");
+    let tag = git(
+        &root,
+        &["mktag"],
+        format!(
+            "object {}\ntype commit\ntag v1.0.0\ntagger {BOT_NAME} <{BOT_EMAIL}> 1700000000 \
+             +0000\n\nrelease 1.0.0\n",
+            f.candidate
+        )
+        .as_bytes(),
+    );
+    git(&root, &["update-ref", RELEASE_TAG, &tag], b"");
+    if private {
+        privatize(&mut f.api.responses);
+    }
+    assert_eq!(
+        f.policy.repository(REPOSITORY).unwrap().baseline,
+        baseline,
+        "the baseline must stay one merge behind"
+    );
+    ApiMergeCut { f, head, tag }
+}
+
+impl ApiMergeCut {
+    /// What the pre-push hook runs for one push line (`hooks::run`): the candidate for the
+    /// peeled commit, with the local tag ref when the destination is a tag, then the ancestry
+    /// proof against the authenticated remote.
+    fn pre_push(&self, local: &str, remote: &str) -> Result<()> {
+        let git = Git::new(self.f.dir.path())?;
+        let head = git.resolve(&format!("{local}^{{commit}}"))?;
+        let tags = if remote.starts_with("refs/tags/") {
+            vec![local.to_owned()]
+        } else {
+            Vec::new()
+        };
+        git.candidate(&self.f.policy, REPOSITORY, &head, &tags)?;
+        b10x_gates::hooks::verify_pre_push(&git, &self.f.policy, REPOSITORY, &head, &self.f.api)
+    }
+
+    /// What `b10x-gates check --head <head> [--tag <tag>]` runs once a scanner is pinned: the
+    /// candidate from the policy baseline, a signed receipt over it, and that receipt verified
+    /// against the same candidate. The pinned Gitleaks is replaced by a scanner that finds
+    /// nothing, so only admission and binding are under test.
+    fn check(&self, tags: &[String]) -> Result<b10x_gates::git::Binding> {
+        let git = Git::new(self.f.dir.path())?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        // A signing policy is a complete private policy (full-length nonce, a private term) with
+        // an enrolled signer; its baseline is the same `B` the push proof reads.
+        let mut policy = self.f.policy.clone();
+        policy.nonce = "synthetic-policy-nonce-for-local-test-1234".into();
+        policy.forbidden_literals = vec![["synthetic", "restricted", "identifier"].join("-")];
+        policy.signers.insert(
+            "fixture-key".into(),
+            b10x_gates::policy::Signer {
+                public_key: hex::encode(key.verifying_key().to_bytes()),
+                repositories: vec![REPOSITORY.into()],
+            },
+        );
+        let candidate = git.candidate(&policy, REPOSITORY, &self.f.candidate, tags)?;
+        let receipt = b10x_gates::evidence::check(&policy, &candidate, &key, &mut NoSecrets)?;
+        b10x_gates::evidence::verify(&policy, &candidate, &receipt)?;
+        Ok(candidate.binding)
+    }
+}
+
+#[test]
+fn a_branch_and_a_tag_cut_from_an_api_merge_are_admitted_without_a_baseline_move() {
+    for private in [false, true] {
+        let cut = api_merge_cut(private);
+        let f = &cut.f;
+        for (local, remote) in [(RELEASE_BRANCH, RELEASE_BRANCH), (RELEASE_TAG, RELEASE_TAG)] {
+            if let Err(error) = cut.pre_push(local, remote) {
+                panic!("pre-push refused {remote} (private: {private}): {error:#}");
+            }
+        }
+        if let Err(error) = f.verify() {
+            panic!("publication refused the release head (private: {private}): {error:#}");
+        }
+        for tags in [vec![], vec![RELEASE_TAG.to_owned()]] {
+            let binding = cut.check(&tags).unwrap_or_else(|error| {
+                panic!("check refused {tags:?} (private: {private}): {error:#}")
+            });
+            assert_eq!(binding.baseline, f.baseline);
+            assert_eq!(
+                binding.commits,
+                vec![cut.head.clone(), f.merge.clone(), f.candidate.clone()],
+                "check must walk the head, the GitHub merge and the release commit"
+            );
+            let expected: Vec<String> = if tags.is_empty() {
+                vec![]
+            } else {
+                vec![cut.tag.clone()]
+            };
+            assert_eq!(binding.tags, expected, "the annotated tag must be bound");
+        }
+    }
+}
+
+impl ApiMergeCut {
+    /// Replace the App's merge with one whose second parent is `second`, a bot commit cut from
+    /// the baseline, keeping the clean local merge as its tree and publishing it. The remote
+    /// commit record matches the local commit exactly; only the pull-request binding is left to
+    /// the caller.
+    fn merge_unbound(&mut self, second: &str) {
+        let root = self.f.dir.path().to_path_buf();
+        let baseline = self.f.baseline.clone();
+        let (merged, clean) = written_merge_tree(&root, &baseline, second);
+        assert!(clean, "the fixture merge must be clean");
+        self.f.replace_merge(&merged, &[&baseline, second]);
+        if self.f.api.responses.get(ROOT).unwrap()["private"] == json!(true) {
+            privatize(&mut self.f.api.responses);
+        }
+    }
+
+    fn assert_pre_push_refused(&self, needle: &str, what: &str) {
+        for (local, remote) in [(RELEASE_BRANCH, RELEASE_BRANCH), (RELEASE_TAG, RELEASE_TAG)] {
+            let error = self
+                .pre_push(local, remote)
+                .expect_err(&format!("{what} admitted for a push of {remote}"));
+            assert!(
+                format!("{error:#}").contains(needle),
+                "{what} refused for another reason on {remote}: {error:#}"
+            );
+        }
+        assert!(self.f.verify().is_err(), "{what} admitted by publication");
+    }
+
+    /// Move the release branch and tag onto a new bot commit on the current merge.
+    fn recut(&mut self) {
+        let root = self.f.dir.path().to_path_buf();
+        let tree = self.f.tree.clone();
+        self.f.candidate = commit(&root, &tree, &[&self.f.merge], false, "release 1.0.0");
+        git(
+            &root,
+            &["update-ref", RELEASE_BRANCH, &self.f.candidate],
+            b"",
+        );
+        let tag = git(
+            &root,
+            &["mktag"],
+            format!(
+                "object {}\ntype commit\ntag v1.0.0\ntagger {BOT_NAME} <{BOT_EMAIL}> 1700000000 \
+                 +0000\n\nrelease 1.0.0\n",
+                self.f.candidate
+            )
+            .as_bytes(),
+        );
+        git(&root, &["update-ref", RELEASE_TAG, &tag], b"");
+        self.tag = tag;
+    }
+}
+
+#[test]
+fn an_api_merge_whose_second_parent_is_not_the_bound_pull_request_head_refuses() {
+    // GitHub committed the merge and a bot-merged pull request names it as its merge commit,
+    // but that pull request's head is H, not the merge's second parent X. X is the bot's own
+    // commit and the merge tree is the clean local merge, so only the binding is wrong.
+    for private in [false, true] {
+        let mut cut = api_merge_cut(private);
+        let root = cut.f.dir.path().to_path_buf();
+        let baseline = cut.f.baseline.clone();
+        let unbound_tree = tree_of(&root, &[("unbound", b"no pull request\n")]);
+        let unbound = commit(&root, &unbound_tree, &[&baseline], false, "unbound");
+        cut.merge_unbound(&unbound);
+        cut.recut();
+        let head = cut.head.clone();
+        let merge = cut.f.merge.clone();
+        cut.f.pr()["head"]["sha"] = json!(head);
+        cut.f
+            .api
+            .responses
+            .get_mut(&format!("{ROOT}/commits/{merge}/pulls?per_page=100&page=1"))
+            .unwrap()[0]["head"]["sha"] = json!(head);
+        cut.assert_pre_push_refused(
+            "pull request head is not the second merge parent",
+            &format!("a merge of an unbound second parent (private: {private})"),
+        );
+    }
+}
+
+#[test]
+fn an_api_merge_no_merged_pull_request_binds_refuses() {
+    // GitHub committed a two-parent merge of the baseline and a bot commit, but no pull request
+    // records it as its merge: nothing binds the second parent to a pull request at all.
+    for private in [false, true] {
+        let mut cut = api_merge_cut(private);
+        let root = cut.f.dir.path().to_path_buf();
+        let baseline = cut.f.baseline.clone();
+        let unbound_tree = tree_of(&root, &[("unbound", b"no pull request\n")]);
+        let unbound = commit(&root, &unbound_tree, &[&baseline], false, "unbound");
+        cut.merge_unbound(&unbound);
+        cut.recut();
+        let merge = cut.f.merge.clone();
+        cut.f
+            .api
+            .responses
+            .get_mut(&format!("{ROOT}/commits/{merge}/pulls?per_page=100&page=1"))
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .clear();
+        cut.assert_pre_push_refused(
+            "updated pull request missing or ambiguous",
+            &format!("a merge no pull request binds (private: {private})"),
+        );
+    }
+}

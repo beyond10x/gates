@@ -13,6 +13,7 @@ use reqwest::{Method, StatusCode, blocking::Client};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -84,9 +85,9 @@ impl RemoteBranches for Github {
 }
 
 /// `gates.delivery.DeleteBranch` after the argument check: refuse the default branch,
-/// an unknown branch, a protected or ruleset-protected branch, a tip that is not an
-/// ancestor of the default branch and a tip that moved, then DELETE
-/// `refs/heads/<branch>` and nothing else.
+/// an unknown branch, a branch with classic protection enabled or a ruleset beyond the
+/// bot-authority rules, a tip that is not an ancestor of the default branch and a tip
+/// that moved, then DELETE `refs/heads/<branch>` and nothing else.
 /// Returns the line to print. Every segment of every path is percent-encoded, so no
 /// name can change which resource is read or deleted.
 pub fn delete_remote_branch(
@@ -144,8 +145,14 @@ pub fn delete_remote_branch(
             .as_str()
             .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .with_context(|| format!("bot delete-branch: GitHub named no tip for `{branch}`"))?;
-        let protected = answer["protected"].as_bool().with_context(|| {
-            format!("bot delete-branch: GitHub did not say whether `{branch}` is protected")
+        // Classic branch protection is `protection.enabled`. The top-level `protected`
+        // is true for every branch any ruleset covers, the bot-authority ruleset
+        // included, so it never decides; rulesets are judged by `rulesets` below.
+        let protected = answer["protection"]["enabled"].as_bool().with_context(|| {
+            format!(
+                "bot delete-branch: GitHub did not say whether classic branch protection is \
+                 enabled on `{branch}` (no boolean `protection.enabled` in the branch answer)"
+            )
         })?;
         Ok((sha.to_ascii_lowercase(), protected))
     };
@@ -203,14 +210,14 @@ pub fn delete_remote_branch(
     Ok(format!("deleted {branch} at {first}"))
 }
 
-/// Rule types the organization's bot-authority ruleset puts on every branch, plus the
-/// naming and message patterns that restrict nothing a deletion touches. Any other
-/// type (`required_status_checks`, `pull_request`, …) marks a branch someone protects.
-const ADMITTED_RULES: [&str; 9] = [
-    "creation",
-    "update",
-    "deletion",
-    "non_fast_forward",
+/// Rule types the organization's bot-authority ruleset puts on every branch, each once and
+/// all from that one ruleset. The same types from a second ruleset are someone else
+/// protecting the branch.
+const RESTRICTING_RULES: [&str; 4] = ["creation", "update", "deletion", "non_fast_forward"];
+/// Naming and message patterns, which restrict nothing a deletion touches and may come
+/// from any ruleset. Any type in neither list (`required_status_checks`,
+/// `pull_request`, …) marks a branch someone protects.
+const PATTERN_RULES: [&str; 5] = [
     "commit_author_email_pattern",
     "committer_email_pattern",
     "commit_message_pattern",
@@ -220,10 +227,13 @@ const ADMITTED_RULES: [&str; 9] = [
 /// The page size asked of `rules/branches`; a full page may hide another and is refused.
 const RULES_PAGE: usize = 100;
 
-/// `gates.delivery.DeleteBranch`'s ruleset refusals. `protected` reports only classic
-/// branch protection, and the App bypasses the rulesets, so they are read here: an
-/// answer that is not a JSON array, a rule type outside `ADMITTED_RULES`, or more than
-/// the one `deletion` rule the bot-authority ruleset carries is refused.
+/// `gates.delivery.DeleteBranch`'s ruleset refusals. `protection.enabled` reports only
+/// classic branch protection, and the App bypasses the rulesets, so they are read here.
+/// Refused, in this order: an answer that is not a JSON array; a rule type in neither
+/// `RESTRICTING_RULES` nor `PATTERN_RULES`; a rule whose `ruleset_id` is missing or not a
+/// positive integer; more than the one `deletion` rule the bot-authority ruleset carries;
+/// any other restricting type more than once; restricting rules from more than one
+/// ruleset.
 fn rulesets(answer: Option<Value>, branch: &str, repository: &str) -> Result<()> {
     let Some(rules) = answer.as_ref().and_then(Value::as_array) else {
         bail!(
@@ -239,13 +249,28 @@ fn rulesets(answer: Option<Value>, branch: &str, repository: &str) -> Result<()>
         );
     }
     let mut unadmitted = Vec::new();
-    let mut deletions = 0;
+    let mut unattributed = Vec::new();
+    // Restricting type → the ruleset ids it came from, one entry per rule.
+    let mut restricting: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
     for rule in rules {
-        match rule["type"].as_str() {
-            Some("deletion") => deletions += 1,
-            Some(kind) if ADMITTED_RULES.contains(&kind) => {}
+        let kind = rule["type"].as_str();
+        match kind {
+            Some(kind) if RESTRICTING_RULES.contains(&kind) || PATTERN_RULES.contains(&kind) => {}
             Some(kind) => unadmitted.push(format!("`{}`", clean(kind, 60))),
             None => unadmitted.push("a rule without a type".into()),
+        }
+        // `as_u64` is `None` for a negative, fractional, string or absent id.
+        match (kind, rule["ruleset_id"].as_u64().filter(|id| *id > 0)) {
+            (Some(kind), Some(id)) => {
+                if let Some(kind) = RESTRICTING_RULES.iter().find(|k| **k == kind) {
+                    restricting.entry(kind).or_default().push(id);
+                }
+            }
+            (kind, None) => unattributed.push(kind.map_or_else(
+                || "a rule without a type".to_owned(),
+                |kind| format!("`{}`", clean(kind, 60)),
+            )),
+            (None, Some(_)) => {}
         }
     }
     if !unadmitted.is_empty() {
@@ -257,10 +282,58 @@ fn rulesets(answer: Option<Value>, branch: &str, repository: &str) -> Result<()>
             unadmitted.join(", ")
         );
     }
-    if deletions > 1 {
+    if !unattributed.is_empty() {
+        unattributed.sort();
+        unattributed.dedup();
         bail!(
-            "bot delete-branch refuses `{branch}` of {repository}: {deletions} rulesets \
-             restrict its deletion, more than the bot's own"
+            "bot delete-branch refuses `{branch}` of {repository}: GitHub did not name the \
+             ruleset (a positive `ruleset_id`) of its {} rule(s)",
+            unattributed.join(", ")
+        );
+    }
+    let ids = |ids: &[u64]| {
+        ids.iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(deletions) = restricting.get("deletion").filter(|ids| ids.len() > 1) {
+        bail!(
+            "bot delete-branch refuses `{branch}` of {repository}: {} rulesets restrict \
+             its deletion, more than the bot's own (`deletion` from rulesets {})",
+            deletions.len(),
+            ids(deletions)
+        );
+    }
+    let repeated: Vec<String> = restricting
+        .iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(kind, from)| format!("`{kind}` {} times (rulesets {})", from.len(), ids(from)))
+        .collect();
+    if !repeated.is_empty() {
+        bail!(
+            "bot delete-branch refuses `{branch}` of {repository}: the bot-authority ruleset \
+             carries each restricting rule once, but rulesets apply {}",
+            repeated.join(", ")
+        );
+    }
+    let mut by_ruleset: BTreeMap<u64, Vec<&str>> = BTreeMap::new();
+    for (kind, from) in &restricting {
+        for id in from {
+            by_ruleset.entry(*id).or_default().push(kind);
+        }
+    }
+    if by_ruleset.len() > 1 {
+        bail!(
+            "bot delete-branch refuses the ruleset-protected branch `{branch}` of \
+             {repository}: its restricting rules come from {} rulesets, not only the \
+             bot's own: {}",
+            by_ruleset.len(),
+            by_ruleset
+                .iter()
+                .map(|(id, kinds)| format!("ruleset {id} ({})", kinds.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     }
     Ok(())

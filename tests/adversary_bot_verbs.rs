@@ -295,23 +295,23 @@ fn percent_escapes_in_a_branch_name_are_never_decoded_twice() {
 }
 
 /// Answer shapes that do not say what the guard needs are refusals, never defaults:
-/// no `protected`, a `protected` that is a string, a missing merge base, and a
-/// comparison that names the right status for another base.
+/// no `protection.enabled`, a `protection.enabled` that is a string, a missing merge
+/// base, and a comparison that names the right status for another base.
 #[test]
 fn ambiguous_github_answers_refuse_the_deletion() {
     let repo = ("/repos/example/sample", json!({"default_branch": "main"}));
     let cases = [
         (json!({"name": "done", "commit": {"sha": TIP}}), None),
         (
-            json!({"name": "done", "protected": "false", "commit": {"sha": TIP}}),
+            json!({"name": "done", "protected": false, "protection": {"enabled": "false"}, "commit": {"sha": TIP}}),
             None,
         ),
         (
-            json!({"name": "done", "protected": false, "commit": {"sha": TIP}}),
+            json!({"name": "done", "protected": true, "protection": {"enabled": false}, "commit": {"sha": TIP}}),
             Some(json!({"status": "ahead"})),
         ),
         (
-            json!({"name": "done", "protected": false, "commit": {"sha": TIP}}),
+            json!({"name": "done", "protected": true, "protection": {"enabled": false}, "commit": {"sha": TIP}}),
             Some(json!({
                 "status": "identical",
                 "merge_base_commit": {"sha": "2222222222222222222222222222222222222222"}
@@ -347,7 +347,7 @@ fn spellings_of_the_default_branch_are_refused() {
             )
             .answer(
                 &format!("/repos/example/sample/branches/{name}"),
-                Some(json!({"name": "main", "protected": false, "commit": {"sha": TIP}})),
+                Some(json!({"name": "main", "protected": true, "protection": {"enabled": false}, "commit": {"sha": TIP}})),
             )
             .answer(
                 &format!("/repos/example/sample/compare/{TIP}...main"),

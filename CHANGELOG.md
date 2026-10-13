@@ -1,6 +1,31 @@
 # Changelog
 
-## 0.1.17 — unreleased
+## 0.1.18 — unreleased
+
+- `bot -- delete-branch <branch>` runs without `--repository`: the repository comes from the
+  installed hooks' protected `config.json`, as for the other bot verbs. An explicit
+  `--repository` still wins; with neither, the refusal names both routes. A repository Git
+  refuses for another reason (shallow history, an unknown format) is refused with its cause,
+  not reported as uninstalled.
+- `delete-branch` judges classic protection by the branch's `protection.enabled`. GitHub's
+  `protected` is true for every branch under a ruleset, so 0.1.17 refused every branch of a
+  repository carrying the bot-authority ruleset. A missing or non-boolean `protection.enabled`
+  is refused.
+- Rulesets are judged by where each rule comes from: every rule must name its ruleset, the
+  restricting rules (`creation`, `update`, `deletion`, `non_fast_forward`) must all come from
+  one ruleset and each appear once, and any other rule type beyond the commit and branch name
+  patterns is refused. A second ruleset that restricts the branch is refused even when its rule
+  types match the bot-authority ruleset's.
+- Tests prove that pre-push and `check` admit a branch and an annotated tag cut from a pull
+  request the bot merged through the API, one merge past the baseline, on public and private
+  repositories; no baseline move is needed. A merge whose second parent is not the bound pull
+  request head, or that no merged pull request records, is refused.
+- `ess/`: `gates.delivery.DeleteBranch` resolves its repository from the flag or the installed
+  configuration and gains the ruleset attribution outcomes.
+- No policy field or receipt format changes. The version increment invalidates receipts retained
+  under 0.1.17, so the first check after upgrading scans in full once.
+
+## 0.1.17 — 2026-10-11
 
 - `bot -- merge <revision>` and `bot -- revert <revision>` run as the bot. Each takes exactly one
   revision, resolved to one commit before Git runs, so a range, a second revision or a

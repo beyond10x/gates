@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-13T12:00:27Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-delete-branch-defaults",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo fmt --check, cargo clippy -p b10x-gates --all-targets --locked -- -D warnings, cargo test -p b10x-gates --locked on 92fc61d: 327 passed, 0 failed"
+  }
+}
