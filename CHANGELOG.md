@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.1.19 — unreleased
+## 0.1.20 — unreleased
+
+- The release executable is built for `x86_64-unknown-linux-musl` again. The 0.1.19 asset was
+  a static glibc build: it resolves names by loading the host's `libnss_*` modules, and its
+  second GitHub request faulted (exit 139, nothing printed), so `bot -- delete-branch` and
+  `api` crashed while `commit` and `push` worked. The source is unchanged; 0.1.19 users should
+  move to 0.1.20 or keep 0.1.18.
+- `scan-artifact` refuses a statically linked executable (no `PT_INTERP`) that carries glibc's
+  name service switch (`nsswitch.conf`), before any scanner runs, naming the musl target
+  (`gates.delivery.ValidateArtifact`, `static-name-service`).
+
+## 0.1.19 — 2026-10-13
 
 - `bot -- delete-branch` reads the comparison of the branch tip with the default branch again.
   0.1.18 built `compare/<tip>...<default>`, which the API client's `..` path guard refuses, so
