@@ -4,8 +4,8 @@
 //! `delete-branch` through the REST API. Everything else is refused with the supported
 //! route in the text, so an agent does not have to find it alone. `Github::git` runs
 //! this same check again, so the two cannot drift.
-use anyhow::{Result, bail};
-use std::path::Path;
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
 
 const SUPPORTED: &str = "bot Git command must be commit, tag, push, fetch, merge or revert, \
                          or the API verb delete-branch";
@@ -464,11 +464,10 @@ pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Optio
     if let Some(flag) = flag {
         return Ok(Some(flag.to_string()));
     }
-    // Not a repository (or one Git refuses to read): nothing is installed to read.
-    let Ok(git) = crate::git::Git::new(root) else {
+    let Some(common) = common_directory(root)? else {
         return Ok(None);
     };
-    let config = crate::hooks::directory(&git)?.join("config.json");
+    let config = common.join(crate::hooks::DIRECTORY).join("config.json");
     match std::fs::symlink_metadata(&config) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         _ => {}
@@ -490,6 +489,40 @@ pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Optio
         );
     }
     Ok(Some(installed.repository))
+}
+
+/// The Git common directory of `root`, located the way `hooks::directory` locates it but
+/// without `Git::new`'s history guards: a shallow or grafted repository still has its
+/// hooks installed, and reading where they live proves no history. `None` only when Git
+/// says `root` is not a repository; any other failure is refused with its exit status
+/// (Git's own stderr may carry path bytes and is not echoed).
+fn common_directory(root: &Path) -> Result<Option<PathBuf>> {
+    let git = crate::git::Git {
+        root: root.to_path_buf(),
+    };
+    let output = git
+        .command()
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .context("bot delete-branch: Git could not start to locate the repository")?;
+    if !output.status.success() {
+        if output.stderr.starts_with(b"fatal: not a git repository") {
+            return Ok(None);
+        }
+        bail!(
+            "bot delete-branch: Git could not locate the repository at {} ({}), so its \
+             installed hook configuration cannot be read; pass --repository <owner>/<repo>",
+            root.display(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"))
+        );
+    }
+    let common = String::from_utf8(output.stdout)
+        .context("bot delete-branch: the Git common directory is not UTF-8")?;
+    Ok(Some(PathBuf::from(common.trim_end_matches('\n'))))
 }
 
 /// `<owner>/<repo>`: two non-empty segments of ASCII letters, digits, `-`, `_` and `.`,
