@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-13T19:28:00Z",
+  "actor": "human:timo",
+  "artifact": "story:release-static-name-service",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo fmt --all --check, cargo clippy --all-targets --locked -- -D warnings, cargo test --locked --no-fail-fast on 1a0d077: 355 passed, 0 failed, 6 ignored",
+    "reference": "1a0d077"
+  }
+}
