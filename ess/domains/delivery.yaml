@@ -184,7 +184,10 @@ commands:
       - {name: ancestry, type: gates.delivery.Ancestry}
       - {name: rules_readable, type: Boolean}
       - {name: unadmitted_rules, type: 'List<String>'}
+      - {name: unattributed_rules, type: 'List<String>'}
       - {name: deletion_rules, type: Integer}
+      - {name: repeated_rules, type: 'List<String>'}
+      - {name: restricting_rulesets, type: 'List<Integer>'}
       - {name: current_tip, type: String}
     outcomes:
       # The remote is `--repository <owner>/<repo>` when given, else the `repository`
@@ -192,7 +195,10 @@ commands:
       # (`<git common dir>/b10x-gates-hooks/config.json`), either held to the
       # `<owner>/<repo>` shape. With neither, nothing is read and no credential is
       # minted; the refusal names both routes: `--repository <owner>/<repo>`, or
-      # `b10x-gates install` in the repository.
+      # `b10x-gates install` in the repository. Only "not a git repository" counts as
+      # no configuration: the common directory is located without the history guards
+      # (a shallow or grafted repository still has its hooks installed), and any other
+      # failure to locate it is refused with its cause.
       - name: no-repository
         when: repository_resolved == false
         error: gates.delivery.RepositoryRequired
@@ -235,15 +241,34 @@ commands:
       # creation, update, deletion, non_fast_forward, commit_author_email_pattern,
       # committer_email_pattern, commit_message_pattern, committer_name_pattern and
       # branch_name_pattern. Any other type (required_status_checks,
-      # pull_request, …) marks a branch someone protects.
+      # pull_request, …), or a rule without a type, marks a branch someone protects.
+      # Admitting a type is not admitting its ruleset: the outcomes below hold every
+      # restricting rule to the one bot-authority ruleset.
       - name: ruled-branch
         when: unadmitted_rules.count > 0
         error: gates.delivery.RuledBranch
+      # Every rule entry names the ruleset it comes from: a `ruleset_id` that is
+      # missing or not a positive integer cannot be attributed, so it is refused.
+      - name: unattributed-rule
+        when: unattributed_rules.count > 0
+        error: gates.delivery.UnattributedRule
       # The bot-authority ruleset carries one `deletion` rule; a second one is a
       # second ruleset restricting deletion.
       - name: deletion-restricted
         when: deletion_rules > 1
         error: gates.delivery.DeletionRestricted
+      # The restricting types (creation, update, deletion, non_fast_forward) are the
+      # bot-authority ruleset's, each carried once: one of them twice is a second
+      # ruleset restricting the branch.
+      - name: repeated-restriction
+        when: repeated_rules.count > 0
+        error: gates.delivery.RepeatedRestriction
+      # Every restricting rule comes from one and the same ruleset, the bot's: a second
+      # ruleset id among them is someone else protecting the branch, even with only
+      # admitted types. The naming and message patterns may come from any ruleset.
+      - name: several-restricting-rulesets
+        when: restricting_rulesets.count > 1
+        error: gates.delivery.SeveralRestrictingRulesets
       # The tip read again before the DELETE differs from the one compared.
       - name: moved-tip
         when_subject:
@@ -290,8 +315,14 @@ errors:
     fields: [{name: name, type: String}]
   - name: gates.delivery.RuledBranch
     fields: [{name: unadmitted_rules, type: 'List<String>'}]
+  - name: gates.delivery.UnattributedRule
+    fields: [{name: unattributed_rules, type: 'List<String>'}]
   - name: gates.delivery.DeletionRestricted
     fields: [{name: deletion_rules, type: Integer}]
+  - name: gates.delivery.RepeatedRestriction
+    fields: [{name: repeated_rules, type: 'List<String>'}]
+  - name: gates.delivery.SeveralRestrictingRulesets
+    fields: [{name: restricting_rulesets, type: 'List<Integer>'}]
   - name: gates.delivery.Conflicted
     fields: [{name: revision, type: String}]
   - name: gates.delivery.RepositoryRequired

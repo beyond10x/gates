@@ -510,6 +510,24 @@ fn refuses_without_repository() {
     // No flag and no installed configuration: nothing to resolve.
     let dir = repository_without_hooks();
     assert_eq!(delete_branch_repository(dir.path(), None).unwrap(), None);
+    // Nor in a directory that is no repository at all.
+    let plain = tempfile::tempdir().unwrap();
+    assert_eq!(delete_branch_repository(plain.path(), None).unwrap(), None);
+    // A repository Git refuses to read is not "no repository": refused with its cause.
+    let unreadable = repository_without_hooks();
+    let status = Command::new("git")
+        .args(["config", "core.repositoryformatversion", "99"])
+        .current_dir(unreadable.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let text = format!(
+        "{:#}",
+        delete_branch_repository(unreadable.path(), None)
+            .expect_err("a repository Git cannot read was reported as absent")
+    );
+    assert!(text.contains("could not locate the repository"), "{text}");
+    assert!(text.contains("--repository <owner>/<repo>"), "{text}");
     for repository in [
         "",
         "example",
@@ -635,6 +653,126 @@ fn refuses_a_second_deletion_rule() {
     rules.as_array_mut().unwrap().push(rule("deletion"));
     let text = refused(&ruled(Some(rules)), "wave/one");
     assert!(text.contains("2 rulesets restrict its deletion"), "{text}");
+    // From a second ruleset, the same refusal, naming both ids.
+    let mut rules = bot_authority();
+    rules
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "deletion", "ruleset_id": 7}));
+    let text = refused(&ruled(Some(rules)), "wave/one");
+    assert!(text.contains("2 rulesets restrict its deletion"), "{text}");
+    assert!(text.contains("rulesets 1, 7"), "{text}");
+}
+
+/// Each restricting type comes from one and the same ruleset, the bot's: a second
+/// ruleset of admitted restricting types, alone or together, is someone protecting the
+/// branch, and the refusal names the types and the ruleset ids.
+#[test]
+fn refuses_restricting_rules_from_a_second_ruleset() {
+    for kinds in [
+        vec!["creation"],
+        vec!["update"],
+        vec!["non_fast_forward"],
+        vec!["update", "non_fast_forward"],
+    ] {
+        // Without the bot's own rule of the same type, so the repeat guard does not
+        // decide it; the one-ruleset guard must.
+        let mut rules: Vec<Value> = bot_authority()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| !kinds.contains(&rule["type"].as_str().unwrap()))
+            .cloned()
+            .collect();
+        for kind in &kinds {
+            rules.push(json!({"type": kind, "ruleset_id": 9}));
+        }
+        let text = refused(&ruled(Some(Value::Array(rules))), "wave/one");
+        assert!(text.contains("ruleset-protected"), "{kinds:?}: {text}");
+        assert!(text.contains("ruleset 1 ("), "{kinds:?}: {text}");
+        assert!(
+            text.contains(&format!("ruleset 9 ({})", {
+                let mut sorted = kinds.clone();
+                sorted.sort();
+                sorted.join(", ")
+            })),
+            "{kinds:?}: {text}"
+        );
+    }
+}
+
+/// The bot-authority ruleset carries each restricting type once; any of them twice,
+/// even from the same ruleset id, is refused naming the type.
+#[test]
+fn refuses_a_repeated_restricting_rule() {
+    for kind in ["creation", "update", "non_fast_forward"] {
+        let mut rules = bot_authority();
+        rules.as_array_mut().unwrap().push(rule(kind));
+        let text = refused(&ruled(Some(rules)), "wave/one");
+        assert!(
+            text.contains(&format!("`{kind}` 2 times (rulesets 1, 1)")),
+            "{kind}: {text}"
+        );
+    }
+}
+
+/// A rule whose `ruleset_id` is missing or not a positive integer cannot be
+/// attributed to a ruleset, whatever its type.
+#[test]
+fn refuses_an_unattributed_rule() {
+    for kind in ["creation", "deletion", "committer_email_pattern"] {
+        for id in [
+            None,
+            Some(json!(0)),
+            Some(json!(-1)),
+            Some(json!(1.5)),
+            Some(json!("1")),
+            Some(Value::Null),
+        ] {
+            let mut entry = json!({"type": kind, "ruleset_source_type": "Organization"});
+            if let Some(id) = &id {
+                entry["ruleset_id"] = id.clone();
+            }
+            let rules = bot_authority()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|rule| rule["type"] != kind)
+                .cloned()
+                .chain([entry])
+                .collect();
+            let text = refused(&ruled(Some(Value::Array(rules))), "wave/one");
+            assert!(
+                text.contains("did not name the ruleset"),
+                "{kind} {id:?}: {text}"
+            );
+            assert!(text.contains(&format!("`{kind}`")), "{kind} {id:?}: {text}");
+        }
+    }
+}
+
+/// The naming and message patterns may come from any ruleset: GitHub's answer for
+/// beyond10x/gates `release/0.1.2` carries the restricting rules from one ruleset and
+/// the two email patterns from another, and is deleted.
+#[test]
+fn deletes_with_patterns_from_other_rulesets() {
+    let mut rules: Vec<Value> = ["creation", "update", "deletion", "non_fast_forward"]
+        .into_iter()
+        .map(|kind| json!({"type": kind, "ruleset_source_type": "Repository", "ruleset_id": 22756851}))
+        .collect();
+    rules.extend(
+        [
+            ("commit_author_email_pattern", 22756856),
+            ("committer_email_pattern", 22756856),
+            ("commit_message_pattern", 5),
+            ("committer_name_pattern", 6),
+            ("branch_name_pattern", 7),
+        ]
+        .map(|(kind, id)| json!({"type": kind, "ruleset_source_type": "Repository", "ruleset_id": id})),
+    );
+    let fake = ruled(Some(Value::Array(rules)));
+    delete_remote_branch(&fake, &deletion("wave/one")).unwrap();
+    assert_eq!(fake.deletes.borrow().len(), 1);
 }
 
 /// A rules answer that is not a JSON array, or a 404, says nothing: refused.

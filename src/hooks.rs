@@ -153,11 +153,14 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
     Ok(())
 }
 
+/// The hooks' directory name under the Git common directory.
+pub const DIRECTORY: &str = "b10x-gates-hooks";
+
 /// The installed hook directory, where the pre-push hook retains its receipts.
 pub fn directory(git: &Git) -> Result<PathBuf> {
     let common =
         PathBuf::from(git.text(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
-    Ok(common.join("b10x-gates-hooks"))
+    Ok(common.join(DIRECTORY))
 }
 
 pub fn invoked() -> Option<String> {
