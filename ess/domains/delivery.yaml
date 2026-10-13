@@ -57,12 +57,15 @@ types:
     kind: enum
     variants: [Flag, InstalledConfiguration, Default, Unresolved]
   # The installed hooks' protected configuration as `install` finds it. It is read only
-  # when a flag is missing (`NotConsulted` otherwise); `Untrusted` covers a file that is
-  # not owner-only, a symlink, a directory others can write, unparsable bytes and a
-  # repository that is not `<owner>/<repo>`.
+  # when the repository (`--repository`) or the policy (`--policy`/`B10X_GATES_POLICY`)
+  # is not named; with both named it is `NotConsulted`, whatever the key and scanner.
+  # `Untrusted` covers a file that is not owner-only, a symlink, a directory others can
+  # write, unparsable bytes and a repository that is not `<owner>/<repo>`.
+  # `OtherRepository` is a trusted configuration naming another repository than
+  # `--repository`.
   - name: gates.delivery.InstalledConfiguration
     kind: enum
-    variants: [NotConsulted, Absent, Trusted, Untrusted]
+    variants: [NotConsulted, Absent, Trusted, Untrusted, OtherRepository]
 
 commands:
   - name: gates.delivery.Merge
@@ -316,9 +319,16 @@ commands:
   # `--gitleaks` and `B10X_GATES_GITLEAKS`. A flag or its environment variable always
   # wins. A first install, with no configuration, keeps the defaults under the
   # configuration home for the policy, the key and the scanner.
+  # The configuration is read only when the repository or the policy is not named.
+  # With both named it is not read at all, so a left-behind, unparsable or
+  # not-owner-only configuration never blocks an explicit repair install, and the key
+  # and scanner come from their flag, their environment variable or the defaults under
+  # the configuration home. Its values are used only when the repository it names is
+  # the resolved repository.
   - name: gates.delivery.InstallHooks
     input:
       - {name: repository, type: String}
+      - {name: configured_repository, type: String}
       - {name: configuration, type: gates.delivery.InstalledConfiguration}
       - {name: repository_source, type: gates.delivery.Resolution}
       - {name: policy_source, type: gates.delivery.Resolution}
@@ -329,10 +339,21 @@ commands:
     outcomes:
       # A configuration that is present but untrusted, unparsable or names a
       # repository that is not `<owner>/<repo>` is refused with its cause, never
-      # skipped as if absent.
+      # skipped as if absent. The refusal names the remedy that installs past it:
+      # `pass --repository <owner>/<repo> and --policy <path>`.
       - name: untrusted-configuration
         when: configuration == Untrusted
         error: gates.delivery.UntrustedConfiguration
+      # `--repository` names another repository than the configuration read because
+      # the policy is not named: refused naming both repositories and the remedy,
+      # `--policy <path>` or a reinstall; nothing of the configuration is used.
+      - name: configuration-names-another-repository
+        when: configuration == OtherRepository
+        error: gates.delivery.ConfiguredRepositoryMismatch
+        payload:
+          gates.delivery.ConfiguredRepositoryMismatch:
+            repository: input.repository
+            configured_repository: input.configured_repository
       # No `--repository` and no installed configuration: the refusal names both
       # routes, `--repository <owner>/<repo>` and an installed configuration.
       - name: no-repository
@@ -421,6 +442,10 @@ errors:
     fields: [{name: name, type: String}]
   - name: gates.delivery.UntrustedConfiguration
     fields: [{name: configuration, type: gates.delivery.InstalledConfiguration}]
+  - name: gates.delivery.ConfiguredRepositoryMismatch
+    fields:
+      - {name: repository, type: String}
+      - {name: configured_repository, type: String}
   - name: gates.delivery.PolicyRequired
     fields: []
   - name: gates.delivery.PolicyUnavailable

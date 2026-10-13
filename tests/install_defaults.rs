@@ -311,3 +311,35 @@ fn the_loaded_policy_must_still_enrol_the_configured_repository() {
     let stderr = refused(&f.install(&[], None));
     assert!(stderr.contains("not enrolled"), "{stderr}");
 }
+
+/// `untrusted-configuration`: the refusal of a configuration that is not owner-only
+/// names the remedy that installs past it, as every other untrusted refusal does.
+#[test]
+fn the_not_owner_only_refusal_names_the_remedy() {
+    let f = Fixture::new();
+    f.write_configuration(REPOSITORY, &f.policy(), 0o644);
+    let stderr = refused(&f.install(&[], None));
+    assert!(stderr.contains("0644"), "{stderr}");
+    assert!(
+        stderr.contains("pass --repository <owner>/<repo> and --policy <path>"),
+        "{stderr}"
+    );
+}
+
+/// `configuration-names-another-repository`: with the policy not named, the
+/// configuration is read; when `--repository` names another repository than it does,
+/// install is refused naming both repositories and the remedy, and the configuration
+/// is left as it was.
+#[test]
+fn refuses_a_configuration_naming_another_repository_than_the_flag() {
+    let f = Fixture::new();
+    let shared = f.write_policy("shared.json", &[REPOSITORY, "example/other"]);
+    f.write_configuration("example/other", &shared, 0o600);
+    let before = fs::read(f.configuration_path()).unwrap();
+    let stderr = refused(&f.install(&["--repository", REPOSITORY], None));
+    assert!(stderr.contains(REPOSITORY), "{stderr}");
+    assert!(stderr.contains("example/other"), "{stderr}");
+    assert!(stderr.contains("--policy <path>"), "{stderr}");
+    assert!(stderr.contains("reinstall"), "{stderr}");
+    assert_eq!(fs::read(f.configuration_path()).unwrap(), before);
+}
