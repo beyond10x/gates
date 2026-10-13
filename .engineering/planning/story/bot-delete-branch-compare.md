@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:bot-delete-branch-compare
 kind: story
-status: active
+status: implemented
 title: delete-branch reads the comparison through a path the API client admits
 scope:
 - confidence: inferred
@@ -11,10 +11,11 @@ scope:
   path: src/delivery.rs
 - confidence: inferred
   path: tests/bot_delete_branch.rs
-revision: 6
+revision: 7
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T18:25:13Z", actor: "human:timo", revision: 5}
 - {from: "proposed", to: "active", at: "2026-10-13T18:25:13Z", actor: "human:timo", revision: 6}
+- {from: "active", to: "implemented", at: "2026-10-13T19:05:51Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":2,"review_outcome":2}}}
 ---
 ## Problem
 

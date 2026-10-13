@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:install-from-installed-config
 kind: story
-status: active
+status: implemented
 title: install reuses the installed repository and policy when no flag names them
 scope:
 - confidence: inferred
@@ -15,10 +15,11 @@ scope:
   path: src/main.rs
 - confidence: inferred
   path: tests/install_defaults.rs
-revision: 8
+revision: 9
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T18:25:13Z", actor: "human:timo", revision: 7}
 - {from: "proposed", to: "active", at: "2026-10-13T18:25:13Z", actor: "human:timo", revision: 8}
+- {from: "active", to: "implemented", at: "2026-10-13T19:05:51Z", actor: "human:timo", revision: 9, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 ## Problem
 

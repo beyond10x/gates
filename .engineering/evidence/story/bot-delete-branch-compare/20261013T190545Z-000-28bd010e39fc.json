@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-13T19:05:45Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-delete-branch-compare",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "x",
+    "reference": "1a27f4c"
+  }
+}
