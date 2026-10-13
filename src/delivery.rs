@@ -84,9 +84,9 @@ impl RemoteBranches for Github {
 }
 
 /// `gates.delivery.DeleteBranch` after the argument check: refuse the default branch,
-/// an unknown branch, a protected or ruleset-protected branch, a tip that is not an
-/// ancestor of the default branch and a tip that moved, then DELETE
-/// `refs/heads/<branch>` and nothing else.
+/// an unknown branch, a branch with classic protection enabled or a ruleset beyond the
+/// bot-authority rules, a tip that is not an ancestor of the default branch and a tip
+/// that moved, then DELETE `refs/heads/<branch>` and nothing else.
 /// Returns the line to print. Every segment of every path is percent-encoded, so no
 /// name can change which resource is read or deleted.
 pub fn delete_remote_branch(
@@ -144,8 +144,14 @@ pub fn delete_remote_branch(
             .as_str()
             .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .with_context(|| format!("bot delete-branch: GitHub named no tip for `{branch}`"))?;
-        let protected = answer["protected"].as_bool().with_context(|| {
-            format!("bot delete-branch: GitHub did not say whether `{branch}` is protected")
+        // Classic branch protection is `protection.enabled`. The top-level `protected`
+        // is true for every branch any ruleset covers, the bot-authority ruleset
+        // included, so it never decides; rulesets are judged by `rulesets` below.
+        let protected = answer["protection"]["enabled"].as_bool().with_context(|| {
+            format!(
+                "bot delete-branch: GitHub did not say whether classic branch protection is \
+                 enabled on `{branch}` (no boolean `protection.enabled` in the branch answer)"
+            )
         })?;
         Ok((sha.to_ascii_lowercase(), protected))
     };
@@ -220,8 +226,8 @@ const ADMITTED_RULES: [&str; 9] = [
 /// The page size asked of `rules/branches`; a full page may hide another and is refused.
 const RULES_PAGE: usize = 100;
 
-/// `gates.delivery.DeleteBranch`'s ruleset refusals. `protected` reports only classic
-/// branch protection, and the App bypasses the rulesets, so they are read here: an
+/// `gates.delivery.DeleteBranch`'s ruleset refusals. `protection.enabled` reports only
+/// classic branch protection, and the App bypasses the rulesets, so they are read here: an
 /// answer that is not a JSON array, a rule type outside `ADMITTED_RULES`, or more than
 /// the one `deletion` rule the bot-authority ruleset carries is refused.
 fn rulesets(answer: Option<Value>, branch: &str, repository: &str) -> Result<()> {

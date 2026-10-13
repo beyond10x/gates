@@ -225,12 +225,18 @@ fn execute(args: Args) -> Result<()> {
         return Ok(());
     }
     if let Action::Bot { args: command } = &args.command {
+        // `delete-branch` reads its repository from `--repository` or the installed
+        // hooks' configuration, before the check and before any credential is minted.
+        let repository = if command.first().is_some_and(|verb| verb == "delete-branch") {
+            b10x_gates::bot_args::delete_branch_repository(&args.repo, args.repository.as_deref())?
+        } else {
+            args.repository.clone()
+        };
         // Refuse an unsupported operation before any credential is minted.
-        b10x_gates::bot_args::check(command, args.repository.as_deref())?;
+        b10x_gates::bot_args::check(command, repository.as_deref())?;
         if command.first().is_some_and(|verb| verb == "delete-branch") {
             // The REST API as the App, never Git; the shape was refused above.
-            let deletion =
-                b10x_gates::bot_args::delete_branch(command, args.repository.as_deref())?;
+            let deletion = b10x_gates::bot_args::delete_branch(command, repository.as_deref())?;
             println!(
                 "{}",
                 delivery::delete_remote_branch(&Github::bot()?, &deletion)?

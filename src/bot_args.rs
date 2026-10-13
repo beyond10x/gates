@@ -5,6 +5,7 @@
 //! route in the text, so an agent does not have to find it alone. `Github::git` runs
 //! this same check again, so the two cannot drift.
 use anyhow::{Result, bail};
+use std::path::Path;
 
 const SUPPORTED: &str = "bot Git command must be commit, tag, push, fetch, merge or revert, \
                          or the API verb delete-branch";
@@ -418,16 +419,18 @@ pub struct BranchDeletion {
 }
 
 /// The argument shape and name refusals of `gates.delivery.DeleteBranch`, all before
-/// any credential is minted: `--repository` given and well-formed, no option, exactly
-/// one branch, and a name that is a branch and nothing else.
+/// any credential is minted: a repository resolved (`delete_branch_repository`) and
+/// well-formed, no option, exactly one branch, and a name that is a branch and nothing
+/// else.
 pub fn delete_branch(args: &[String], repository: Option<&str>) -> Result<BranchDeletion> {
     if args.first().map(String::as_str) != Some("delete-branch") {
         bail!("{SUPPORTED}");
     }
     let Some(repository) = repository else {
         bail!(
-            "bot delete-branch needs --repository <owner>/<repo>: run \
-             `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`"
+            "bot delete-branch needs a repository: pass --repository <owner>/<repo> \
+             (`b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`), or \
+             run `b10x-gates install` in the repository so its hooks' configuration names it"
         );
     };
     if !repository_shaped(repository) {
@@ -449,6 +452,44 @@ pub fn delete_branch(args: &[String], repository: Option<&str>) -> Result<Branch
         repository: repository.to_string(),
         branch,
     })
+}
+
+/// The repository `delete-branch` deletes in, resolved before any credential is
+/// minted: `--repository` when given, else the `repository` of the installed hooks'
+/// protected configuration (`<git common dir>/b10x-gates-hooks/config.json`), as the
+/// hooks read it for `commit` and `push`. `None` when neither exists, which
+/// `delete_branch` refuses naming both routes. A configuration that is present but
+/// untrusted, unparsable or not `<owner>/<repo>` is refused with its cause.
+pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Option<String>> {
+    if let Some(flag) = flag {
+        return Ok(Some(flag.to_string()));
+    }
+    // Not a repository (or one Git refuses to read): nothing is installed to read.
+    let Ok(git) = crate::git::Git::new(root) else {
+        return Ok(None);
+    };
+    let config = crate::hooks::directory(&git)?.join("config.json");
+    match std::fs::symlink_metadata(&config) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+    let installed: crate::hooks::Config =
+        serde_json::from_slice(&crate::policy::protected_read(&config)?).map_err(|_| {
+            anyhow::anyhow!(
+                "bot delete-branch: installed hook configuration {} is invalid; pass \
+                 --repository <owner>/<repo> or run `b10x-gates install` in the repository",
+                config.display()
+            )
+        })?;
+    if !repository_shaped(&installed.repository) {
+        bail!(
+            "bot delete-branch: installed hook configuration {} names the repository `{}`, \
+             not <owner>/<repo>; pass --repository <owner>/<repo>",
+            config.display(),
+            installed.repository.escape_debug()
+        );
+    }
+    Ok(Some(installed.repository))
 }
 
 /// `<owner>/<repo>`: two non-empty segments of ASCII letters, digits, `-`, `_` and `.`,

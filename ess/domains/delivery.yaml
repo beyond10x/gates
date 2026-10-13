@@ -12,14 +12,19 @@ summary: >-
   ancestry with the default branch.
 
 entities:
-  # A branch on the GitHub remote, as the App reads it: its tip, whether a branch
-  # protection rule covers it and whether it is the repository's default branch.
-  # `delete-branch` is the only way the bot removes one, and only once its tip is
-  # an ancestor of the default branch, so no commit becomes unreachable.
+  # A branch on the GitHub remote, as the App reads it: its tip, whether classic
+  # branch protection is enabled on it and whether it is the repository's default
+  # branch. `delete-branch` is the only way the bot removes one, and only once its
+  # tip is an ancestor of the default branch, so no commit becomes unreachable.
   - name: gates.delivery.RemoteBranch
     identity: {name: name, type: String}
     fields:
       - {name: tip, type: String}
+      # Classic branch protection enabled: the branch answer's `protection.enabled`,
+      # a JSON boolean; an answer without one is refused. Not the answer's top-level
+      # `protected`, which GitHub sets for a branch under any ruleset, the
+      # bot-authority ruleset included; rulesets are judged by `ruled-branch` and
+      # `deletion-restricted`.
       - {name: protected, type: Boolean}
       - {name: default, type: Boolean}
     lifecycle:
@@ -175,16 +180,21 @@ commands:
       - {name: argument_count, type: Integer}
       - {name: forbidden_options, type: 'List<String>'}
       - {name: name_problems, type: 'List<String>'}
-      - {name: repository_given, type: Boolean}
+      - {name: repository_resolved, type: Boolean}
       - {name: ancestry, type: gates.delivery.Ancestry}
       - {name: rules_readable, type: Boolean}
       - {name: unadmitted_rules, type: 'List<String>'}
       - {name: deletion_rules, type: Integer}
       - {name: current_tip, type: String}
     outcomes:
-      # `--repository <owner>/<repo>` names the remote; without it nothing is read.
+      # The remote is `--repository <owner>/<repo>` when given, else the `repository`
+      # of the installed hooks' protected configuration
+      # (`<git common dir>/b10x-gates-hooks/config.json`), either held to the
+      # `<owner>/<repo>` shape. With neither, nothing is read and no credential is
+      # minted; the refusal names both routes: `--repository <owner>/<repo>`, or
+      # `b10x-gates install` in the repository.
       - name: no-repository
-        when: repository_given == false
+        when: repository_resolved == false
         error: gates.delivery.RepositoryRequired
       # No option at all (`--force`, `-f`, `--`): the verb takes exactly one branch.
       - name: options-given
@@ -215,8 +225,8 @@ commands:
         when: ancestry == Diverged
         error: gates.delivery.Unmerged
       # `GET /repos/<repo>/rules/branches/<branch>`: the rulesets that apply to the
-      # branch, which the `protected` field does not report and which the App, as a
-      # bypass actor, would pass. An answer that is not a JSON array (or a 404) says
+      # branch, which classic protection (`protected`) does not cover and which the
+      # App, as a bypass actor, would pass. An answer that is not a JSON array (or a 404) says
       # nothing, so it is refused.
       - name: rules-unreadable
         when: rules_readable == false

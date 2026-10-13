@@ -1,11 +1,13 @@
-//! `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>` deletes a
+//! `b10x-gates bot [--repository <owner>/<repo>] -- delete-branch <branch>` deletes a
 //! remote branch through the REST API as the App, only when its tip is an ancestor of
-//! the default branch (`story:bot-delete-branch`, modelled as
-//! `gates.delivery.DeleteBranch` in `ess/domains/delivery.yaml`). Each test is named
+//! the default branch (`story:bot-delete-branch` and
+//! `story:bot-delete-branch-defaults`, modelled as `gates.delivery.DeleteBranch` in
+//! `ess/domains/delivery.yaml`). Without `--repository` the repository is the
+//! installed hooks' configuration's. Each test is named
 //! after the outcome it holds the implementation to. GitHub is a fake behind
 //! `delivery::RemoteBranches`, so no credential is ever minted.
 use b10x_gates::{
-    bot_args::{check, delete_branch},
+    bot_args::{check, delete_branch, delete_branch_repository},
     delivery::{RemoteBranches, bot_git, delete_remote_branch},
 };
 use serde_json::{Value, json};
@@ -133,8 +135,16 @@ fn ruled(rules: Option<Value>) -> Fake {
         .answer(&rules_path("wave/one"), rules)
 }
 
+/// A branch answer as GitHub gives it under the organization's bot-authority ruleset:
+/// `protected` is true for every branch a ruleset covers, so only
+/// `protection.enabled` says whether classic branch protection is on.
 fn branch(name: &str, tip: &str, protected: bool) -> Value {
-    json!({"name": name, "protected": protected, "commit": {"sha": tip}})
+    json!({
+        "name": name,
+        "protected": true,
+        "protection": {"enabled": protected, "required_status_checks": {"enforcement_level": "off"}},
+        "commit": {"sha": tip}
+    })
 }
 
 fn deletion(branch: &str) -> b10x_gates::bot_args::BranchDeletion {
@@ -232,6 +242,76 @@ fn refuses_a_protected_branch() {
     let text = refused(&fake, "release");
     assert!(text.contains("protected"), "{text}");
     assert!(text.contains("`release`"), "{text}");
+    // Classic protection is decided by `protection.enabled`, whatever `protected` says.
+    let fake = Fake::default()
+        .answer(
+            "/repos/example/sample",
+            Some(json!({"default_branch": "main"})),
+        )
+        .answer(
+            "/repos/example/sample/branches/release",
+            Some(json!({
+                "name": "release",
+                "protected": false,
+                "protection": {"enabled": true},
+                "commit": {"sha": TIP}
+            })),
+        );
+    let text = refused(&fake, "release");
+    assert!(text.contains("protected branch `release`"), "{text}");
+}
+
+/// `protected` is true for every branch a ruleset covers (observed on beyond10x/gates,
+/// where `GET /branches/<b>/protection` answered 404 for each of them): a merged
+/// branch with classic protection off and only the bot-authority rules is deleted.
+#[test]
+fn deletes_a_merged_branch_under_the_bot_authority_ruleset() {
+    let fake = ruled(Some(bot_authority()));
+    let printed = delete_remote_branch(&fake, &deletion("wave/one")).unwrap_or_else(|e| {
+        panic!("a ruleset-only branch with protection.enabled false was refused: {e:#}")
+    });
+    assert_eq!(printed, format!("deleted wave/one at {TIP}"));
+    assert_eq!(
+        *fake.deletes.borrow(),
+        vec!["/repos/example/sample/git/refs/heads/wave/one".to_string()]
+    );
+}
+
+/// A branch answer that does not say, as a JSON boolean, whether classic protection is
+/// enabled is refused and names `protection.enabled`; `protected` never stands in.
+#[test]
+fn refuses_a_branch_without_protection_enabled() {
+    for answer in [
+        json!({"name": "wave/one", "protected": false, "commit": {"sha": TIP}}),
+        json!({"name": "wave/one", "protected": true, "commit": {"sha": TIP}}),
+        json!({"name": "wave/one", "protected": false, "protection": {}, "commit": {"sha": TIP}}),
+        json!({"name": "wave/one", "protected": false, "protection": null, "commit": {"sha": TIP}}),
+        json!({
+            "name": "wave/one",
+            "protected": false,
+            "protection": {"enabled": "false"},
+            "commit": {"sha": TIP}
+        }),
+        json!({
+            "name": "wave/one",
+            "protected": false,
+            "protection": {"enabled": 0},
+            "commit": {"sha": TIP}
+        }),
+    ] {
+        let fake = Fake::default()
+            .answer(
+                "/repos/example/sample",
+                Some(json!({"default_branch": "main"})),
+            )
+            .answer(
+                "/repos/example/sample/branches/wave/one",
+                Some(answer.clone()),
+            );
+        let text = refused(&fake, "wave/one");
+        assert!(text.contains("protection.enabled"), "{answer}: {text}");
+        assert!(text.contains("`wave/one`"), "{answer}: {text}");
+    }
 }
 
 #[test]
@@ -335,10 +415,101 @@ fn refuses_tag_and_invalid_names() {
     }
 }
 
+/// A fresh repository in a temporary directory, without installed hooks.
+fn repository_without_hooks() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    dir
+}
+
+/// Install a hooks configuration naming `repository` in the repository's common
+/// directory, as `b10x-gates install` writes it: directory 0700, file `mode`.
+fn install_configuration(root: &std::path::Path, repository: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = root.join(".git/b10x-gates-hooks");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({
+            "repository": repository,
+            "policy": "policy.json",
+            "key": "receipt.key",
+            "scanner": "gitleaks",
+            "previous": {},
+            "retired_pre_push_digest": null,
+            "installed_version": "0.0.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Without `--repository`, the repository is the installed hooks' `repository`, as
+/// for `commit` and `push`; an explicit `--repository` still wins.
+#[test]
+fn resolves_the_repository_from_the_installed_configuration() {
+    let dir = repository_without_hooks();
+    install_configuration(dir.path(), REPOSITORY, 0o600);
+    let resolved = delete_branch_repository(dir.path(), None).unwrap();
+    assert_eq!(resolved.as_deref(), Some(REPOSITORY));
+    let parsed = delete_branch(&args("delete-branch wave/one"), resolved.as_deref()).unwrap();
+    assert_eq!(parsed.repository, REPOSITORY);
+    check(&args("delete-branch wave/one"), resolved.as_deref()).unwrap();
+    // The flag wins over the configuration.
+    let flagged = delete_branch_repository(dir.path(), Some("example/other")).unwrap();
+    assert_eq!(flagged.as_deref(), Some("example/other"));
+    // A configuration others can read is not trusted: its cause is named.
+    install_configuration(dir.path(), REPOSITORY, 0o644);
+    let text = format!(
+        "{:#}",
+        delete_branch_repository(dir.path(), None).unwrap_err()
+    );
+    assert!(text.contains("config.json"), "{text}");
+    assert!(text.contains("0644"), "{text}");
+    // A configured repository that is not `<owner>/<repo>` is refused, naming it.
+    install_configuration(dir.path(), "example/../x", 0o600);
+    let text = format!(
+        "{:#}",
+        delete_branch_repository(dir.path(), None).unwrap_err()
+    );
+    assert!(text.contains("example/../x"), "{text}");
+    assert!(text.contains("config.json"), "{text}");
+    // The binary reads the configuration before any bot credential: with the
+    // repository resolved, the first refusal is the absent bot configuration.
+    install_configuration(dir.path(), REPOSITORY, 0o600);
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
+        .arg("--repo")
+        .arg(dir.path())
+        .args(["bot", "--", "delete-branch", "wave/one"])
+        .env("HOME", home.path())
+        .env("B10X_BOT_CONFIG", home.path().join("absent.json"))
+        .env("B10X_BOT_KEY", home.path().join("absent.pem"))
+        .env_remove("B10X_GATES_POLICY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("--repository"), "{stderr}");
+    assert!(stderr.contains("absent.json"), "{stderr}");
+}
+
 #[test]
 fn refuses_without_repository() {
     let text = shape_refusal("delete-branch wave/one", None);
-    assert!(text.contains("--repository"), "{text}");
+    assert!(text.contains("--repository <owner>/<repo>"), "{text}");
+    assert!(text.contains("b10x-gates install"), "{text}");
+    // No flag and no installed configuration: nothing to resolve.
+    let dir = repository_without_hooks();
+    assert_eq!(delete_branch_repository(dir.path(), None).unwrap(), None);
     for repository in [
         "",
         "example",
@@ -350,10 +521,13 @@ fn refuses_without_repository() {
         let text = shape_refusal("delete-branch wave/one", Some(repository));
         assert!(text.contains("--repository"), "{repository:?}: {text}");
     }
-    // The binary refuses before it reads any bot configuration or mints a token.
+    // The binary refuses before it reads any bot configuration or mints a token. A
+    // repository without installed hooks: this checkout may have them installed.
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_b10x-gates"))
-        .args(["--repo", ".", "bot", "--", "delete-branch", "wave/one"])
+        .arg("--repo")
+        .arg(dir.path())
+        .args(["bot", "--", "delete-branch", "wave/one"])
         .env("HOME", home.path())
         .env("B10X_BOT_CONFIG", home.path().join("absent.json"))
         .env("B10X_BOT_KEY", home.path().join("absent.pem"))
@@ -363,6 +537,7 @@ fn refuses_without_repository() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--repository"), "{stderr}");
+    assert!(stderr.contains("b10x-gates install"), "{stderr}");
 }
 
 #[test]
