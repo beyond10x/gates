@@ -490,13 +490,17 @@ pub fn installed_configuration(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         _ => {}
     }
-    let installed: crate::hooks::Config =
-        serde_json::from_slice(&crate::policy::protected_read(&config)?).map_err(|_| {
-            anyhow::anyhow!(
-                "{verb}: installed hook configuration {} is invalid; {remedy}",
-                config.display()
-            )
-        })?;
+    let bytes = crate::policy::protected_read(&config).map_err(|error| {
+        anyhow::anyhow!(
+            "{verb}: installed hook configuration cannot be trusted: {error:#}; {remedy}"
+        )
+    })?;
+    let installed: crate::hooks::Config = serde_json::from_slice(&bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "{verb}: installed hook configuration {} is invalid; {remedy}",
+            config.display()
+        )
+    })?;
     if !repository_shaped(&installed.repository) {
         bail!(
             "{verb}: installed hook configuration {} names the repository `{}`, \

@@ -373,13 +373,11 @@ fn execute(args: Args) -> Result<()> {
     {
         // `gates.delivery.InstallHooks`: a flag or its environment variable wins; a
         // reinstall takes what is missing from the installed hooks' configuration; a
-        // first install keeps the defaults under the configuration home.
+        // first install keeps the defaults under the configuration home. The
+        // configuration is read only when the repository or the policy is not named,
+        // so naming both always installs past a left-behind or untrusted one.
         let root = policy::root()?;
-        let installed = if args.repository.is_none()
-            || args.policy.is_none()
-            || args.key.is_none()
-            || args.gitleaks.is_none()
-        {
+        let installed = if args.repository.is_none() || args.policy.is_none() {
             b10x_gates::bot_args::installed_configuration(
                 &args.repo,
                 "install",
@@ -388,6 +386,18 @@ fn execute(args: Args) -> Result<()> {
         } else {
             None
         };
+        if let (Some(named), Some(config)) = (&args.repository, &installed)
+            && *named != config.repository
+        {
+            bail!(
+                "install: --repository names {named}, but the installed hook configuration \
+                 (<git common dir>/b10x-gates-hooks/config.json) names {}; its policy, key \
+                 and scanner are trusted only for that repository: pass --policy <path> to \
+                 install for {named}, or reinstall for {} without --repository",
+                config.repository,
+                config.repository
+            );
+        }
         let Some(repository) = args
             .repository
             .or_else(|| installed.as_ref().map(|c| c.repository.clone()))
