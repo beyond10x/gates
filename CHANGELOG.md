@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.1.18 — unreleased
+## 0.1.19 — unreleased
+
+- `bot -- delete-branch` reads the comparison of the branch tip with the default branch again.
+  0.1.18 built `compare/<tip>...<default>`, which the API client's `..` path guard refuses, so
+  every merged branch was refused with "invalid GitHub API path". The separator is now sent
+  percent-encoded; the guard is unchanged, and the delete-branch test doubles apply it.
+- A comparison GitHub cannot answer is refused and nothing is deleted
+  (`comparison-unreadable`).
+- `install` without `--repository` or `--policy` reinstalls from the installed hooks'
+  `config.json`: repository, policy, key and scanner, each only when no flag or `B10X_GATES_*`
+  names it. The file is read through the owner-only checks, and only for the repository it
+  names; a `--repository` naming another one is refused with both names. With both
+  `--repository` and `--policy` named, the file is not read, so a left-behind or damaged
+  configuration never blocks an explicit repair install.
+
+## 0.1.18 — 2026-10-13
 
 - `bot -- delete-branch <branch>` runs without `--repository`: the repository comes from the
   installed hooks' protected `config.json`, as for the other bot verbs. An explicit
