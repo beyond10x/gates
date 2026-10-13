@@ -464,7 +464,25 @@ pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Optio
     if let Some(flag) = flag {
         return Ok(Some(flag.to_string()));
     }
-    let Some(common) = common_directory(root)? else {
+    Ok(installed_configuration(
+        root,
+        "bot delete-branch",
+        "pass --repository <owner>/<repo> or run `b10x-gates install` in the repository",
+    )?
+    .map(|installed| installed.repository))
+}
+
+/// The installed hooks' protected configuration (`<git common dir>/b10x-gates-hooks/
+/// config.json`), read as the hooks read it. `None` when the directory is no
+/// repository or no configuration is installed. A configuration that is present but
+/// untrusted, unparsable or whose repository is not `<owner>/<repo>` is refused with
+/// its cause; every refusal is prefixed with `verb` and ends with `remedy`.
+pub fn installed_configuration(
+    root: &Path,
+    verb: &str,
+    remedy: &str,
+) -> Result<Option<crate::hooks::Config>> {
+    let Some(common) = common_directory(root, verb, remedy)? else {
         return Ok(None);
     };
     let config = common.join(crate::hooks::DIRECTORY).join("config.json");
@@ -475,20 +493,19 @@ pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Optio
     let installed: crate::hooks::Config =
         serde_json::from_slice(&crate::policy::protected_read(&config)?).map_err(|_| {
             anyhow::anyhow!(
-                "bot delete-branch: installed hook configuration {} is invalid; pass \
-                 --repository <owner>/<repo> or run `b10x-gates install` in the repository",
+                "{verb}: installed hook configuration {} is invalid; {remedy}",
                 config.display()
             )
         })?;
     if !repository_shaped(&installed.repository) {
         bail!(
-            "bot delete-branch: installed hook configuration {} names the repository `{}`, \
-             not <owner>/<repo>; pass --repository <owner>/<repo>",
+            "{verb}: installed hook configuration {} names the repository `{}`, \
+             not <owner>/<repo>; {remedy}",
             config.display(),
             installed.repository.escape_debug()
         );
     }
-    Ok(Some(installed.repository))
+    Ok(Some(installed))
 }
 
 /// The Git common directory of `root`, located the way `hooks::directory` locates it but
@@ -496,7 +513,7 @@ pub fn delete_branch_repository(root: &Path, flag: Option<&str>) -> Result<Optio
 /// hooks installed, and reading where they live proves no history. `None` only when Git
 /// says `root` is not a repository; any other failure is refused with its exit status
 /// (Git's own stderr may carry path bytes and is not echoed).
-fn common_directory(root: &Path) -> Result<Option<PathBuf>> {
+fn common_directory(root: &Path, verb: &str, remedy: &str) -> Result<Option<PathBuf>> {
     let git = crate::git::Git {
         root: root.to_path_buf(),
     };
@@ -505,14 +522,14 @@ fn common_directory(root: &Path) -> Result<Option<PathBuf>> {
         .env("LC_ALL", "C")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
-        .context("bot delete-branch: Git could not start to locate the repository")?;
+        .with_context(|| format!("{verb}: Git could not start to locate the repository"))?;
     if !output.status.success() {
         if output.stderr.starts_with(b"fatal: not a git repository") {
             return Ok(None);
         }
         bail!(
-            "bot delete-branch: Git could not locate the repository at {} ({}), so its \
-             installed hook configuration cannot be read; pass --repository <owner>/<repo>",
+            "{verb}: Git could not locate the repository at {} ({}), so its \
+             installed hook configuration cannot be read; {remedy}",
             root.display(),
             output
                 .status
@@ -521,7 +538,7 @@ fn common_directory(root: &Path) -> Result<Option<PathBuf>> {
         );
     }
     let common = String::from_utf8(output.stdout)
-        .context("bot delete-branch: the Git common directory is not UTF-8")?;
+        .with_context(|| format!("{verb}: the Git common directory is not UTF-8"))?;
     Ok(Some(PathBuf::from(common.trim_end_matches('\n'))))
 }
 
