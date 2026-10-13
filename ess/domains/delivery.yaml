@@ -383,7 +383,45 @@ commands:
           gates.delivery.HooksInstalled:
             repository: input.repository
 
+  # `b10x-gates scan-artifact <file>`, run on every release executable before it is
+  # published. The file is parsed, never executed. `static` is true when the ELF has
+  # no `PT_INTERP` program header; `name_service_switch` is true when its bytes hold
+  # glibc's NSS loader (`nsswitch.conf`). A statically linked glibc resolves names by
+  # loading `libnss_*.so` at run time; on a host whose `hosts:` line names a module
+  # such as `resolve`, the second lookup crashes the process (SIGSEGV), so every verb
+  # that makes two GitHub requests dies silently. The release target is
+  # `x86_64-unknown-linux-musl`, whose resolver loads nothing.
+  - name: gates.delivery.ValidateArtifact
+    input:
+      - {name: format_supported, type: Boolean}
+      - {name: static, type: Boolean}
+      - {name: name_service_switch, type: Boolean}
+      - {name: private_rules, type: Integer}
+      - {name: secrets, type: Integer}
+    outcomes:
+      # Anything but a bounded, well-formed ELF64 little-endian ET_EXEC or ET_DYN.
+      - name: format-unsupported
+        when: format_supported == false
+        error: gates.delivery.ArtifactFormatUnsupported
+      # Refused before any scanner runs; the error names the musl target.
+      - name: static-name-service
+        when: {all: [static == true, name_service_switch == true]}
+        error: gates.delivery.StaticNameService
+      - name: private-rule
+        when: private_rules > 0
+        error: gates.delivery.ArtifactPrivateRule
+      - name: secret
+        when: secrets > 0
+        error: gates.delivery.ArtifactSecret
+      - name: validated
+        emits: [gates.delivery.ArtifactValidated]
+        payload:
+          gates.delivery.ArtifactValidated:
+            static: input.static
+
 events:
+  - name: gates.delivery.ArtifactValidated
+    fields: [{name: static, type: Boolean}]
   - name: gates.delivery.BranchDeleted
     fields: [{name: name, type: String}, {name: tip, type: String}]
   - name: gates.delivery.BotCommitted
@@ -452,3 +490,11 @@ errors:
     fields: [{name: policy_loaded, type: Boolean}]
   - name: gates.delivery.RepositoryNotEnrolled
     fields: [{name: repository, type: String}]
+  - name: gates.delivery.ArtifactFormatUnsupported
+    fields: [{name: format_supported, type: Boolean}]
+  - name: gates.delivery.StaticNameService
+    fields: [{name: name_service_switch, type: Boolean}]
+  - name: gates.delivery.ArtifactPrivateRule
+    fields: [{name: private_rules, type: Integer}]
+  - name: gates.delivery.ArtifactSecret
+    fields: [{name: secrets, type: Integer}]

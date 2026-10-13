@@ -24,6 +24,9 @@ const MAX_SEGMENTS: usize = 4_096;
 const MAX_EXTRACTED_BYTES: usize = 256 * 1024 * 1024;
 const SHF_EXECINSTR: u64 = 0x4;
 const SHF_COMPRESSED: u64 = 0x800;
+/// glibc's name service switch configuration, which only a glibc that loads NSS modules
+/// carries; musl's resolver reads `/etc/hosts` and DNS itself.
+const NAME_SERVICE_SWITCH: &[u8] = b"nsswitch.conf";
 
 /// The successful validation facts safe to publish with a release artifact.
 pub struct Report {
@@ -136,6 +139,17 @@ fn extract(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize)> {
             .data(file.endian(), bytes)
             .map_err(|()| anyhow::anyhow!("artifact segment range invalid"))?;
     }
+    // `gates.delivery.ValidateArtifact`, `static-name-service`: a static glibc resolves
+    // names by loading the host's `libnss_*` modules, and 0.1.19 faulted on its second
+    // GitHub request that way. Refused before any scanner runs.
+    let interpreted = program_headers
+        .iter()
+        .any(|header| header.p_type(file.endian()) == object::elf::PT_INTERP);
+    ensure!(
+        interpreted || !contains(bytes, NAME_SERVICE_SWITCH),
+        "artifact is statically linked against glibc's name service switch, which crashes on \
+         name lookups; build the release for x86_64-unknown-linux-musl"
+    );
 
     let mut privacy = Vec::new();
     let mut meaningful = Vec::new();
@@ -234,6 +248,12 @@ fn printable(bytes: &[u8], minimum: usize, output: &mut Vec<u8>) -> Result<()> {
         start = end.saturating_add(1);
     }
     Ok(())
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn printable_byte(byte: u8) -> bool {

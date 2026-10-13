@@ -382,3 +382,37 @@ fn every_program_header_file_range_is_validated_before_scanning() {
         assert!(!stderr(&output).contains("pinned Gitleaks binary unavailable"));
     }
 }
+
+/// `gates.delivery.ValidateArtifact`, outcome `static-name-service`: a statically linked
+/// glibc loads the host's `libnss_*` modules to resolve a name and crashed 0.1.19 on its
+/// second GitHub request. Such an executable is refused before any scanner runs.
+#[test]
+fn a_static_executable_carrying_glibc_name_service_switch_is_refused_before_scanning() {
+    let fixture = Fixture::new("xyz");
+    let bytes = elf64(b"\x90\x90", b"/etc/nsswitch.conf\0libnss_\0");
+    let artifact = fixture.write("static-glibc", &bytes);
+    let output = fixture.run_with_scanner(&artifact, Path::new("missing-scanner"));
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let refusal = stderr(&output);
+    assert!(
+        refusal.contains("statically linked") && refusal.contains("x86_64-unknown-linux-musl"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_dynamic_executable_or_a_static_one_without_name_service_switch_is_not_refused_by_it() {
+    let fixture = Fixture::new("xyz");
+    let dynamic = with_program_header(
+        elf64(b"\x90\x90", b"/etc/nsswitch.conf\0safe metadata\n"),
+        object::elf::PT_INTERP.0,
+        0,
+        16,
+    );
+    let musl = elf64(b"\x90\x90", b"safe release metadata\n");
+    for (name, bytes) in [("dynamic-glibc", dynamic), ("static-musl", musl)] {
+        let artifact = fixture.write(name, &bytes);
+        let output = fixture.run(&artifact);
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+    }
+}
