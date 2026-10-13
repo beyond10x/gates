@@ -6,7 +6,7 @@
 //! `delivery::RemoteBranches`, so no credential is ever minted.
 use b10x_gates::{
     bot_args::{delete_branch, delete_branch_repository},
-    delivery::{RemoteBranches, delete_remote_branch},
+    delivery::{RemoteBranches, api_path_admitted, delete_remote_branch},
 };
 use serde_json::{Value, json};
 use std::{
@@ -24,6 +24,8 @@ struct Fake {
 
 impl RemoteBranches for Fake {
     fn read(&self, path: &str) -> anyhow::Result<Option<Value>> {
+        // The real client's path guard: a path `Github::api_response` refuses is refused here.
+        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
         Ok(self
             .answers
             .get(path)
@@ -32,6 +34,7 @@ impl RemoteBranches for Fake {
     }
 
     fn delete(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
         self.deletes.borrow_mut().push(path.to_string());
         Ok(())
     }
@@ -79,7 +82,7 @@ fn merged_branch(rules: Vec<Value>) -> Fake {
         })),
     );
     answers.insert(
-        format!("/repos/example/sample/compare/{TIP}...main"),
+        format!("/repos/example/sample/compare/{TIP}%2E%2E%2Emain"),
         Some(json!({"status": "ahead", "merge_base_commit": {"sha": TIP}})),
     );
     answers.insert(

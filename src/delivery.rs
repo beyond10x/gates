@@ -160,8 +160,9 @@ pub fn delete_remote_branch(
     if protected {
         bail!("bot delete-branch refuses the protected branch `{branch}` of {repository}");
     }
+    // The `...` separator is percent-encoded: `api_response` refuses any path holding `..`.
     let comparison = read(
-        &format!("{repo_path}/compare/{first}...{}", encoded(&default)),
+        &format!("{repo_path}/compare/{first}%2E%2E%2E{}", encoded(&default)),
         "the comparison with the default branch",
     )?
     .with_context(|| {
@@ -339,6 +340,13 @@ fn rulesets(answer: Option<Value>, branch: &str, repository: &str) -> Result<()>
     Ok(())
 }
 
+/// The path guard `Github::api_response` applies before sending anything: an absolute
+/// path with no `..` and no `#`. Public so a test double refuses exactly what the real
+/// client refuses.
+pub fn api_path_admitted(path: &str) -> bool {
+    path.starts_with('/') && !path.contains("..") && !path.contains('#')
+}
+
 impl Github {
     pub fn gh(&self, root: &Path, args: &[String]) -> Result<()> {
         const SUPPORTED: [&str; 6] = ["release", "pr", "run", "workflow", "api", "repo"];
@@ -447,10 +455,7 @@ impl Github {
         path: &str,
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
-        ensure!(
-            path.starts_with('/') && !path.contains("..") && !path.contains('#'),
-            "invalid GitHub API path"
-        );
+        ensure!(api_path_admitted(path), "invalid GitHub API path");
         let mut request = self
             .client
             .request(method, format!("https://api.github.com{path}"))

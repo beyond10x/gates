@@ -181,6 +181,7 @@ commands:
       - {name: forbidden_options, type: 'List<String>'}
       - {name: name_problems, type: 'List<String>'}
       - {name: repository_resolved, type: Boolean}
+      - {name: comparison_readable, type: Boolean}
       - {name: ancestry, type: gates.delivery.Ancestry}
       - {name: rules_readable, type: Boolean}
       - {name: unadmitted_rules, type: 'List<String>'}
@@ -223,6 +224,10 @@ commands:
         when_subject:
           predicate: protected == true
         error: gates.delivery.ProtectedBranch
+      # The comparison is read through a path the API client's guard admits.
+      - name: comparison-unreadable
+        when: comparison_readable == false
+        error: gates.delivery.ComparisonUnreadable
       # Deleting an unmerged tip would make its commits unreachable on the remote.
       - name: unmerged
         when: ancestry == Behind
@@ -311,6 +316,8 @@ errors:
     fields: [{name: merge_heads, type: Integer}]
   - name: gates.delivery.StagedChanges
     fields: [{name: index_differs, type: Boolean}]
+  - name: gates.delivery.ComparisonUnreadable
+    fields: [{name: name, type: String}]
   - name: gates.delivery.RulesUnreadable
     fields: [{name: name, type: String}]
   - name: gates.delivery.RuledBranch
