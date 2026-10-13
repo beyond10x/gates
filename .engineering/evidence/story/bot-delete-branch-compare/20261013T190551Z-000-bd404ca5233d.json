@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-13T19:05:51Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-delete-branch-compare",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo fmt --all --check, cargo clippy --all-targets --locked -- -D warnings, cargo test --locked --no-fail-fast on 1a27f4c: 353 passed, 0 failed, 6 ignored",
+    "reference": "1a27f4c"
+  }
+}

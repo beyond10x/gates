@@ -8,7 +8,7 @@
 //! `delivery::RemoteBranches`, so no credential is ever minted.
 use b10x_gates::{
     bot_args::{check, delete_branch, delete_branch_repository},
-    delivery::{RemoteBranches, bot_git, delete_remote_branch},
+    delivery::{RemoteBranches, api_path_admitted, bot_git, delete_remote_branch},
 };
 use serde_json::{Value, json};
 use std::{
@@ -63,10 +63,7 @@ impl Fake {
                 &format!("/repos/example/sample/branches/{encoded}"),
                 Some(branch(name, TIP, false)),
             )
-            .answer(
-                &format!("/repos/example/sample/compare/{TIP}...main"),
-                Some(comparison),
-            )
+            .answer(&compare_path(), Some(comparison))
             .answer(&rules_path(encoded), Some(bot_authority()))
     }
 }
@@ -74,6 +71,7 @@ impl Fake {
 impl RemoteBranches for Fake {
     fn read(&self, path: &str) -> anyhow::Result<Option<Value>> {
         self.reads.borrow_mut().push(path.to_string());
+        guard(path)?;
         let mut answers = self.answers.borrow_mut();
         let queue = answers
             .get_mut(path)
@@ -87,8 +85,21 @@ impl RemoteBranches for Fake {
 
     fn delete(&self, path: &str) -> anyhow::Result<()> {
         self.deletes.borrow_mut().push(path.to_string());
+        guard(path)?;
         Ok(())
     }
+}
+
+/// The real client's path guard: a path `Github::api_response` refuses is refused here.
+fn guard(path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
+    Ok(())
+}
+
+/// The comparison of `TIP` with `main`, its `...` separator percent-encoded so the
+/// client's `..` guard admits it.
+fn compare_path() -> String {
+    format!("/repos/example/sample/compare/{TIP}%2E%2E%2Emain")
 }
 
 fn rules_path(encoded: &str) -> String {
@@ -129,7 +140,7 @@ fn ruled(rules: Option<Value>) -> Fake {
             Some(branch("wave/one", TIP, false)),
         )
         .answer(
-            &format!("/repos/example/sample/compare/{TIP}...main"),
+            &compare_path(),
             Some(json!({"status": "ahead", "merge_base_commit": {"sha": TIP}})),
         )
         .answer(&rules_path("wave/one"), rules)
@@ -333,6 +344,68 @@ fn refuses_an_unmerged_branch() {
         let text = refused(&fake, "wave/one");
         assert!(text.contains("not merged"), "{comparison}: {text}");
     }
+}
+
+/// `story:bot-delete-branch-compare`: 0.1.18 read `compare/<tip>...<default>`, which
+/// the client's `..` guard refused before sending, so every merged branch was refused.
+/// Observed on `wave/2026-10-13-w3`; the double applies the real guard.
+#[test]
+fn deletes_a_merged_branch_through_an_admitted_comparison_path() {
+    let fake = Fake::merged("wave/2026-10-13-w3", "wave/2026-10-13-w3", "ahead");
+    let printed = delete_remote_branch(&fake, &deletion("wave/2026-10-13-w3"))
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(printed, format!("deleted wave/2026-10-13-w3 at {TIP}"));
+    assert_eq!(
+        *fake.deletes.borrow(),
+        vec!["/repos/example/sample/git/refs/heads/wave/2026-10-13-w3".to_string()]
+    );
+    assert!(
+        fake.reads.borrow().contains(&compare_path()),
+        "{:?}",
+        fake.reads.borrow()
+    );
+}
+
+/// Every path `delete_remote_branch` requests, read or DELETE, passes the guard.
+#[test]
+fn every_requested_path_passes_the_client_guard() {
+    for (name, encoded) in [
+        ("wave/2026-10-13-w3", "wave/2026-10-13-w3"),
+        ("wave/one", "wave/one"),
+        ("wave/a#b%c&d+e", "wave/a%23b%25c%26d%2Be"),
+    ] {
+        let fake = Fake::merged(name, encoded, "identical");
+        delete_remote_branch(&fake, &deletion(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        let requested: Vec<String> = fake
+            .reads
+            .borrow()
+            .iter()
+            .chain(fake.deletes.borrow().iter())
+            .cloned()
+            .collect();
+        assert_eq!(requested.len(), 6, "{name}: {requested:?}");
+        for path in requested {
+            assert!(api_path_admitted(&path), "{name}: guard refuses {path}");
+        }
+    }
+}
+
+/// `comparison-unreadable`: a comparison GitHub does not answer (a 404) is refused and
+/// nothing is deleted.
+#[test]
+fn refuses_an_unreadable_comparison() {
+    let fake = Fake::default()
+        .answer(
+            "/repos/example/sample",
+            Some(json!({"default_branch": "main"})),
+        )
+        .answer(
+            "/repos/example/sample/branches/wave/one",
+            Some(branch("wave/one", TIP, false)),
+        )
+        .answer(&compare_path(), None);
+    let text = refused(&fake, "wave/one");
+    assert!(text.contains("cannot compare"), "{text}");
 }
 
 #[test]
