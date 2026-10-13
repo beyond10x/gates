@@ -6,7 +6,7 @@
 //! credential is ever minted.
 use b10x_gates::{
     bot_args::delete_branch,
-    delivery::{RemoteBranches, bot_git, delete_remote_branch},
+    delivery::{RemoteBranches, api_path_admitted, bot_git, delete_remote_branch},
 };
 use serde_json::{Value, json};
 use std::{cell::RefCell, fs, path::Path, process::Command};
@@ -256,6 +256,8 @@ impl Fake {
 
 impl RemoteBranches for Fake {
     fn read(&self, path: &str) -> anyhow::Result<Option<Value>> {
+        // The real client's path guard: a path `Github::api_response` refuses is refused here.
+        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
         self.reads.borrow_mut().push(path.to_string());
         let answers = self.answers.borrow();
         let (_, value) = answers
@@ -266,6 +268,7 @@ impl RemoteBranches for Fake {
     }
 
     fn delete(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
         self.deletes.borrow_mut().push(path.to_string());
         Ok(())
     }
@@ -323,7 +326,7 @@ fn ambiguous_github_answers_refuse_the_deletion() {
             .answer(repo.0, Some(repo.1.clone()))
             .answer("/repos/example/sample/branches/done", Some(branch.clone()))
             .answer(
-                &format!("/repos/example/sample/compare/{TIP}...main"),
+                &format!("/repos/example/sample/compare/{TIP}%2E%2E%2Emain"),
                 comparison.clone(),
             );
         let result = delete_remote_branch(&fake, &deletion("done").unwrap());
@@ -350,7 +353,7 @@ fn spellings_of_the_default_branch_are_refused() {
                 Some(json!({"name": "main", "protected": true, "protection": {"enabled": false}, "commit": {"sha": TIP}})),
             )
             .answer(
-                &format!("/repos/example/sample/compare/{TIP}...main"),
+                &format!("/repos/example/sample/compare/{TIP}%2E%2E%2Emain"),
                 Some(json!({"status": "identical", "merge_base_commit": {"sha": TIP}})),
             );
         assert!(
