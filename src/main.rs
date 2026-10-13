@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use b10x_gates::{
     artifact,
     delivery::{self, Github},
@@ -367,6 +367,90 @@ fn execute(args: Args) -> Result<()> {
         );
         return Ok(());
     }
+    if let Action::Install {
+        retire_pre_push_sha256,
+    } = &args.command
+    {
+        // `gates.delivery.InstallHooks`: a flag or its environment variable wins; a
+        // reinstall takes what is missing from the installed hooks' configuration; a
+        // first install keeps the defaults under the configuration home.
+        let root = policy::root()?;
+        let installed = if args.repository.is_none()
+            || args.policy.is_none()
+            || args.key.is_none()
+            || args.gitleaks.is_none()
+        {
+            b10x_gates::bot_args::installed_configuration(
+                &args.repo,
+                "install",
+                "pass --repository <owner>/<repo> and --policy <path>",
+            )?
+        } else {
+            None
+        };
+        let Some(repository) = args
+            .repository
+            .or_else(|| installed.as_ref().map(|c| c.repository.clone()))
+        else {
+            bail!(
+                "install needs a repository: pass --repository <owner>/<repo>, or rerun \
+                 install in a repository whose installed hook configuration \
+                 (<git common dir>/b10x-gates-hooks/config.json) names one; none is installed here"
+            );
+        };
+        let (policy_path, policy) = match (args.policy, &installed) {
+            (Some(path), _) => {
+                let policy = load_policy(&path)?;
+                (path, policy)
+            }
+            (None, Some(config)) => {
+                let policy = Policy::load(&config.policy).map_err(|e| {
+                    anyhow::anyhow!(
+                        "trusted policy at {}, named by the installed hook configuration: {e}; \
+                         pass --policy or set B10X_GATES_POLICY",
+                        config.policy.display()
+                    )
+                })?;
+                (config.policy.clone(), policy)
+            }
+            (None, None) => {
+                let path = root.join("policy.json");
+                let policy = Policy::load(&path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "trusted policy at {}: {e}; pass --policy or set B10X_GATES_POLICY, or \
+                         rerun install in a repository whose installed hook configuration names \
+                         one; none is installed here",
+                        path.display()
+                    )
+                })?;
+                (path, policy)
+            }
+        };
+        policy.repository(&repository)?;
+        let installed_key = installed.as_ref().map(|c| c.key.clone());
+        let installed_scanner = installed.map(|c| c.scanner);
+        hooks::install(
+            &args.repo,
+            hooks::Config {
+                repository,
+                policy: policy_path,
+                key: args
+                    .key
+                    .or(installed_key)
+                    .unwrap_or_else(|| root.join("signing-key")),
+                scanner: args
+                    .gitleaks
+                    .or(installed_scanner)
+                    .unwrap_or_else(|| root.join("bin/gitleaks")),
+                previous: BTreeMap::new(),
+                retired_pre_push_digest: None,
+                installed_version: String::new(),
+            },
+            retire_pre_push_sha256.as_deref(),
+        )?;
+        println!("coordinated hooks installed");
+        return Ok(());
+    }
     let root = policy::root()?;
     let policy_path = args.policy.unwrap_or_else(|| root.join("policy.json"));
     let key_path = args.key.unwrap_or_else(|| root.join("signing-key"));
@@ -460,26 +544,6 @@ fn execute(args: Args) -> Result<()> {
     }
     let repository = args.repository.context("--repository is required")?;
     policy.repository(&repository)?;
-    if let Action::Install {
-        retire_pre_push_sha256,
-    } = &args.command
-    {
-        hooks::install(
-            &args.repo,
-            hooks::Config {
-                repository,
-                policy: policy_path,
-                key: key_path,
-                scanner: scanner_path,
-                previous: BTreeMap::new(),
-                retired_pre_push_digest: None,
-                installed_version: String::new(),
-            },
-            retire_pre_push_sha256.as_deref(),
-        )?;
-        println!("coordinated hooks installed");
-        return Ok(());
-    }
     let git = Git::new(&args.repo)?;
     if let Action::Audit { output } = &args.command {
         let units = git.historical(&policy.repository(&repository)?.baseline)?;

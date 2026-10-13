@@ -49,6 +49,20 @@ types:
   - name: gates.delivery.Ancestry
     kind: enum
     variants: [Ahead, Identical, Behind, Diverged]
+  # Where `install` took a value from: its flag (or the flag's environment variable),
+  # the installed hooks' configuration, the default path under the configuration home
+  # (`b10x/gates/policy.json`, `signing-key` and `bin/gitleaks`; never the repository),
+  # or nowhere.
+  - name: gates.delivery.Resolution
+    kind: enum
+    variants: [Flag, InstalledConfiguration, Default, Unresolved]
+  # The installed hooks' protected configuration as `install` finds it. It is read only
+  # when a flag is missing (`NotConsulted` otherwise); `Untrusted` covers a file that is
+  # not owner-only, a symlink, a directory others can write, unparsable bytes and a
+  # repository that is not `<owner>/<repo>`.
+  - name: gates.delivery.InstalledConfiguration
+    kind: enum
+    variants: [NotConsulted, Absent, Trusted, Untrusted]
 
 commands:
   - name: gates.delivery.Merge
@@ -288,6 +302,61 @@ commands:
         payload:
           gates.delivery.UnknownBranch: {name: input.name}
 
+  # `b10x-gates install`, which every gates release asks each repository to rerun.
+  # A reinstall needs no flag: without `--repository` the repository is the installed
+  # hooks' configuration's (`<git common dir>/b10x-gates-hooks/config.json`, read
+  # through the same protected read as the hooks), and without `--policy` and
+  # `B10X_GATES_POLICY` the policy is the path that configuration names; likewise the
+  # signing key without `--key` and `B10X_GATES_KEY`, and the scanner without
+  # `--gitleaks` and `B10X_GATES_GITLEAKS`. A flag or its environment variable always
+  # wins. A first install, with no configuration, keeps the defaults under the
+  # configuration home for the policy, the key and the scanner.
+  - name: gates.delivery.InstallHooks
+    input:
+      - {name: repository, type: String}
+      - {name: configuration, type: gates.delivery.InstalledConfiguration}
+      - {name: repository_source, type: gates.delivery.Resolution}
+      - {name: policy_source, type: gates.delivery.Resolution}
+      - {name: key_source, type: gates.delivery.Resolution}
+      - {name: scanner_source, type: gates.delivery.Resolution}
+      - {name: policy_loaded, type: Boolean}
+      - {name: repository_enrolled, type: Boolean}
+    outcomes:
+      # A configuration that is present but untrusted, unparsable or names a
+      # repository that is not `<owner>/<repo>` is refused with its cause, never
+      # skipped as if absent.
+      - name: untrusted-configuration
+        when: configuration == Untrusted
+        error: gates.delivery.UntrustedConfiguration
+      # No `--repository` and no installed configuration: the refusal names both
+      # routes, `--repository <owner>/<repo>` and an installed configuration.
+      - name: no-repository
+        when: repository_source == Unresolved
+        error: gates.delivery.RepositoryRequired
+      # No `--policy`, no `B10X_GATES_POLICY`, no installed configuration and no
+      # default policy: the refusal names `--policy`/`B10X_GATES_POLICY` and an
+      # installed configuration.
+      - name: no-policy
+        when: policy_source == Unresolved
+        error: gates.delivery.PolicyRequired
+      # The resolved policy path is not a trusted policy; refused naming the path.
+      - name: policy-unavailable
+        when: policy_loaded == false
+        error: gates.delivery.PolicyUnavailable
+      # The loaded policy must still enrol the repository, as for every command.
+      - name: not-enrolled
+        when: repository_enrolled == false
+        error: gates.delivery.RepositoryNotEnrolled
+        payload:
+          gates.delivery.RepositoryNotEnrolled: {repository: input.repository}
+      # The new configuration names the resolved repository and the canonical policy,
+      # key and scanner paths, and keeps the hooks it already chained.
+      - name: installed
+        emits: [gates.delivery.HooksInstalled]
+        payload:
+          gates.delivery.HooksInstalled:
+            repository: input.repository
+
 events:
   - name: gates.delivery.BranchDeleted
     fields: [{name: name, type: String}, {name: tip, type: String}]
@@ -295,6 +364,8 @@ events:
     fields: [{name: revision, type: String}]
   - name: gates.delivery.NothingToMerge
     fields: [{name: revision, type: String}]
+  - name: gates.delivery.HooksInstalled
+    fields: [{name: repository, type: String}]
 
 errors:
   - name: gates.delivery.ForbiddenOption
@@ -341,3 +412,11 @@ errors:
     fields: [{name: current_tip, type: String}]
   - name: gates.delivery.UnknownBranch
     fields: [{name: name, type: String}]
+  - name: gates.delivery.UntrustedConfiguration
+    fields: [{name: configuration, type: gates.delivery.InstalledConfiguration}]
+  - name: gates.delivery.PolicyRequired
+    fields: []
+  - name: gates.delivery.PolicyUnavailable
+    fields: [{name: policy_loaded, type: Boolean}]
+  - name: gates.delivery.RepositoryNotEnrolled
+    fields: [{name: repository, type: String}]
