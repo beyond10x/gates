@@ -66,6 +66,11 @@ types:
   - name: gates.delivery.InstalledConfiguration
     kind: enum
     variants: [NotConsulted, Absent, Trusted, Untrusted, OtherRepository]
+  # Where `ci` took the policy from: `B10X_GATES_POLICY_GZ`, `B10X_GATES_POLICY_JSON`,
+  # or the protected policy file.
+  - name: gates.delivery.PolicySource
+    kind: enum
+    variants: [Compressed, Json, File]
 
 commands:
   - name: gates.delivery.Merge
@@ -419,7 +424,96 @@ commands:
           gates.delivery.ArtifactValidated:
             static: input.static
 
+  # `b10x-gates ci`, the reusable workflow's check, reads the private policy from its
+  # environment before it reads anything else. A secret is capped at 48 KB, so the
+  # workflow passes `B10X_GATES_POLICY_GZ` (the policy compressed with gzip and encoded
+  # as standard base64); `B10X_GATES_POLICY_JSON` (the plain JSON a caller on an older
+  # pin passes) and the protected policy file are the fallbacks, in that order.
+  # `B10X_GATES_POLICY_GZ` counts as given when it is set and non-empty (GitHub passes an
+  # absent secret as the empty string); `B10X_GATES_POLICY_JSON` counts when it is set,
+  # and an empty or non-UTF-8 value is parsed and refused, as before. A compressed value
+  # that does not decode, is not exactly one gzip member, does not decompress within
+  # 4 MiB or does not parse is refused naming `B10X_GATES_POLICY_GZ`; it never falls back
+  # to another source.
+  - name: gates.delivery.LoadCiPolicy
+    input:
+      - {name: source, type: gates.delivery.PolicySource}
+      - {name: decoded, type: Boolean}
+      - {name: parsed, type: Boolean}
+    outcomes:
+      - name: compressed-invalid
+        when: {all: [source == Compressed, {any: [decoded == false, parsed == false]}]}
+        error: gates.delivery.CompressedPolicyInvalid
+      - name: unparsable
+        when: parsed == false
+        error: gates.delivery.PolicyUnavailable
+      - name: loaded
+        emits: [gates.delivery.CiPolicyLoaded]
+        payload:
+          gates.delivery.CiPolicyLoaded:
+            source: input.source
+
+  # `b10x-gates policy publish`: the one step that puts the trusted policy into the CI
+  # secrets `ci` reads. It publishes only `origin/main:policy.json` of the policy
+  # repository, after a fetch and read with `git show`, never a working-tree file, so an
+  # uncommitted edit cannot reach CI. The targets come from a targets file, not code:
+  # the organization secret `B10X_GATES_POLICY_GZ` (the whole policy, gzip -9 then
+  # base64) and, while callers on older pins exist, the sliced `B10X_GATES_POLICY`
+  # secrets (the organization's without the listed repositories' exceptions, each listed
+  # repository's with only its own). `unchanged` is true when the policy commit is the
+  # one the marker in Gates' state directory names. A dry run (the default) prints the
+  # commit, targets and sizes; `--apply` writes each secret with `gh secret set`, the
+  # value on standard input, reads the names back with `gh secret list`, and only then
+  # moves the marker.
+  - name: gates.delivery.PublishPolicy
+    input:
+      - {name: unchanged, type: Boolean}
+      - {name: force, type: Boolean}
+      - {name: policy_valid, type: Boolean}
+      # Values of 48,000 bytes or more; any one publishes nothing.
+      - {name: oversized, type: Integer}
+      - {name: apply, type: Boolean}
+      - {name: written, type: Boolean}
+      - {name: read_back, type: Boolean}
+    outcomes:
+      - name: unchanged
+        when: {all: [unchanged == true, force == false]}
+        emits: [gates.delivery.PolicyUnchanged]
+        payload:
+          gates.delivery.PolicyUnchanged: {unchanged: input.unchanged}
+      - name: policy-invalid
+        when: policy_valid == false
+        error: gates.delivery.PublishedPolicyInvalid
+      - name: oversized
+        when: oversized > 0
+        error: gates.delivery.SecretTooLarge
+        payload:
+          gates.delivery.SecretTooLarge: {oversized: input.oversized}
+      - name: planned
+        when: apply == false
+        emits: [gates.delivery.PolicyPublishPlanned]
+        payload:
+          gates.delivery.PolicyPublishPlanned: {apply: input.apply}
+      - name: write-failed
+        when: written == false
+        error: gates.delivery.SecretWriteFailed
+      - name: not-read-back
+        when: read_back == false
+        error: gates.delivery.SecretNotReadBack
+      - name: published
+        emits: [gates.delivery.PolicyPublished]
+        payload:
+          gates.delivery.PolicyPublished: {apply: input.apply}
+
 events:
+  - name: gates.delivery.PolicyUnchanged
+    fields: [{name: unchanged, type: Boolean}]
+  - name: gates.delivery.PolicyPublishPlanned
+    fields: [{name: apply, type: Boolean}]
+  - name: gates.delivery.PolicyPublished
+    fields: [{name: apply, type: Boolean}]
+  - name: gates.delivery.CiPolicyLoaded
+    fields: [{name: source, type: gates.delivery.PolicySource}]
   - name: gates.delivery.ArtifactValidated
     fields: [{name: static, type: Boolean}]
   - name: gates.delivery.BranchDeleted
@@ -498,3 +592,13 @@ errors:
     fields: [{name: private_rules, type: Integer}]
   - name: gates.delivery.ArtifactSecret
     fields: [{name: secrets, type: Integer}]
+  - name: gates.delivery.CompressedPolicyInvalid
+    fields: [{name: decoded, type: Boolean}]
+  - name: gates.delivery.PublishedPolicyInvalid
+    fields: [{name: policy_valid, type: Boolean}]
+  - name: gates.delivery.SecretTooLarge
+    fields: [{name: oversized, type: Integer}]
+  - name: gates.delivery.SecretWriteFailed
+    fields: [{name: written, type: Boolean}]
+  - name: gates.delivery.SecretNotReadBack
+    fields: [{name: read_back, type: Boolean}]

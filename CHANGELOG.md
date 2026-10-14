@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.1.20 — unreleased
+## 0.1.21 — unreleased
+
+- `ci` reads the private policy from `B10X_GATES_POLICY_GZ` (the policy compressed with
+  `gzip -9` and encoded as base64) when it is set and non-empty, else from
+  `B10X_GATES_POLICY_JSON` as before, else from the protected file. GitHub refuses a secret over
+  48 KB, which the policy outgrew. A set but undecodable value is refused naming the variable,
+  never a fallback; the decompressed policy is bounded at 4 MiB
+  (`gates.delivery.LoadCiPolicy`).
+- `common.yml` declares the optional secret `B10X_GATES_POLICY_GZ` and passes it to `ci`;
+  `B10X_GATES_POLICY` is now optional and still passed as `B10X_GATES_POLICY_JSON`, so callers
+  on an older pin keep working and move to the new secret when they bump their pin.
+- `policy publish` writes the CI secrets from `origin/main:policy.json` of the policy repository,
+  never a working-tree file: a dry run by default (commit, targets, sizes), `--apply` writes with
+  `gh secret set` and reads back with `gh secret list`; targets come from a JSON file; any value
+  of 48,000 bytes or more publishes nothing; a marker in the state directory makes a repeat
+  print `unchanged` (`--force` publishes anyway) (`gates.delivery.PublishPolicy`).
+
+## 0.1.20 — 2026-10-13
 
 - The release executable is built for `x86_64-unknown-linux-musl` again. The 0.1.19 asset was
   a static glibc build: it resolves names by loading the host's `libnss_*` modules, and its

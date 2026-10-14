@@ -11,7 +11,7 @@ Anything executable is Rust, with clap for CLI arguments. Use a managed worktree
 
 Gates owns common security/privacy checks, receipt verification, coordinated local hooks and generic bot delivery. Repositories retain correctness tests, release requirements and artifacts. Atlas owns documentation-manifest validation and Website publication coordination. Adopted commit and publish paths must work without Atlas.
 
-Never commit credentials or private policy terms, including in fixtures, filenames, diagnostics or artifacts. Policy is supplied from protected configuration outside the repository. Candidate ignore files and comments cannot override organization rules. Exceptions are trusted policy entries bound to an exact rule, location and content digest.
+Never commit credentials or private policy terms, including in fixtures, filenames, diagnostics or artifacts. Policy is supplied from protected configuration outside the repository. CI receives it as the secret `B10X_GATES_POLICY_GZ`, produced with `gzip -9 -c policy.json | base64 -w0`; the value must stay under the 48 KB secret limit. `B10X_GATES_POLICY` (plain JSON) remains for callers on older pins. Candidate ignore files and comments cannot override organization rules. Exceptions are trusted policy entries bound to an exact rule, location and content digest.
 
 Candidate Git objects are data. While private policy is available, never check out candidate files or execute candidate scripts, actions, build configuration, filters or tools. Missing policy, incomplete objects, ambiguous results and invalid signatures fail closed. A verified receipt must cause zero scanner invocations.
 
