@@ -97,7 +97,9 @@ fn compressed_not_a_policy_names_the_variable() {
 
 #[test]
 fn compressed_over_the_bound_names_the_variable() {
-    let error = refusal(Some(&encode(&gzip(&vec![b' '; 5 << 20]))), None);
+    // A valid policy padded past the bound with JSON whitespace: only the bound refuses it.
+    let padded = format!("{}{}", policy_json(), " ".repeat(5 << 20));
+    let error = refusal(Some(&encode(&gzip(padded.as_bytes()))), None);
     assert!(error.contains("B10X_GATES_POLICY_GZ"), "{error}");
 }
 

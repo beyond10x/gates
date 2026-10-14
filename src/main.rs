@@ -523,7 +523,12 @@ fn execute(args: Args) -> Result<()> {
             }
             value => value.ok(),
         };
-        let json = std::env::var("B10X_GATES_POLICY_JSON").ok();
+        let json = match std::env::var("B10X_GATES_POLICY_JSON") {
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("B10X_GATES_POLICY_JSON is not UTF-8")
+            }
+            value => value.ok(),
+        };
         match policy::ci_policy(compressed.as_deref(), json.as_deref())? {
             Some((policy, _)) => policy,
             None => load_policy(&policy_path)?,

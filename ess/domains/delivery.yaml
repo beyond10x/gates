@@ -428,18 +428,21 @@ commands:
   # environment before it reads anything else. A secret is capped at 48 KB, so the
   # workflow passes `B10X_GATES_POLICY_GZ` (the policy compressed with gzip and encoded
   # as standard base64); `B10X_GATES_POLICY_JSON` (the plain JSON a caller on an older
-  # pin passes) and the protected policy file are the fallbacks, in that order. A
-  # variable counts as given only when it is set and non-empty. A compressed value that
-  # does not decode, decompress within 4 MiB or parse is refused naming
-  # `B10X_GATES_POLICY_GZ`; it never falls back to another source.
+  # pin passes) and the protected policy file are the fallbacks, in that order.
+  # `B10X_GATES_POLICY_GZ` counts as given when it is set and non-empty (GitHub passes an
+  # absent secret as the empty string); `B10X_GATES_POLICY_JSON` counts when it is set,
+  # and an empty or non-UTF-8 value is parsed and refused, as before. A compressed value
+  # that does not decode, is not exactly one gzip member, does not decompress within
+  # 4 MiB or does not parse is refused naming `B10X_GATES_POLICY_GZ`; it never falls back
+  # to another source.
   - name: gates.delivery.LoadCiPolicy
     input:
       - {name: source, type: gates.delivery.PolicySource}
       - {name: decoded, type: Boolean}
       - {name: parsed, type: Boolean}
     outcomes:
-      - name: compressed-undecodable
-        when: {all: [source == Compressed, decoded == false]}
+      - name: compressed-invalid
+        when: {all: [source == Compressed, {any: [decoded == false, parsed == false]}]}
         error: gates.delivery.CompressedPolicyInvalid
       - name: unparsable
         when: parsed == false

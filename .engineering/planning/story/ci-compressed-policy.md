@@ -4,7 +4,7 @@ id: story:ci-compressed-policy
 kind: story
 status: active
 title: Read the CI policy from a compressed secret under the 48 KB limit
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T07:12:16Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-14T07:12:16Z", actor: "human:timo", revision: 3}
@@ -42,3 +42,18 @@ about 18 KB.
   (`json_path_unchanged`); the binary refuses an undecodable value and reads a valid one before
   the event (`ci_refuses_undecodable_compressed_policy`,
   `ci_reads_compressed_policy_before_the_event`).
+
+## Publishing the policy
+
+- `b10x-gates policy publish` is the step that writes those secrets, from
+  `origin/main:policy.json` of the policy repository only (fetched, read with `git show`).
+  Dry run by default; `--apply` writes with `gh secret set` (value on standard input) and reads
+  the names back with `gh secret list`; the targets (organization, plain sliced secrets for
+  callers on older pins) come from a JSON file; any value of 48,000 bytes or more publishes
+  nothing; a marker in Gates' state directory makes a repeat print `unchanged`, `--force`
+  publishes anyway. Spec: `gates.delivery.PublishPolicy`.
+- Acceptance: `tests/policy_publish.rs` with a fake `gh` on `PATH` (`planned_by_default`,
+  `published_with_apply`, `only_origin_main_is_published`, `unchanged_publishes_nothing`,
+  `forced_publishes_unchanged`, `oversized_publishes_nothing`, `compressed_only_targets`,
+  `invalid_policy_publishes_nothing`, `write_failure_keeps_the_marker`,
+  `missing_read_back_keeps_the_marker`).

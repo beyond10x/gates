@@ -199,14 +199,22 @@ pub fn ci_policy(
         let gzip = base64::engine::general_purpose::STANDARD
             .decode(&text)
             .map_err(|_| anyhow::anyhow!("{VARIABLE} is not standard base64"))?;
+        // Exactly one gzip member and nothing after it: `bufread` consumes only the bytes the
+        // member uses, so what is left is a second member or trailing data, which `gzip -dc`
+        // would read differently.
         let mut bytes = Vec::new();
-        flate2::read::GzDecoder::new(gzip.as_slice())
+        let mut decoder = flate2::bufread::GzDecoder::new(gzip.as_slice());
+        (&mut decoder)
             .take(CI_POLICY_MAX + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| anyhow::anyhow!("{VARIABLE} is not gzip-compressed data"))?;
         ensure!(
             bytes.len() as u64 <= CI_POLICY_MAX,
             "{VARIABLE} decompresses to more than {CI_POLICY_MAX} bytes"
+        );
+        ensure!(
+            decoder.into_inner().is_empty(),
+            "{VARIABLE} holds data after its one gzip member"
         );
         let policy = Policy::parse(&bytes).map_err(|e| anyhow::anyhow!("{VARIABLE}: {e}"))?;
         return Ok(Some((policy, CiPolicySource::Compressed)));

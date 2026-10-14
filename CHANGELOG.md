@@ -11,6 +11,11 @@
 - `common.yml` declares the optional secret `B10X_GATES_POLICY_GZ` and passes it to `ci`;
   `B10X_GATES_POLICY` is now optional and still passed as `B10X_GATES_POLICY_JSON`, so callers
   on an older pin keep working and move to the new secret when they bump their pin.
+- `policy publish` writes the CI secrets from `origin/main:policy.json` of the policy repository,
+  never a working-tree file: a dry run by default (commit, targets, sizes), `--apply` writes with
+  `gh secret set` and reads back with `gh secret list`; targets come from a JSON file; any value
+  of 48,000 bytes or more publishes nothing; a marker in the state directory makes a repeat
+  print `unchanged` (`--force` publishes anyway) (`gates.delivery.PublishPolicy`).
 
 ## 0.1.20 — 2026-10-13
 
