@@ -3,8 +3,13 @@ name: Common source gates
 on:
   workflow_call:
     secrets:
+      # The policy, gzip -9 then base64 (`gzip -9 -c policy.json | base64 -w0`), under the
+      # 48 KB secret limit. Read first when set and non-empty.
+      B10X_GATES_POLICY_GZ:
+        required: false
+      # The plain JSON policy, for callers that have not moved to the compressed secret.
       B10X_GATES_POLICY:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
         run: '"$RUNNER_TEMP/b10x-gates" bootstrap --directory "$RUNNER_TEMP/gitleaks"'
       - name: Verify evidence or scan Git objects as data
         env:
+          B10X_GATES_POLICY_GZ: ${{ secrets.B10X_GATES_POLICY_GZ }}
           B10X_GATES_POLICY_JSON: ${{ secrets.B10X_GATES_POLICY }}
           GITHUB_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/b10x-gates" --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" ci --event "$GITHUB_EVENT_PATH" --objects "$RUNNER_TEMP/candidate.git"'

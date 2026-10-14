@@ -151,6 +151,27 @@ enum PolicyAction {
         #[arg(long)]
         any_content: bool,
     },
+    /// Publish `origin/main:policy.json` of the policy repository to the CI secrets. A dry
+    /// run by default: prints the commit, each target and its size.
+    Publish {
+        /// The policy repository. Default: the directory of `--policy`.
+        #[arg(long)]
+        policy_repository: Option<PathBuf>,
+        /// The targets file. Default: `<configuration home>/b10x/gates/publish.json`, or,
+        /// when it is absent, only the organization secret `B10X_GATES_POLICY_GZ`.
+        #[arg(long)]
+        targets: Option<PathBuf>,
+        /// The record of the last published policy commit. Default:
+        /// `<state home>/b10x/gates/policy-published`.
+        #[arg(long)]
+        marker: Option<PathBuf>,
+        /// Write the secrets with `gh secret set` and read them back.
+        #[arg(long)]
+        apply: bool,
+        /// Publish even when the policy commit is the one last published.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -461,14 +482,51 @@ fn execute(args: Args) -> Result<()> {
         println!("coordinated hooks installed");
         return Ok(());
     }
+    if let Action::Policy {
+        action:
+            PolicyAction::Publish {
+                policy_repository,
+                targets,
+                marker,
+                apply,
+                force,
+            },
+    } = &args.command
+    {
+        let repository = match (policy_repository, &args.policy) {
+            (Some(path), _) => path.clone(),
+            (None, Some(policy)) => policy
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), PathBuf::from),
+            (None, None) => bail!(
+                "policy publish needs the policy repository: pass --policy-repository, or \
+                 --policy/B10X_GATES_POLICY naming its policy.json"
+            ),
+        };
+        return b10x_gates::publish::publish(&b10x_gates::publish::Options {
+            repository,
+            targets: targets.clone(),
+            marker: marker.clone(),
+            apply: *apply,
+            force: *force,
+        });
+    }
     let root = policy::root()?;
     let policy_path = args.policy.unwrap_or_else(|| root.join("policy.json"));
     let key_path = args.key.unwrap_or_else(|| root.join("signing-key"));
     let scanner_path = args.gitleaks.unwrap_or_else(|| root.join("bin/gitleaks"));
     let policy = if matches!(args.command, Action::Ci { .. }) {
-        match std::env::var("B10X_GATES_POLICY_JSON") {
-            Ok(bytes) => Policy::parse(bytes.as_bytes())?,
-            Err(_) => load_policy(&policy_path)?,
+        let compressed = match std::env::var("B10X_GATES_POLICY_GZ") {
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("B10X_GATES_POLICY_GZ is not standard base64")
+            }
+            value => value.ok(),
+        };
+        let json = std::env::var("B10X_GATES_POLICY_JSON").ok();
+        match policy::ci_policy(compressed.as_deref(), json.as_deref())? {
+            Some((policy, _)) => policy,
+            None => load_policy(&policy_path)?,
         }
     } else {
         load_policy(&policy_path)?
@@ -500,7 +558,10 @@ fn execute(args: Args) -> Result<()> {
             location,
             any_line,
             any_content,
-        } = action;
+        } = action
+        else {
+            unreachable!("policy publish returns before the policy is loaded");
+        };
         let reported: Vec<scan::Finding> = serde_json::from_slice(&fs::read(findings)?)
             .map_err(|_| anyhow::anyhow!("findings report format invalid"))?;
         let repository = args.repository.context("--repository is required")?;

@@ -171,6 +171,55 @@ pub fn valid_repository(name: &str) -> bool {
         })
 }
 
+/// Where `ci` took the policy from (`gates.delivery.PolicySource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiPolicySource {
+    Compressed,
+    Json,
+}
+
+/// Bound on the decompressed policy, far above any real policy and far below memory.
+const CI_POLICY_MAX: u64 = 4 << 20;
+
+/// The policy `ci` reads from its environment (`gates.delivery.LoadCiPolicy`):
+/// `compressed` (`B10X_GATES_POLICY_GZ`, gzip then standard base64) when it is set and
+/// non-empty, else `json` (`B10X_GATES_POLICY_JSON`) when it is set, else `None` for the
+/// protected file. A compressed value that does not decode, decompress within the bound
+/// or parse is refused naming its variable, never a fallback. Diagnostics carry no byte
+/// of the value.
+pub fn ci_policy(
+    compressed: Option<&str>,
+    json: Option<&str>,
+) -> Result<Option<(Policy, CiPolicySource)>> {
+    use base64::Engine;
+    use std::io::Read;
+    const VARIABLE: &str = "B10X_GATES_POLICY_GZ";
+    if let Some(value) = compressed.filter(|v| !v.is_empty()) {
+        let text: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        let gzip = base64::engine::general_purpose::STANDARD
+            .decode(&text)
+            .map_err(|_| anyhow::anyhow!("{VARIABLE} is not standard base64"))?;
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(gzip.as_slice())
+            .take(CI_POLICY_MAX + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("{VARIABLE} is not gzip-compressed data"))?;
+        ensure!(
+            bytes.len() as u64 <= CI_POLICY_MAX,
+            "{VARIABLE} decompresses to more than {CI_POLICY_MAX} bytes"
+        );
+        let policy = Policy::parse(&bytes).map_err(|e| anyhow::anyhow!("{VARIABLE}: {e}"))?;
+        return Ok(Some((policy, CiPolicySource::Compressed)));
+    }
+    match json {
+        Some(value) => Ok(Some((
+            Policy::parse(value.as_bytes())?,
+            CiPolicySource::Json,
+        ))),
+        None => Ok(None),
+    }
+}
+
 pub fn root() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

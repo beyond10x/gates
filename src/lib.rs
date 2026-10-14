@@ -6,6 +6,7 @@ pub mod evidence;
 pub mod git;
 pub mod hooks;
 pub mod policy;
+pub mod publish;
 pub mod published_merge;
 pub mod scan;
 
