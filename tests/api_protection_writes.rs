@@ -230,7 +230,6 @@ fn undecodable_write_path_is_refused() {
         "/repos/example/example/%zz",
         "/repos/example/example/%4",
         "/repos/example/example/%ff",
-        "/repos/example/example/%25zz",
     ] {
         let run = Sandbox::new().api("POST", path, None);
         refused(&run, path);
@@ -238,6 +237,8 @@ fn undecodable_write_path_is_refused() {
     }
 }
 
+/// Round 2, A4: only the first decoding is strict. A `%` that the first decoding yields
+/// (a label named `50%`, spelled `50%25`) is text, not an escape that fails.
 #[test]
 fn writes_elsewhere_reach_the_token_step() {
     for path in [
@@ -246,6 +247,9 @@ fn writes_elsewhere_reach_the_token_step() {
         "/repos/example/example/branches/protection/rename",
         "/repos/rulesets/protection/pulls",
         "/orgs/example/teams",
+        "/repos/example/example/labels/50%25",
+        "/repos/example/example/labels/%25zz",
+        "/repos/example/example/labels/%25ff",
     ] {
         reached_token(&Sandbox::new().api("POST", path, None));
     }
@@ -654,4 +658,209 @@ fn gh_api_input_file_with_a_json_escape_is_refused() {
         &sandbox.gh(&["graphql", "--input", "request.json"]),
         "createRepositoryRuleset",
     );
+}
+
+/// The backslash of a JSON escape, built at run time so no tool can decode it.
+fn backslash() -> char {
+    char::from(92u8)
+}
+
+/// Round 2, A1: a mutation name counts only as a whole GraphQL name, so a read naming an
+/// input or payload type of the same stem stays open.
+#[test]
+fn graphql_type_named_after_a_mutation_reaches_the_token_step() {
+    let body = serde_json::json!({
+        "query": "query { __type(name: \"UpdateBranchProtectionRuleInput\") { name } \
+                  payload: __type(name: \"deleteRepositoryRuleset_payload\") { name } }",
+    })
+    .to_string();
+    reached_token(
+        &Sandbox::new()
+            .with_policy()
+            .api("POST", "/graphql", Some(body.as_bytes())),
+    );
+    reached_token(&Sandbox::new().with_policy().gh(&[
+        "graphql",
+        "-f",
+        "query=query{__type(name:\"CreateRepositoryRulesetPayload\"){name}}",
+    ]));
+}
+
+/// Round 2, A1: a whole name is still found in any letter case and after a JSON escape
+/// such as the newline that usually precedes it in a multi-line query.
+#[test]
+fn graphql_whole_mutation_name_after_a_json_newline_or_in_upper_case_is_refused() {
+    let newline = format!("{}n", backslash());
+    let body = format!(
+        "{{\"query\":\"mutation {{{newline}updateRepositoryRuleset(input: {{}}) {{ clientMutationId }} }}\"}}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .contains("\nupdateRepositoryRuleset"),
+        "fixture: the escape decodes to a newline before the name"
+    );
+    refused(
+        &Sandbox::new().api("POST", "/graphql", Some(body.as_bytes())),
+        "updateRepositoryRuleset",
+    );
+    refused(
+        &Sandbox::new().api(
+            "POST",
+            "/graphql",
+            Some(br#"{"query":"MUTATION { DELETEREPOSITORYRULESET(input: {}) { x } }"}"#),
+        ),
+        "deleteRepositoryRuleset",
+    );
+}
+
+/// Round 2, A2: a placeholder is refused as part of a GraphQL query only in an argument
+/// that sets the `query` field, in every spelling of a field argument.
+#[test]
+fn gh_api_placeholder_in_the_query_field_is_refused_in_every_spelling() {
+    let query = "query=mutation { delete{repo}(input: {rulesetId: \"x\"}) { clientMutationId } }";
+    let upper = query.replacen("query=", "QUERY=", 1);
+    let joined = [
+        format!("-F{query}"),
+        format!("-f{query}"),
+        format!("-F={query}"),
+        format!("-iF{query}"),
+        format!("--field={query}"),
+        format!("--raw-field={query}"),
+    ];
+    let mut cases: Vec<Vec<&str>> = vec![
+        vec!["graphql", "-F", query],
+        vec!["graphql", "--raw-field", query],
+        vec!["graphql", "-F", upper.as_str()],
+    ];
+    cases.extend(joined.iter().map(|a| vec!["graphql", a.as_str()]));
+    for args in cases {
+        let run = Sandbox::new().gh(&args);
+        refused(&run, "query");
+    }
+}
+
+/// Round 2, A2: an argument that only mentions `query` sets no GraphQL query.
+#[test]
+fn gh_api_placeholder_beside_the_word_query_elsewhere_reaches_the_token_step() {
+    let sandbox = Sandbox::new().with_policy();
+    reached_token(&sandbox.gh(&["repos/{owner}/{repo}/contents/docs/query.md"]));
+    reached_token(&sandbox.gh(&[
+        "repos/{owner}/{repo}/issues",
+        "-f",
+        "title=the query for {repo}",
+    ]));
+}
+
+/// Round 2, A5: a refusal names a protection path found in text only up to its `rulesets`
+/// segment and a numeric ruleset id, or up to its `protection` segment; text after that,
+/// after a `\`, or after the fixed word in the same segment is never shown.
+#[test]
+fn refusal_names_a_found_path_only_up_to_its_protection_segment() {
+    let marker = "private-marker-text";
+    let slash = backslash();
+    for (body, named) in [
+        (
+            format!("see repos/example/example/rulesets/42/{marker}"),
+            "/repos/example/example/rulesets/42",
+        ),
+        (
+            format!("see repos/example/example/rulesets/{marker}"),
+            "/repos/example/example/rulesets",
+        ),
+        (
+            format!("see repos/example/example/branches/main/protection/enforce_admins/{marker}"),
+            "/repos/example/example/branches/main/protection",
+        ),
+        (
+            format!("see repos/example/example/rulesets{slash}{marker}"),
+            "/repos/example/example/rulesets",
+        ),
+        (
+            format!("see orgs/example/rulesets.{marker}"),
+            "/orgs/example/rulesets",
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        sandbox.file("body.txt", body.as_bytes());
+        let run = sandbox.gh(&["repos/example/example/issues", "--input", "body.txt"]);
+        refused(&run, named);
+        assert!(!run.stderr.contains(marker), "{}", run.stderr);
+    }
+    let run = Sandbox::new().gh(&["-X", "PUT", &format!("repos/{{owner}}/x/{{repo}}/{marker}")]);
+    refused(&run, "/repos/x/x/rulesets");
+    assert!(!run.stderr.contains(marker), "{}", run.stderr);
+}
+
+/// Round 2 follow-up: a path found in text runs on past a `\`, which every reading takes
+/// as a separator, so a path spelled with `\` in a file or an argument is still found.
+/// The refusal shows it only up to its protection segment.
+#[test]
+fn gh_api_backslash_separated_path_is_refused() {
+    let slash = backslash();
+    let spelled = format!("repos{slash}example{slash}example{slash}rulesets");
+    let sandbox = Sandbox::new();
+    sandbox.file("body.txt", format!("see {spelled} there").as_bytes());
+    refused(
+        &sandbox.gh(&["repos/example/example/issues", "--input", "body.txt"]),
+        "/repos/example/example/rulesets",
+    );
+    refused(
+        &Sandbox::new().gh(&["-X", "PUT", &spelled]),
+        "/repos/example/example/rulesets",
+    );
+}
+
+/// Round 2, A6: every argument and named file is read for a protection path or a mutation
+/// before an encoding header is refused, so the refusal names what the request changes.
+#[test]
+fn gh_api_mutation_in_a_file_is_named_before_an_encoding_header() {
+    let sandbox = Sandbox::new();
+    sandbox.file("request.json", &mutation("deleteBranchProtectionRule"));
+    let run = sandbox.gh(&[
+        "graphql",
+        "-H",
+        "Content-Encoding: identity",
+        "--input",
+        "request.json",
+    ]);
+    refused(&run, "deleteBranchProtectionRule");
+    assert!(!run.stderr.contains("Content-Encoding"), "{}", run.stderr);
+}
+
+/// `%` then `25` `depth` times then `41`: one more decoding than `depth` yields `A`.
+fn nested_percent(depth: usize) -> String {
+    format!("%{}41", "25".repeat(depth))
+}
+
+/// Round 2, A7: at most 8 decodings. Text still changing after the 8th is refused as
+/// undecodable, in a path, a body and a named file; text that settles within 8 is read.
+#[test]
+fn text_still_changing_after_eight_decodings_is_refused() {
+    let issue = "/repos/example/example/issues/1/";
+    reached_token(&Sandbox::new().api("PATCH", &format!("{issue}{}", nested_percent(7)), None));
+    let path = format!("{issue}{}", nested_percent(8));
+    let run = Sandbox::new().api("PATCH", &path, None);
+    refused(&run, &path);
+    assert!(run.stderr.contains("cannot be decoded"), "{}", run.stderr);
+    // A protection path that settles at the 8th decoding is read and refused.
+    let hidden = format!("/repos/example/example/%{}72ulesets", "25".repeat(7));
+    let run = Sandbox::new().api("PUT", &hidden, None);
+    refused(&run, &hidden);
+    assert!(!run.stderr.contains("cannot be decoded"), "{}", run.stderr);
+    // A `/graphql` body.
+    let run = Sandbox::new().api("POST", "/graphql", Some(nested_percent(8).as_bytes()));
+    refused(&run, "cannot be decoded");
+    // A named file through `gh`.
+    for (depth, refusal) in [(7, false), (8, true)] {
+        let sandbox = Sandbox::new().with_policy();
+        sandbox.file("body.json", nested_percent(depth).as_bytes());
+        let run = sandbox.gh(&["repos/example/example/issues", "--input", "body.json"]);
+        if refusal {
+            refused(&run, "cannot be decoded");
+        } else {
+            reached_token(&run);
+        }
+    }
 }

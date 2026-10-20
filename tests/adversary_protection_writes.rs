@@ -169,6 +169,25 @@ fn judged_within_the_cap(run: &Run) {
     reached_token(run);
 }
 
+/// A capped run ended as an ordinary error (exit 1), not a signal, a timeout or an
+/// allocation failure, and the guard refused the input as undecodable: the coordinator's
+/// decision in correction round 2, finding A7, refuses text still changing after 8
+/// percent-decodings.
+fn refused_as_undecodable_within_the_cap(run: &Run) {
+    assert_eq!(
+        run.code,
+        Some(1),
+        "the guard did not finish within the cap; stderr: {}",
+        run.stderr.chars().take(400).collect::<String>()
+    );
+    assert!(
+        !run.stderr.contains("memory allocation"),
+        "{}",
+        run.stderr.chars().take(400).collect::<String>()
+    );
+    refused(run, "cannot be decoded");
+}
+
 /// A percent-encoding nested `depth` times that decodes, one level per decoding, to `A`:
 /// `%25` repeated, then `41`.
 fn nested_percent(depth: usize) -> String {
@@ -186,7 +205,13 @@ fn graphql_introspection_of_a_mutation_input_type_reaches_the_token_step() {
         "query": "query { __type(name: \"UpdateBranchProtectionRuleInput\") { inputFields { name } } }",
     })
     .to_string();
-    reached_token(&Sandbox::new().api("POST", "/graphql", Some(query.as_bytes())));
+    // An `--input` body is read by the private-rule scan after the guard, which needs a
+    // policy before the token step is reached.
+    reached_token(
+        &Sandbox::new()
+            .with_policy()
+            .api("POST", "/graphql", Some(query.as_bytes())),
+    );
 }
 
 /// ESS `gates.delivery.BotApi`: "A placeholder in an argument naming a GraphQL `query`
@@ -198,17 +223,22 @@ fn gh_api_read_of_a_file_named_query_reaches_the_token_step() {
     reached_token(&sandbox.gh(&["repos/{owner}/{repo}/contents/docs/query.md"]));
 }
 
-/// ESS `gates.delivery.BotApi`: "An argument that sets a `Content-Encoding` or
-/// `Transfer-Encoding` header (any letter case, any spelling of `-H`/`--header`)". A
-/// comment body that mentions the header sets none; the comment is an unrelated write.
+/// ESS `gates.delivery.BotApi`: an argument that holds a `Content-Encoding:` or
+/// `Transfer-Encoding:` header text is refused. The coordinator's decision in correction
+/// round 2, finding A3: the guard reads every argument for the header text rather than
+/// parsing `-H`/`--header`, so no flag spelling is missed, and accepts that a comment body
+/// mentioning the header is refused too.
 #[test]
-fn gh_api_comment_mentioning_content_encoding_reaches_the_token_step() {
+fn gh_api_comment_mentioning_content_encoding_is_refused() {
     let sandbox = Sandbox::new().with_policy();
-    reached_token(&sandbox.gh(&[
-        "repos/example/example/issues/1/comments",
-        "-f",
-        "body=Responses carry Content-Encoding: gzip when asked",
-    ]));
+    refused(
+        &sandbox.gh(&[
+            "repos/example/example/issues/1/comments",
+            "-f",
+            "body=Responses carry Content-Encoding: gzip when asked",
+        ]),
+        "Content-Encoding",
+    );
 }
 
 /// Story proposal: only a write to a protection path is refused. A label named `50%`,
@@ -263,7 +293,8 @@ fn gh_api_protection_path_after_an_encoding_header_is_named() {
 // --- Bounded work on inputs within reason -----------------------------------------------
 
 /// Brief: the guard never fails on a very long path. A 64 KiB path nested in
-/// percent-encoding is judged within a 512 MiB address space.
+/// percent-encoding is judged within a 512 MiB address space: refused as undecodable
+/// (round 2, A7).
 #[test]
 fn nested_percent_encoding_in_an_api_path_is_judged_within_bounded_memory() {
     let path = format!(
@@ -271,7 +302,7 @@ fn nested_percent_encoding_in_an_api_path_is_judged_within_bounded_memory() {
         nested_percent(32 * 1024)
     );
     let run = Sandbox::new().api_command(true, "PATCH", &path, None);
-    judged_within_the_cap(&run);
+    refused_as_undecodable_within_the_cap(&run);
 }
 
 /// The control for the case above: a path of the same length without nesting is judged
@@ -287,7 +318,8 @@ fn plain_api_path_of_the_same_length_is_judged_within_the_same_cap() {
 }
 
 /// Brief: the guard never fails on a huge file within reason. A 256 KiB `--input` file
-/// nested in percent-encoding is judged within a 512 MiB address space.
+/// nested in percent-encoding is judged within a 512 MiB address space: refused as
+/// undecodable (round 2, A7).
 #[test]
 fn nested_percent_encoding_in_an_input_file_is_judged_within_bounded_memory() {
     let sandbox = Sandbox::new().with_policy();
@@ -296,7 +328,7 @@ fn nested_percent_encoding_in_an_input_file_is_judged_within_bounded_memory() {
         true,
         &["repos/example/example/issues", "--input", "body.json"],
     );
-    judged_within_the_cap(&run);
+    refused_as_undecodable_within_the_cap(&run);
 }
 
 /// The control for the case above: an input file of the same size without nesting.

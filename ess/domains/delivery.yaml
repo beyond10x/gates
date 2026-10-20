@@ -518,31 +518,45 @@ commands:
   # `/repos/<o>/<r>/branches/<b...>/protection` (a branch name may hold `/`),
   # `/orgs/<o>/rulesets`, or the same paths under `/repositories/<id>/` and
   # `/organizations/<id>/`. It is judged in every reading a server on the way may make:
-  # as given and after each percent-decoding until stable, lowercased, with `\` as a
-  # separator, repeated separators collapsed, a trailing separator, a query and a
-  # fragment dropped, tab and newline removed, `.` and `..` segments kept and resolved,
-  # and a fixed segment matched alone or with a suffix a router may strip (a format such
-  # as `.json`, matrix parameters after `;`, trailing white space or control characters);
-  # any reading that is a protection path counts. A protection mutation is
-  # `createRepositoryRuleset`, `updateRepositoryRuleset`, `deleteRepositoryRuleset`,
-  # `createBranchProtectionRule`, `updateBranchProtectionRule` or
-  # `deleteBranchProtectionRule`, in any case, in the text read as UTF-8, UTF-16 or UTF-32
-  # in either byte order, each also with JSON escapes and percent-encoding undone.
+  # as given and after each percent-decoding until stable, at most 8 (the first decoding
+  # of an `api` path is strict, every later one lenient, so a `%` the first decoding
+  # yields is text), lowercased, with `\` as a separator, repeated separators collapsed,
+  # a trailing separator, a query and a fragment dropped, tab and newline removed, `.` and
+  # `..` segments kept and resolved, and a fixed segment matched alone or with a suffix a
+  # router may strip (a format such as `.json`, matrix parameters after `;`, trailing white
+  # space or control characters); any reading that is a protection path counts. A path
+  # found in text runs to the next white space, quote, backtick or angle bracket, on past a
+  # `\` (a separator in every reading).
+  # A protection mutation is `createRepositoryRuleset`, `updateRepositoryRuleset`,
+  # `deleteRepositoryRuleset`, `createBranchProtectionRule`, `updateBranchProtectionRule`
+  # or `deleteBranchProtectionRule` as a whole GraphQL name (no letter, digit or `_` right
+  # before or after it), in any letter case, in the text read as UTF-8, UTF-16 or UTF-32
+  # in either byte order, each also with JSON string escapes and percent-encoding undone.
+  # Text still changing after 8 percent-decodings cannot be decoded, in a path, a body
+  # and a named file alike.
   # `api` judges its method (a write is any method but GET and HEAD, compared
   # case-insensitively), its path and, for `/graphql`, the input file's bytes and the
   # path's query string. `gh -- api` judges every argument and the bytes of every file an
   # argument names (`--input`, `-F`/`--field` `<key>=@<file>` in every spelling),
   # whatever the method: reads go through `b10x-gates api --method GET`. An argument that
-  # sets a `Content-Encoding` or `Transfer-Encoding` header (any letter case, any spelling
-  # of `-H`/`--header`) makes GitHub decode the body the guard read as bytes, so it cannot
-  # be judged.
+  # holds a `Content-Encoding:` or `Transfer-Encoding:` header text (any letter case, white
+  # space ignored) is refused: as a header, in any spelling of `-H`/`--header`, it may make
+  # GitHub decode the body the guard read as bytes. Every argument is read for it, so a
+  # comment body that only mentions the header is refused too.
   # `gh` fills `{owner}`, `{repo}` and `{branch}` (also `:owner`, `:repo`, `:branch`) into
   # the endpoint and `-F` values after the guard has read them. An owner or name holds no
   # `/`, so an argument holding one is judged as the endpoint with each segment holding a
   # placeholder tried as another name, `.`, `..` and every fixed segment; a protection
-  # reading counts as a protection path. A placeholder in an argument naming a GraphQL
-  # `query`, and `{branch}` anywhere but as a whole field value (`head={branch}`), cannot
-  # be judged.
+  # reading counts as a protection path. A placeholder in an argument that sets the GraphQL
+  # `query` field (the key `query`, any letter case, before the first `=` of a field
+  # argument in any spelling: `query=…`, `-Fquery=…`, `-fquery=…`, `-F=query=…`,
+  # `--field=query=…`, `--raw-field=query=…`), and `{branch}` anywhere but as a whole field
+  # value (`head={branch}`), cannot be judged.
+  # A refusal names a protection path found in text only up to its `rulesets` segment and
+  # a numeric ruleset id after it, or up to its `protection` segment, each fixed segment
+  # in its plain spelling; no text after that is shown.
+  # Outcomes are taken in declaration order over every argument and named file, so a
+  # request that carries a protection path is refused naming it.
   - name: gates.delivery.BotApi
     input:
       - {name: route, type: gates.delivery.ApiRoute}
@@ -550,6 +564,7 @@ commands:
       - {name: path_decodable, type: Boolean}
       - {name: protection_paths, type: 'List<String>'}
       - {name: protection_mutations, type: 'List<String>'}
+      - {name: undecodable_texts, type: 'List<String>'}
       - {name: unjudged_placeholders, type: 'List<String>'}
       - {name: body_encoding_headers, type: 'List<String>'}
       - {name: standard_input, type: Boolean}
@@ -564,17 +579,15 @@ commands:
       - name: protection-mutation
         when: protection_mutations.count > 0
         error: gates.delivery.ProtectionWrite
-      # Fail closed: an `api` write whose path holds a `%` that is not an escape, or
-      # decodes to bytes that are not UTF-8, at any decoding, cannot be judged.
+      # Fail closed: an `api` write whose path holds a `%` that is not an escape, or bytes
+      # that are not UTF-8, at the first decoding, or is still changing after 8.
       - name: undecodable-path
         when: {all: [route == Api, write == true, path_decodable == false]}
         error: gates.delivery.ProtectionWrite
-      # Checked in every argument before anything else, naming the argument.
-      - name: body-encoding-header
-        when: {all: [route == GhApi, body_encoding_headers.count > 0]}
-        error: gates.delivery.UncheckableInput
-      - name: unjudged-placeholder
-        when: {all: [route == GhApi, unjudged_placeholders.count > 0]}
+      # A `/graphql` body or path (`api`), or an argument or named file (`gh -- api`),
+      # still changing after 8 percent-decodings.
+      - name: undecodable-text
+        when: undecodable_texts.count > 0
         error: gates.delivery.UncheckableInput
       # `--input -` or `@-`: `gh` would read standard input, which cannot be judged.
       - name: standard-input
@@ -582,6 +595,14 @@ commands:
         error: gates.delivery.UncheckableInput
       - name: unreadable-file
         when: {all: [route == GhApi, unreadable_files.count > 0]}
+        error: gates.delivery.UncheckableInput
+      - name: unjudged-placeholder
+        when: {all: [route == GhApi, unjudged_placeholders.count > 0]}
+        error: gates.delivery.UncheckableInput
+      # An argument that holds a `Content-Encoding:` or `Transfer-Encoding:` header text,
+      # named; taken after every other outcome (round 2, A3 and A6).
+      - name: body-encoding-header
+        when: {all: [route == GhApi, body_encoding_headers.count > 0]}
         error: gates.delivery.UncheckableInput
       - name: admitted
         emits: [gates.delivery.ApiAdmitted]
@@ -694,6 +715,7 @@ errors:
       - {name: path_decodable, type: Boolean}
   - name: gates.delivery.UncheckableInput
     fields:
+      - {name: undecodable_texts, type: 'List<String>'}
       - {name: unjudged_placeholders, type: 'List<String>'}
       - {name: body_encoding_headers, type: 'List<String>'}
       - {name: standard_input, type: Boolean}
