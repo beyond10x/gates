@@ -1,6 +1,29 @@
 # Changelog
 
-## 0.1.21 — unreleased
+## 0.1.22 — 2026-10-20
+
+- `api` and `gh -- api` refuse a write to a ruleset or to branch protection before the policy is
+  read and before a token is minted, naming the path and saying "ruleset and branch protection
+  changes are the owner's". On 2026-10-20 a ruleset of another repository was changed through
+  `api` with the bot token. `api` refuses any method but GET and HEAD on the repository and
+  organization ruleset paths and the branch protection paths (and what is below them, and under
+  the `/repositories/<id>/` and `/organizations/<id>/` aliases), judged in every percent-decoded
+  (first decoding strict, at most 8), lowercased, dot-resolved reading with repeated or trailing
+  `/` and the query dropped; a write whose path cannot be decoded; and a `/graphql` request whose
+  body or query string names one of the six ruleset or branch protection mutations as a whole
+  GraphQL name. `gh -- api` refuses any argument or named file (`--input`,
+  `-F`/`--field <key>=@<file>`, read as UTF-8, UTF-16 or UTF-32) carrying such a path or
+  mutation, whatever the method, or still changing after 8 percent-decodings; standard input; a
+  `{owner}`/`{repo}` placeholder some owner or name would turn into such a path, `{branch}`
+  outside a whole field value, any placeholder in the GraphQL `query` field, and an argument
+  whose placeholders would take more than 4 MiB of fillings to judge; and an argument holding a
+  `Content-Encoding:` or `Transfer-Encoding:` header text. Paths are judged in time linear in
+  the text. A refusal shows a path found in a file only up to its `rulesets` or `protection`
+  segment. Reads go through
+  `api --method GET` (`gates.delivery.BotApi`). The App's `administration` permission is
+  unchanged: the App key still reaches the API without `b10x-gates`.
+
+## 0.1.21 — 2026-10-14
 
 - `ci` reads the private policy from `B10X_GATES_POLICY_GZ` (the policy compressed with
   `gzip -9` and encoded as base64) when it is set and non-empty, else from
