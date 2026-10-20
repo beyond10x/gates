@@ -23,11 +23,12 @@ const SHOWN: usize = 300;
 /// protection, or `None`. A write is any method but GET and HEAD, compared
 /// case-insensitively. Refused: a write to a protection path in any reading of `path`
 /// (`protected`); a write whose path cannot be decoded; and a `/graphql` request, whatever
-/// the method, whose body names one of `MUTATIONS`.
+/// the method, whose body or path (its query string, in every reading) names one of
+/// `MUTATIONS`.
 pub fn protection_write(method: &str, path: &str, body: &[u8]) -> Option<String> {
     let write = !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"));
     let request = format!("{} {}", shown(method), shown(path));
-    let mutation = || mutations(body);
+    let mutation = || mutations(body).or_else(|| mutations(path.as_bytes()));
     let Some(readings) = readings(path, true) else {
         return (write || mutation().is_some()).then(|| {
             format!(
@@ -65,7 +66,10 @@ pub fn gh_api_refusal(
     read: impl Fn(&str) -> std::io::Result<Vec<u8>>,
 ) -> Option<String> {
     for (i, argument) in args.iter().enumerate() {
-        if let Some(found) = carried(argument.as_bytes()).or_else(|| placeholder(argument)) {
+        if let Some(found) = body_encoding(argument)
+            .or_else(|| carried(argument.as_bytes()))
+            .or_else(|| placeholder(argument))
+        {
             return Some(format!(
                 "gh api argument {} {found}; {OWNERS}; read them with `b10x-gates api \
                  --method GET`",
@@ -146,6 +150,35 @@ pub fn gh_api_files(args: &[String]) -> Vec<(usize, String)> {
         }
     }
     files
+}
+
+/// Headers that make GitHub decode the body before it reads it, lowercased, as a `gh`
+/// `-H`/`--header` value spells them once white space is removed.
+const BODY_ENCODINGS: [(&str, &str); 2] = [
+    ("content-encoding:", "Content-Encoding"),
+    ("transfer-encoding:", "Transfer-Encoding"),
+];
+
+/// An argument that sets a body-encoding header, as the clause of a refusal. The guard
+/// reads the bytes `gh` sends; with such a header GitHub may read them decoded (gzip, for
+/// one), which the guard never sees. Read in every argument, not only after `-H`, so no
+/// spelling of the flag (`-H v`, `-Hv`, `-H=v`, `-iH v`, `--header v`, `--header=v`) and
+/// no value another flag consumes is missed.
+fn body_encoding(argument: &str) -> Option<String> {
+    let squeezed: String = argument
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    BODY_ENCODINGS
+        .iter()
+        .find(|(spelled, _)| squeezed.contains(spelled))
+        .map(|(_, name)| {
+            format!(
+                "sets a {name} header: GitHub may decode the body before it reads it, so the \
+                 bytes the guard reads are not the request"
+            )
+        })
 }
 
 /// What `gh` fills into the endpoint and into `-F` values once the guard has read them:
@@ -270,16 +303,37 @@ fn mutations(bytes: &[u8]) -> Option<&'static str> {
         .find(|name| views.iter().any(|v| v.contains(&name.to_lowercase())))
 }
 
-/// A text with JSON's `\uXXXX` and `\/` escapes undone and as given, each then
-/// percent-decoded until stable (an escape that does not decode stays as it is), all
-/// lowercased.
+/// The bytes read as UTF-8 and as UTF-16 and UTF-32 in both byte orders (a JSON body may
+/// arrive in any of them), each with JSON's `\uXXXX` escapes undone and as given,
+/// each of those percent-decoded until stable (an escape that does not decode stays as it
+/// is), all lowercased. Bytes that do not decode become U+FFFD.
 fn views(bytes: &[u8]) -> Vec<String> {
-    let raw = String::from_utf8_lossy(bytes).into_owned();
-    let unescaped = json_unescaped(&raw);
+    let utf16 = |unit: fn([u8; 2]) -> u16| {
+        char::decode_utf16(bytes.as_chunks::<2>().0.iter().map(|pair| unit(*pair)))
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+    };
+    let utf32 = |unit: fn([u8; 4]) -> u32| {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|four| char::from_u32(unit(*four)).unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+    };
     let mut views = Vec::new();
-    for start in [unescaped, raw] {
-        for stage in stages(&start, false).unwrap_or_default() {
-            views.push(stage.to_lowercase());
+    for text in [
+        String::from_utf8_lossy(bytes).into_owned(),
+        utf16(u16::from_le_bytes),
+        utf16(u16::from_be_bytes),
+        utf32(u32::from_le_bytes),
+        utf32(u32::from_be_bytes),
+    ] {
+        let unescaped = json_unescaped(&text);
+        for start in [unescaped, text] {
+            for stage in stages(&start, false).unwrap_or_default() {
+                views.push(stage.to_lowercase());
+            }
         }
     }
     views.dedup();
@@ -425,18 +479,16 @@ fn decoded(text: &str, strict: bool) -> Option<String> {
     }
 }
 
-/// JSON's `\uXXXX` (a scalar value, not a surrogate) and `\/` escapes undone, anywhere in
-/// the text, so an escaped name or path is read as the JSON parser on the server reads it.
+/// JSON's `\uXXXX` escapes (a scalar value, not a surrogate) undone, anywhere in the text,
+/// so an escaped name is read as the JSON parser on the server reads it. JSON's `\/` needs
+/// no undoing: `\` is a separator in every path reading, and no mutation name holds `/`.
 fn json_unescaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('\\') {
         out.push_str(&rest[..at]);
         let escape = &rest[at..];
-        if let Some(path) = escape.strip_prefix("\\/") {
-            out.push('/');
-            rest = path;
-        } else if let Some(c) = escape
+        if let Some(c) = escape
             .get(2..6)
             .filter(|h| escape.starts_with("\\u") && h.bytes().all(|b| b.is_ascii_hexdigit()))
             .and_then(|h| u32::from_str_radix(h, 16).ok())

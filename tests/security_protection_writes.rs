@@ -245,8 +245,9 @@ mod api_graphql_refused {
 
     #[test]
     fn post_mutation_behind_a_graphql_alias() {
-        let body =
-            graphql("mutation{a: updateRepositoryRuleset(input:{rulesetId:\"x\"}){clientMutationId}}");
+        let body = graphql(
+            "mutation{a: updateRepositoryRuleset(input:{rulesetId:\"x\"}){clientMutationId}}",
+        );
         let run = Sandbox::new().api("POST", "/graphql", Some(&body));
         refused("POST /graphql alias", &run, "updateRepositoryRuleset");
     }
@@ -288,9 +289,10 @@ mod api_reaches_token {
         let body = serde_json::json!({ "title": "example", "body": "example" })
             .to_string()
             .into_bytes();
-        let run = Sandbox::new()
-            .with_policy()
-            .api("POST", "/repos/example/example/issues", Some(&body));
+        let run =
+            Sandbox::new()
+                .with_policy()
+                .api("POST", "/repos/example/example/issues", Some(&body));
         reached_token("POST issues", &run);
     }
 
