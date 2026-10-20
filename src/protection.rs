@@ -19,22 +19,40 @@ pub const MUTATIONS: [&str; 6] = [
 /// Longest path shown in a refusal, in characters.
 const SHOWN: usize = 300;
 
+/// Most percent-decodings a text is read through. Text still changing after the last of
+/// them cannot be decoded and is refused, so the readings kept stay linear in the input.
+const MOST_DECODINGS: usize = 8;
+
+/// A text the guard cannot read: an `api` path whose first decoding fails, or any text
+/// still changing after `MOST_DECODINGS` decodings.
+struct Undecodable;
+
+/// What one `gh api` argument or named file carries: its first protection path as shown
+/// and its first mutation, or `None` when it cannot be decoded.
+type Found = Option<(Option<String>, Option<&'static str>)>;
+
 /// `b10x-gates api`: the refusal for a request that would change a ruleset or branch
 /// protection, or `None`. A write is any method but GET and HEAD, compared
 /// case-insensitively. Refused: a write to a protection path in any reading of `path`
 /// (`protected`); a write whose path cannot be decoded; and a `/graphql` request, whatever
 /// the method, whose body or path (its query string, in every reading) names one of
-/// `MUTATIONS`.
+/// `MUTATIONS` or cannot be decoded.
 pub fn protection_write(method: &str, path: &str, body: &[u8]) -> Option<String> {
     let write = !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"));
     let request = format!("{} {}", shown(method), shown(path));
-    let mutation = || mutations(body).or_else(|| mutations(path.as_bytes()));
+    let mutation = || -> Result<Option<&'static str>, Undecodable> {
+        match mutation_in(&views(body).ok_or(Undecodable)?) {
+            Some(name) => Ok(Some(name)),
+            None => Ok(mutation_in(&views(path.as_bytes()).ok_or(Undecodable)?)),
+        }
+    };
     let Some(readings) = readings(path, true) else {
-        return (write || mutation().is_some()).then(|| {
+        return (write || !matches!(mutation(), Ok(None))).then(|| {
             format!(
                 "{request} refused: the path cannot be decoded (a `%` that is not an escape, \
-                 or bytes that are not UTF-8), so it cannot be shown to leave rulesets and \
-                 branch protection alone; {OWNERS}"
+                 or bytes that are not UTF-8, at the first decoding, or text still changing \
+                 after {MOST_DECODINGS} decodings), so it cannot be shown to leave rulesets \
+                 and branch protection alone; {OWNERS}"
             )
         });
     };
@@ -47,11 +65,22 @@ pub fn protection_write(method: &str, path: &str, body: &[u8]) -> Option<String>
     if readings
         .iter()
         .any(|segments| segments.len() == 1 && fixed(&segments[0], "graphql"))
-        && let Some(name) = mutation()
     {
-        return Some(format!(
-            "{request} refused: the GraphQL request names the mutation {name}; {OWNERS}"
-        ));
+        match mutation() {
+            Ok(Some(name)) => {
+                return Some(format!(
+                    "{request} refused: the GraphQL request names the mutation {name}; {OWNERS}"
+                ));
+            }
+            Err(Undecodable) => {
+                return Some(format!(
+                    "{request} refused: the GraphQL request cannot be decoded within \
+                     {MOST_DECODINGS} decodings, so it cannot be shown to name no ruleset or \
+                     branch protection mutation; {OWNERS}"
+                ));
+            }
+            Ok(None) => {}
+        }
     }
     None
 }
@@ -59,48 +88,86 @@ pub fn protection_write(method: &str, path: &str, body: &[u8]) -> Option<String>
 /// `b10x-gates gh -- api`: the refusal for an argument, or a file an argument names, that
 /// carries a protection path or one of `MUTATIONS`, whatever the method, or `None`.
 /// `args` is the whole command, `api` first, so argument numbers match the private-rule
-/// scan's. `read` reads a named file as `gh` would; a file it cannot read, and standard
-/// input, cannot be judged and are refused.
+/// scan's. `read` reads a named file as `gh` would. Judged in this order over every
+/// argument and named file, so the refusal names what the request changes whenever it
+/// names anything: a protection path; a mutation; text that cannot be decoded; standard
+/// input and a file that cannot be read; a placeholder `gh` could fill into a protection
+/// path or mutation; a body-encoding header text.
 pub fn gh_api_refusal(
     args: &[String],
     read: impl Fn(&str) -> std::io::Result<Vec<u8>>,
 ) -> Option<String> {
-    for (i, argument) in args.iter().enumerate() {
-        if let Some(found) = body_encoding(argument)
-            .or_else(|| carried(argument.as_bytes()))
-            .or_else(|| placeholder(argument))
-        {
-            return Some(format!(
-                "gh api argument {} {found}; {OWNERS}; read them with `b10x-gates api \
-                 --method GET`",
-                i + 1
-            ));
-        }
-    }
+    let argument = |i: usize| format!("gh api argument {}", i + 1);
+    let mut texts: Vec<(String, Vec<u8>)> = args
+        .iter()
+        .enumerate()
+        .map(|(i, text)| (argument(i), text.as_bytes().to_vec()))
+        .collect();
+    let mut uncheckable = None;
     for (i, file) in gh_api_files(args) {
-        let named = format!(
-            "gh api argument {}, the file it names ({}),",
-            i + 1,
-            shown(&file)
-        );
+        let named = format!("{}, the file it names ({}),", argument(i), shown(&file));
         if file == "-" {
-            return Some(format!(
-                "gh api argument {} reads standard input, which cannot be checked for a \
-                 ruleset or branch protection change; {OWNERS}: name a file instead",
-                i + 1
+            uncheckable.get_or_insert(format!(
+                "{} reads standard input, which cannot be checked for a ruleset or branch \
+                 protection change; {OWNERS}: name a file instead",
+                argument(i)
             ));
+            continue;
         }
-        let bytes = match read(&file) {
-            Ok(bytes) => bytes,
+        match read(&file) {
+            Ok(bytes) => texts.push((named, bytes)),
             Err(error) => {
-                return Some(format!(
+                uncheckable.get_or_insert(format!(
                     "{named} cannot be read ({error}), so it cannot be checked for a ruleset \
                      or branch protection change; {OWNERS}"
                 ));
             }
-        };
-        if let Some(found) = carried(&bytes) {
-            return Some(format!("{named} {found}; {OWNERS}"));
+        }
+    }
+    // Each text read once.
+    let judged: Vec<(&str, Found)> = texts
+        .iter()
+        .map(|(who, bytes)| {
+            let found = views(bytes).map(|views| {
+                (
+                    views.iter().find_map(|view| path_in(view)),
+                    mutation_in(&views),
+                )
+            });
+            (who.as_str(), found)
+        })
+        .collect();
+    let read_instead = "read them with `b10x-gates api --method GET`";
+    for (who, found) in &judged {
+        if let Some((Some(path), _)) = found {
+            return Some(format!(
+                "{who} carries the protection path {}; {OWNERS}; {read_instead}",
+                shown(path)
+            ));
+        }
+    }
+    for (who, found) in &judged {
+        if let Some((_, Some(name))) = found {
+            return Some(format!(
+                "{who} names the GraphQL mutation {name}; {OWNERS}; {read_instead}"
+            ));
+        }
+    }
+    if let Some((who, _)) = judged.iter().find(|(_, found)| found.is_none()) {
+        return Some(format!(
+            "{who} cannot be decoded: it is still changing after {MOST_DECODINGS} \
+             percent-decodings, so it cannot be shown to leave rulesets and branch protection \
+             alone; {OWNERS}"
+        ));
+    }
+    if let Some(refusal) = uncheckable {
+        return Some(refusal);
+    }
+    for check in [placeholder, body_encoding] {
+        for (i, text) in args.iter().enumerate() {
+            if let Some(found) = check(text) {
+                return Some(format!("{} {found}; {OWNERS}", argument(i)));
+            }
         }
     }
     None
@@ -159,11 +226,12 @@ const BODY_ENCODINGS: [(&str, &str); 2] = [
     ("transfer-encoding:", "Transfer-Encoding"),
 ];
 
-/// An argument that sets a body-encoding header, as the clause of a refusal. The guard
-/// reads the bytes `gh` sends; with such a header GitHub may read them decoded (gzip, for
-/// one), which the guard never sees. Read in every argument, not only after `-H`, so no
-/// spelling of the flag (`-H v`, `-Hv`, `-H=v`, `-iH v`, `--header v`, `--header=v`) and
-/// no value another flag consumes is missed.
+/// An argument that holds a body-encoding header text, as the clause of a refusal. The
+/// guard reads the bytes `gh` sends; with such a header GitHub may read them decoded (gzip,
+/// for one), which the guard never sees. Read in every argument, not only after `-H`, so
+/// no spelling of the flag (`-H v`, `-Hv`, `-H=v`, `-iH v`, `--header v`, `--header=v`)
+/// and no value another flag consumes is missed; an argument that only mentions the
+/// header, such as a comment body, is refused too (round 2, A3).
 fn body_encoding(argument: &str) -> Option<String> {
     let squeezed: String = argument
         .chars()
@@ -175,8 +243,8 @@ fn body_encoding(argument: &str) -> Option<String> {
         .find(|(spelled, _)| squeezed.contains(spelled))
         .map(|(_, name)| {
             format!(
-                "sets a {name} header: GitHub may decode the body before it reads it, so the \
-                 bytes the guard reads are not the request"
+                "holds the header text `{name}:`; as a header it may make GitHub decode the \
+                 body before it reads it, so the bytes the guard reads would not be the request"
             )
         })
 }
@@ -207,19 +275,45 @@ const STAND_INS: [&str; 10] = [
 /// `STAND_INS.len()` to this power fillings are tried; more are refused.
 const MOST_PLACEHOLDER_SEGMENTS: u32 = 4;
 
+/// Whether an argument sets the GraphQL `query` field: the key `query`, in any letter
+/// case, before the first `=` of a field argument: `query=…` (the value of a separate
+/// `-F`, `-f`, `--field` or `--raw-field`), `-Fquery=…`, `-fquery=…`, `-F=query=…`, a short
+/// cluster such as `-iFquery=…`, `--field=query=…` and `--raw-field=query=…`.
+fn sets_query_field(argument: &str) -> bool {
+    let pair = if let Some(rest) = argument
+        .strip_prefix("--field=")
+        .or_else(|| argument.strip_prefix("--raw-field="))
+    {
+        rest
+    } else if let Some(cluster) = argument.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+        // The first short flag that takes a value; only `-F` and `-f` take a field.
+        match cluster.char_indices().find(|(_, c)| "fFHXqtp".contains(*c)) {
+            Some((at, 'f' | 'F')) => {
+                let rest = &cluster[at + 1..];
+                rest.strip_prefix('=').unwrap_or(rest)
+            }
+            _ => return false,
+        }
+    } else {
+        argument
+    };
+    pair.split_once('=')
+        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("query"))
+}
+
 /// An argument whose placeholders `gh` could fill into a protection path or a mutation
-/// name, as the clause of a refusal. Refused: a placeholder in an argument that names a
-/// GraphQL `query`; `{branch}` anywhere but as a whole field value (`head={branch}`),
-/// since the branch name may hold `/`; and an argument that, read as the endpoint, is a
-/// protection path for some owner or name, each segment holding one tried as every
-/// `STAND_INS`. A field value `<key>=<placeholder>` is admitted: its first segment
-/// starts with `<key>=`, which no fixed segment does.
+/// name, as the clause of a refusal. Refused: a placeholder in an argument that sets the
+/// GraphQL `query` field (`sets_query_field`); `{branch}` anywhere but as a whole field
+/// value (`head={branch}`), since the branch name may hold `/`; and an argument that, read
+/// as the endpoint, is a protection path for some owner or name, each segment holding one
+/// tried as every `STAND_INS`. A field value `<key>=<placeholder>` is admitted: its first
+/// segment starts with `<key>=`, which no fixed segment does.
 fn placeholder(argument: &str) -> Option<String> {
     let text = argument.to_lowercase();
     if !PLACEHOLDERS.iter().any(|p| text.contains(p)) {
         return None;
     }
-    if text.contains("query") {
+    if sets_query_field(argument) {
         return Some(
             "fills a placeholder into a GraphQL query, where a value the guard cannot see \
              could complete a mutation name"
@@ -262,52 +356,38 @@ fn placeholder(argument: &str) -> Option<String> {
             filled[hole] = STAND_INS[rest % STAND_INS.len()];
             rest /= STAND_INS.len();
         }
-        let candidate = filled.join("/");
-        if readings(&candidate, false)
-            .unwrap_or_default()
-            .iter()
-            .any(|segments| protected(segments))
-        {
+        if let Some(path) = protection_named(&filled.join("/")) {
             return Some(format!(
                 "becomes a protection path once gh fills its placeholders (as {})",
-                shown(&candidate)
+                shown(&path)
             ));
         }
     }
     None
 }
 
-/// What a text carries, as the clause of a refusal: a protection path in any reading, or
-/// one of `MUTATIONS`.
-fn carried(bytes: &[u8]) -> Option<String> {
-    let views = views(bytes);
-    for view in &views {
-        if let Some(path) = paths(view).into_iter().find(|p| {
-            readings(p, false)
-                .unwrap_or_default()
-                .iter()
-                .any(|segments| protected(segments))
-        }) {
-            return Some(format!("carries the protection path {}", shown(&path)));
-        }
-    }
-    mutations(bytes).map(|name| format!("names the GraphQL mutation {name}"))
-}
-
-/// The first of `MUTATIONS` a text names, in any case, also behind a JSON `\u` escape or
-/// percent-encoding.
-fn mutations(bytes: &[u8]) -> Option<&'static str> {
-    let views = views(bytes);
-    MUTATIONS
-        .into_iter()
-        .find(|name| views.iter().any(|v| v.contains(&name.to_lowercase())))
+/// The first of `MUTATIONS` the views of a text name, each as a whole GraphQL name: no
+/// `[A-Za-z0-9_]` right before or after it, so `UpdateBranchProtectionRuleInput` names
+/// none. In any letter case: the views are lowercased.
+fn mutation_in(views: &[String]) -> Option<&'static str> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    MUTATIONS.into_iter().find(|name| {
+        let name = name.to_lowercase();
+        views.iter().any(|view| {
+            view.match_indices(&name).any(|(at, _)| {
+                !view[..at].chars().next_back().is_some_and(word)
+                    && !view[at + name.len()..].chars().next().is_some_and(word)
+            })
+        })
+    })
 }
 
 /// The bytes read as UTF-8 and as UTF-16 and UTF-32 in both byte orders (a JSON body may
-/// arrive in any of them), each with JSON's `\uXXXX` escapes undone and as given,
-/// each of those percent-decoded until stable (an escape that does not decode stays as it
-/// is), all lowercased. Bytes that do not decode become U+FFFD.
-fn views(bytes: &[u8]) -> Vec<String> {
+/// arrive in any of them), each with JSON's string escapes undone and as given, each of
+/// those percent-decoded until stable (an escape that does not decode stays as it is), all
+/// lowercased. Bytes that do not decode become U+FFFD. `None` when a text is still changing
+/// after `MOST_DECODINGS` decodings.
+fn views(bytes: &[u8]) -> Option<Vec<String>> {
     let utf16 = |unit: fn([u8; 2]) -> u16| {
         char::decode_utf16(bytes.as_chunks::<2>().0.iter().map(|pair| unit(*pair)))
             .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -331,20 +411,23 @@ fn views(bytes: &[u8]) -> Vec<String> {
     ] {
         let unescaped = json_unescaped(&text);
         for start in [unescaped, text] {
-            for stage in stages(&start, false).unwrap_or_default() {
+            for stage in stages(&start, false)? {
                 views.push(stage.to_lowercase());
             }
         }
     }
     views.dedup();
-    views
+    Some(views)
 }
 
-/// Every place in a lowercased text where a REST path of a protection family may begin
-/// (`repos`, `repositories`, `orgs`, `organizations`, not inside a longer word), up to
-/// the next space, quote or angle bracket, as an absolute path.
-fn paths(view: &str) -> Vec<String> {
-    let mut found = Vec::new();
+/// The first protection path in a lowercased view, as a refusal shows it
+/// (`protection_named`). A path may begin wherever `repos`, `repositories`, `orgs` or
+/// `organizations` begins outside a longer word, and runs to the next white space, quote,
+/// backtick or angle bracket. It runs on past a `\`, which every reading takes as a
+/// separator, so `repos\o\r\rulesets` is found; what a refusal shows of it stops at the
+/// protection segment (`protection_prefix`). Each place is judged as it is found, so the
+/// memory used stays linear in the view.
+fn path_in(view: &str) -> Option<String> {
     let mut previous: Option<char> = None;
     for (at, c) in view.char_indices() {
         let rest = &view[at..];
@@ -354,19 +437,29 @@ fn paths(view: &str) -> Vec<String> {
             let end = rest
                 .find(|c: char| c.is_whitespace() || "\"'`<>".contains(c))
                 .unwrap_or(rest.len());
-            found.push(format!("/{}", &rest[..end]));
+            if let Some(path) = protection_named(&format!("/{}", &rest[..end])) {
+                return Some(path);
+            }
         }
         previous = Some(c);
     }
-    found
+    None
+}
+
+/// The protection target of the first reading of `path` that is a protection path, as a
+/// refusal shows it (`protection_prefix`).
+fn protection_named(path: &str) -> Option<String> {
+    readings(path, false)?
+        .iter()
+        .find_map(|segments| protection_prefix(segments))
 }
 
 /// Every reading of a path a server on the way may make, each as its segments: as given
-/// and after each percent-decoding until stable; lowercased; tab and newline removed (the
-/// URL parser drops them); `\` as a separator (the URL parser reads it as `/`); with and
-/// without what follows `?` or `#`; empty segments dropped (repeated and trailing
-/// separators); each segment trimmed; `.` and `..` segments kept and resolved. `None`
-/// when `strict` and a decoding fails.
+/// and after each percent-decoding until stable (`stages`); lowercased; tab and newline
+/// removed (the URL parser drops them); `\` as a separator (the URL parser reads it as
+/// `/`); without and with what follows `?` or `#`; empty segments dropped (repeated and
+/// trailing separators); each segment trimmed; `.` and `..` segments kept and resolved.
+/// `None` when the path cannot be decoded.
 fn readings(path: &str, strict: bool) -> Option<Vec<Vec<String>>> {
     let mut readings = Vec::new();
     for stage in stages(path, strict)? {
@@ -376,7 +469,7 @@ fn readings(path: &str, strict: bool) -> Option<Vec<Vec<String>>> {
             .collect::<String>()
             .to_lowercase();
         let cut = text.split(['?', '#']).next().unwrap_or_default();
-        for candidate in [text.as_str(), cut] {
+        for candidate in [cut, text.as_str()] {
             let segments: Vec<String> = candidate
                 .split(['/', '\\'])
                 .filter(|s| !s.is_empty())
@@ -399,27 +492,54 @@ fn readings(path: &str, strict: bool) -> Option<Vec<Vec<String>>> {
     Some(readings)
 }
 
-/// A path's segments name a protection surface: `repos/<o>/<r>` or `repositories/<id>`
-/// followed by `rulesets`, or by `branches/<branch...>/protection` with anything below;
-/// or `orgs/<o>` or `organizations/<id>` followed by `rulesets`.
+/// A path's segments name a protection surface (`protection_prefix`).
 fn protected(segments: &[String]) -> bool {
-    let Some(first) = segments.first() else {
-        return false;
-    };
-    let rest = if fixed(first, "repos") && segments.len() > 3 {
-        &segments[3..]
+    protection_prefix(segments).is_some()
+}
+
+/// The protection surface a path's segments name, as a refusal shows it, or `None`:
+/// `repos/<o>/<r>` or `repositories/<id>` followed by `rulesets`, or by
+/// `branches/<branch...>/protection` with anything below; or `orgs/<o>` or
+/// `organizations/<id>` followed by `rulesets`. Shown only up to and including `rulesets`
+/// and a numeric ruleset id after it, or `protection`, each fixed segment in its plain
+/// spelling, so nothing after the surface, and nothing a suffix such as `.json` holds,
+/// reaches a refusal (round 2, A5).
+fn protection_prefix(segments: &[String]) -> Option<String> {
+    let first = segments.first()?;
+    let (mut shown, rest): (Vec<&str>, &[String]) = if fixed(first, "repos") && segments.len() > 3 {
+        (vec!["repos", &segments[1], &segments[2]], &segments[3..])
     } else if fixed(first, "repositories") && segments.len() > 2 {
-        &segments[2..]
-    } else if fixed(first, "orgs") || fixed(first, "organizations") {
-        return segments.get(2).is_some_and(|s| fixed(s, "rulesets"));
+        (vec!["repositories", &segments[1]], &segments[2..])
+    } else if (fixed(first, "orgs") || fixed(first, "organizations")) && segments.len() > 2 {
+        let family = if fixed(first, "orgs") {
+            "orgs"
+        } else {
+            "organizations"
+        };
+        (vec![family, &segments[1]], &segments[2..])
     } else {
-        return false;
+        return None;
     };
+    let organization = shown[0].starts_with("org");
     if fixed(&rest[0], "rulesets") {
-        return true;
+        shown.push("rulesets");
+        if let Some(id) = rest
+            .get(1)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            shown.push(id);
+        }
+    } else if !organization && fixed(&rest[0], "branches") {
+        // A branch name may hold `/`, so `protection` anywhere after its first segment
+        // counts.
+        let at = rest.iter().skip(2).position(|s| fixed(s, "protection"))? + 2;
+        shown.push("branches");
+        shown.extend(rest[1..at].iter().map(String::as_str));
+        shown.push("protection");
+    } else {
+        return None;
     }
-    // A branch name may hold `/`, so `protection` anywhere after its first segment counts.
-    fixed(&rest[0], "branches") && rest.iter().skip(2).any(|s| fixed(s, "protection"))
+    Some(format!("/{}", shown.join("/")))
 }
 
 /// A fixed segment, alone or with a suffix a router may strip: a format (`rulesets.json`),
@@ -432,16 +552,22 @@ fn fixed(segment: &str, name: &str) -> bool {
     })
 }
 
-/// The text and each percent-decoding of it until stable. Strict: a `%` that is not an
-/// escape, or bytes that are not UTF-8, fail; lenient: such a `%` stays, and invalid bytes
-/// become U+FFFD.
+/// The text and each percent-decoding of it until stable, at most `MOST_DECODINGS` of
+/// them; `None` when the text is still changing after the last (round 2, A7). With
+/// `strict`, the first decoding fails on a `%` that is not an escape or on bytes that are
+/// not UTF-8. Every later decoding is lenient, such a `%` staying and invalid bytes
+/// becoming U+FFFD: a `%` the first decoding yields is text, as in a label named `50%`
+/// spelled `50%25` (round 2, A4).
 fn stages(text: &str, strict: bool) -> Option<Vec<String>> {
     let mut stages = vec![text.to_owned()];
     loop {
         let last = stages.last().expect("one stage");
-        let next = decoded(last, strict)?;
+        let next = decoded(last, strict && stages.len() == 1)?;
         if next == *last {
             return Some(stages);
+        }
+        if stages.len() > MOST_DECODINGS {
+            return None;
         }
         stages.push(next);
     }
@@ -479,26 +605,60 @@ fn decoded(text: &str, strict: bool) -> Option<String> {
     }
 }
 
-/// JSON's `\uXXXX` escapes (a scalar value, not a surrogate) undone, anywhere in the text,
-/// so an escaped name is read as the JSON parser on the server reads it. JSON's `\/` needs
-/// no undoing: `\` is a separator in every path reading, and no mutation name holds `/`.
+/// JSON's string escapes undone, left to right and anywhere in the text, as the server's
+/// JSON parser reads them: `\uXXXX` (a surrogate pair as one character, a lone surrogate
+/// as U+FFFD), `\n`, `\t`, `\r`, `\b`, `\f`, `\"`, `\\` and `\/`. Any other backslash stays.
+/// A mutation name is judged as a whole name, so the newline that a multi-line query
+/// spells `\n` before it must read as a newline, not as the letter `n` (round 2, A1).
+/// `\/` changes no verdict, since every path reading takes `\` as a separator; it is undone
+/// so this view is the text the server reads.
 fn json_unescaped(text: &str) -> String {
+    let hex = |text: &str| {
+        text.get(..4)
+            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+    };
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('\\') {
         out.push_str(&rest[..at]);
-        let escape = &rest[at..];
-        if let Some(c) = escape
-            .get(2..6)
-            .filter(|h| escape.starts_with("\\u") && h.bytes().all(|b| b.is_ascii_hexdigit()))
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .and_then(char::from_u32)
-        {
+        let escape = &rest[at + 1..];
+        let short = match escape.chars().next() {
+            Some('n') => Some('\n'),
+            Some('t') => Some('\t'),
+            Some('r') => Some('\r'),
+            Some('b') => Some(char::from(8u8)),
+            Some('f') => Some(char::from(12u8)),
+            Some(c @ ('"' | '\\' | '/')) => Some(c),
+            _ => None,
+        };
+        if let Some(c) = short {
             out.push(c);
-            rest = &escape[6..];
-        } else {
-            out.push('\\');
             rest = &escape[1..];
+            continue;
+        }
+        let Some(unit) = escape.strip_prefix('u').and_then(hex) else {
+            out.push('\\');
+            rest = escape;
+            continue;
+        };
+        // `u` and four digits; a high surrogate takes the low one after it, if any.
+        let low = escape
+            .get(5..)
+            .and_then(|after| after.strip_prefix('\\'))
+            .and_then(|after| after.strip_prefix('u'))
+            .and_then(hex)
+            .filter(|low| (0xD800..0xDC00).contains(&unit) && (0xDC00..0xE000).contains(low));
+        match low {
+            Some(low) => {
+                let scalar = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                out.push(char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER));
+                rest = &escape[11..];
+            }
+            None => {
+                out.push(char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER));
+                rest = &escape[5..];
+            }
         }
     }
     out.push_str(rest);
