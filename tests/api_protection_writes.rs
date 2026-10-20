@@ -14,6 +14,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 const OWNERS: &str = "ruleset and branch protection changes are the owner's";
@@ -109,6 +110,30 @@ impl Sandbox {
             .args(["gh", "--", "api"])
             .args(args);
         self.run(command)
+    }
+
+    /// `gh` as above under a 60 s `timeout`, with the time the run took.
+    fn gh_timed(&self, args: &[&str]) -> (Run, Duration) {
+        let inner = self.command();
+        let mut command = Command::new("/usr/bin/timeout");
+        command
+            .arg("60")
+            .arg(inner.get_program())
+            .current_dir(self.path());
+        for (key, value) in inner.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+            .arg("--repo")
+            .arg(self.path())
+            .args(["gh", "--", "api"])
+            .args(args);
+        let started = Instant::now();
+        let run = self.run(command);
+        (run, started.elapsed())
     }
 }
 
@@ -863,4 +888,63 @@ fn text_still_changing_after_eight_decodings_is_refused() {
             reached_token(&run);
         }
     }
+}
+
+/// Round 3, B1: the most a text of `repos/` with no separator may take to be judged, debug
+/// build, with every place a path may begin six bytes after the last.
+const QUICK: Duration = Duration::from_secs(5);
+
+fn judged_quickly(took: Duration, run: &Run) {
+    let stderr: String = run.stderr.chars().take(300).collect();
+    assert!(
+        took < QUICK,
+        "judged in {took:?}, bound {QUICK:?}; stderr: {stderr}"
+    );
+}
+
+/// Round 3, B1: one argument as long as Linux allows (`MAX_ARG_STRLEN`, 128 KiB with its
+/// NUL) of `repos/` repeated carries no protection path and is admitted, in linear time.
+#[test]
+fn longest_argument_of_repeated_repos_segments_is_judged_quickly() {
+    let argument = "repos/".repeat((128 * 1024 - 1) / 6);
+    let sandbox = Sandbox::new().with_policy();
+    let (run, took) = sandbox.gh_timed(&["repos/example/example/issues", &argument]);
+    judged_quickly(took, &run);
+    reached_token(&run);
+}
+
+/// Round 3, B1: a 1 MiB `--input` file of `repos/` repeated is admitted, in linear time.
+#[test]
+fn mebibyte_input_file_of_repeated_repos_segments_is_judged_quickly() {
+    let sandbox = Sandbox::new().with_policy();
+    sandbox.file("body.json", "repos/".repeat(1024 * 1024 / 6).as_bytes());
+    let (run, took) = sandbox.gh_timed(&["repos/example/example/issues", "--input", "body.json"]);
+    judged_quickly(took, &run);
+    reached_token(&run);
+}
+
+/// Round 3, B1: a protection path at the end of the same 1 MiB text is still found.
+#[test]
+fn protection_path_after_a_mebibyte_of_repeated_repos_segments_is_refused_quickly() {
+    let sandbox = Sandbox::new();
+    let mut body = "repos/".repeat(1024 * 1024 / 6);
+    body.push_str("example/example/branches/main/protection");
+    sandbox.file("body.json", body.as_bytes());
+    let (run, took) = sandbox.gh_timed(&["repos/example/example/issues", "--input", "body.json"]);
+    judged_quickly(took, &run);
+    refused(&run, "/repos/example/example/branches/main/protection");
+}
+
+/// Round 3, B1, the same class: `gh` placeholders are judged by trying every stand-in in
+/// every segment that holds one, each filling read whole. More text than that work allows
+/// is refused as not judged, quickly, rather than judged for minutes.
+#[test]
+fn placeholders_in_more_text_than_can_be_judged_are_refused_quickly() {
+    let argument = format!(
+        "a/b/{{owner}}/{{repo}}/{{owner}}/{{repo}}/{}",
+        "a".repeat(128 * 1024 - 64)
+    );
+    let (run, took) = Sandbox::new().gh_timed(&["-X", "PUT", &argument]);
+    judged_quickly(took, &run);
+    refused(&run, "placeholder");
 }
