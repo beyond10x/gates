@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-20T08:44:33Z",
+  "actor": "human:timo",
+  "artifact": "story:api-protection-writes",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "verify.sh: 4 api writes + 1 gh api write + 1 GET, 0.1.21 vs unit build, no bot configuration",
+    "reference": "VERIFIED: baseline 0/5 writes refused before the token step, treatment 5/5 refused, GET reaches the token step in both; unit commit 9e9a6772b0d20c5ff5a8468c7c841c87593ae329"
+  }
+}

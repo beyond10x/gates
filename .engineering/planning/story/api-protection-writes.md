@@ -2,26 +2,39 @@
 format: aep.planning-md/3
 id: story:api-protection-writes
 kind: story
-status: active
+status: implemented
 title: b10x-gates api refuses writes to rulesets and branch protection
 summary: Refuse a bot write to a repository's or organization's rulesets or branch protection, through api, gh api and GraphQL, before a token is minted; reads stay.
 scope:
-- confidence: inferred
+- confidence: cited
   path: CHANGELOG.md
-- confidence: inferred
+- confidence: cited
+  path: Cargo.lock
+- confidence: cited
+  path: Cargo.toml
+- confidence: cited
   path: README.md
-- confidence: inferred
+- confidence: cited
   path: ess/domains/delivery.yaml
-- confidence: inferred
-  path: src/delivery.rs
-- confidence: inferred
+- confidence: cited
+  path: src/lib.rs
+- confidence: cited
   path: src/main.rs
-- confidence: inferred
+- confidence: cited
+  path: src/protection.rs
+- confidence: cited
+  path: tests/adversary_protection_writes.rs
+- confidence: cited
+  path: tests/adversary_protection_writes_2.rs
+- confidence: cited
   path: tests/api_protection_writes.rs
-revision: 4
+- confidence: cited
+  path: tests/security_protection_writes.rs
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-20T08:08:59Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-20T08:10:43Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-20T13:48:37Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1,"review_outcome":5,"verification":1}}}
 ---
 ## Problem
 
@@ -79,3 +92,20 @@ the owner's". It is a cause in the existing refusal vocabulary (`gates.delivery.
 - Repository settings that change which branch a ruleset targets (`PATCH /repos/<o>/<r>`
   default branch, `POST …/branches/<b>/rename`) and environment protection rules.
 - Any change to a live ruleset or branch protection.
+
+## Scope
+
+Read from `git diff --stat 94b5d40 ff9b904`, so every line is cited.
+
+| path | role |
+|---|---|
+| `src/protection.rs` (new) | the guard: `protection_write`, `gh_api_refusal`, `gh_api_files` |
+| `src/main.rs` | calls the guard in `Action::Api` and `Action::Gh`, before the policy read and `Github::bot()` |
+| `src/lib.rs` | `pub mod protection` |
+| `ess/domains/delivery.yaml` | `gates.delivery.BotApi`, errors `ProtectionWrite` and `UncheckableInput` |
+| `tests/api_protection_writes.rs` | the implementor's cases |
+| `tests/security_protection_writes.rs`, `tests/adversary_protection_writes.rs`, `tests/adversary_protection_writes_2.rs` | the reviewers' cases |
+| `README.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock` | release content 0.1.22 |
+
+Correction to the inferred scope filed with the story: `src/delivery.rs` was not changed; the
+guard went into the new `src/protection.rs`.

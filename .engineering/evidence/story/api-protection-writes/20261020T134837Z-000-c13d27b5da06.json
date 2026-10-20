@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-20T13:48:37Z",
+  "actor": "human:timo",
+  "artifact": "story:api-protection-writes",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked --no-fail-fast; cargo fmt --all --check; cargo clippy --all-targets --locked -- -D warnings; ess specify validate --path ess",
+    "reference": "wave/ruleset-write-refusal ff9b904: test=0 (556 passed, 0 failed, 6 ignored), fmt=0, clippy=0, ess=0"
+  }
+}
