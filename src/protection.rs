@@ -103,15 +103,19 @@ pub fn gh_api_refusal(
         .enumerate()
         .map(|(i, text)| (argument(i), text.as_bytes().to_vec()))
         .collect();
-    let mut uncheckable = None;
-    for (i, file) in gh_api_files(args) {
+    let files = gh_api_files(args);
+    // Standard input across every argument before any file is read, so an unreadable file
+    // named earlier is never what the refusal names (round 3, B2).
+    let mut uncheckable = files.iter().find(|(_, file)| file == "-").map(|(i, _)| {
+        format!(
+            "{} reads standard input, which cannot be checked for a ruleset or branch \
+             protection change; {OWNERS}: name a file instead",
+            argument(*i)
+        )
+    });
+    for (i, file) in files {
         let named = format!("{}, the file it names ({}),", argument(i), shown(&file));
         if file == "-" {
-            uncheckable.get_or_insert(format!(
-                "{} reads standard input, which cannot be checked for a ruleset or branch \
-                 protection change; {OWNERS}: name a file instead",
-                argument(i)
-            ));
             continue;
         }
         match read(&file) {
@@ -275,6 +279,12 @@ const STAND_INS: [&str; 10] = [
 /// `STAND_INS.len()` to this power fillings are tried; more are refused.
 const MOST_PLACEHOLDER_SEGMENTS: u32 = 4;
 
+/// Most bytes of fillings one argument's placeholders are judged through, each filling
+/// read whole: 4 MiB, enough for one placeholder in the longest argument Linux passes
+/// (128 KiB) and for four in an endpoint of 400 bytes. More is refused as not judged
+/// (round 3, B1).
+const MOST_PLACEHOLDER_WORK: usize = 4 << 20;
+
 /// Whether an argument sets the GraphQL `query` field: the key `query`, in any letter
 /// case, before the first `=` of a field argument: `query=…` (the value of a separate
 /// `-F`, `-f`, `--field` or `--raw-field`), `-Fquery=…`, `-fquery=…`, `-F=query=…`, a short
@@ -349,7 +359,15 @@ fn placeholder(argument: &str) -> Option<String> {
     if count > MOST_PLACEHOLDER_SEGMENTS {
         return Some("holds more placeholders than the guard can judge".into());
     }
-    for n in 0..STAND_INS.len().pow(count) {
+    let fillings = STAND_INS.len().pow(count);
+    if fillings.saturating_mul(text.len()) > MOST_PLACEHOLDER_WORK {
+        return Some(format!(
+            "holds placeholders in more text than the guard can judge: {fillings} fillings \
+             of {} bytes",
+            text.len()
+        ));
+    }
+    for n in 0..fillings {
         let mut filled = segments.clone();
         let mut rest = n;
         for &hole in &holes {
@@ -425,25 +443,209 @@ fn views(bytes: &[u8]) -> Option<Vec<String>> {
 /// `organizations` begins outside a longer word, and runs to the next white space, quote,
 /// backtick or angle bracket. It runs on past a `\`, which every reading takes as a
 /// separator, so `repos\o\r\rulesets` is found; what a refusal shows of it stops at the
-/// protection segment (`protection_prefix`). Each place is judged as it is found, so the
-/// memory used stays linear in the view.
+/// protection segment (`protection_prefix`). Every place in one token is judged at once
+/// (`protected_starts`), so time and memory stay linear in the view; only the first place
+/// found is read again, as `protection_named` reads it, to show it (round 3, B1).
 fn path_in(view: &str) -> Option<String> {
+    let terminator = |c: char| c.is_whitespace() || "\"'`<>".contains(c);
+    let mut begin = 0;
+    let mut starts = Vec::new();
     let mut previous: Option<char> = None;
-    for (at, c) in view.char_indices() {
-        let rest = &view[at..];
-        if !previous.is_some_and(|p| p.is_alphanumeric())
-            && (rest.starts_with("repos") || rest.starts_with("org"))
-        {
-            let end = rest
-                .find(|c: char| c.is_whitespace() || "\"'`<>".contains(c))
-                .unwrap_or(rest.len());
-            if let Some(path) = protection_named(&format!("/{}", &rest[..end])) {
-                return Some(path);
+    for (at, c) in view
+        .char_indices()
+        .chain(std::iter::once((view.len(), ' ')))
+    {
+        if terminator(c) {
+            if !starts.is_empty() {
+                let token = &view[begin..at];
+                let starts: Vec<usize> = starts.drain(..).map(|start| start - begin).collect();
+                for (start, flagged) in starts.iter().zip(protected_starts(token, &starts)) {
+                    if flagged
+                        && let Some(path) = protection_named(&format!("/{}", &token[*start..]))
+                    {
+                        return Some(path);
+                    }
+                }
             }
+            begin = at + c.len_utf8();
+        } else if !previous.is_some_and(|p| p.is_alphanumeric())
+            && (view[at..].starts_with("repos") || view[at..].starts_with("org"))
+        {
+            starts.push(at);
         }
         previous = Some(c);
     }
     None
+}
+
+/// For each of `starts` (ascending offsets in `token`, each where `repos` or `org` begins),
+/// whether `protection_named` finds a protection path in `/` and the rest of the token, all
+/// judged together in time linear in the token: each decoding of the token is folded once
+/// and read once with its query cut and once without (`judge_line`). A start is never left
+/// out where `protection_named` finds a path. A token still changing after
+/// `MOST_DECODINGS` decodings, which no view holds, leaves every start to `path_in`.
+fn protected_starts(token: &str, starts: &[usize]) -> Vec<bool> {
+    let mut found = vec![false; starts.len()];
+    let mut text = token.to_owned();
+    let mut marks = starts.to_vec();
+    for _ in 0..=MOST_DECODINGS {
+        let (folded, at) = folded_marked(&text, &marks);
+        for cut in [true, false] {
+            judge_line(&folded, &at, cut, &mut found);
+        }
+        let (next, moved) = decoded_marked(&text, &marks);
+        if next == text {
+            return found;
+        }
+        text = next;
+        marks = moved;
+    }
+    vec![true; starts.len()]
+}
+
+/// Marks each start whose window of a folded `text`, to its end or with `cut` to the next
+/// `?` or `#`, reads as a protection path with its dot segments kept or resolved. With
+/// `cut`, each run between `?` and `#` is read on its own (`judge_region`).
+fn judge_line(text: &str, starts: &[usize], cut: bool, found: &mut [bool]) {
+    let mut region = 0;
+    let mut first = 0;
+    while first < starts.len() {
+        let end = if cut {
+            text[region..]
+                .find(['?', '#'])
+                .map_or(text.len(), |at| region + at)
+        } else {
+            text.len()
+        };
+        let last = first + starts[first..].iter().take_while(|s| **s < end).count();
+        if last > first {
+            judge_region(
+                &text[region..end],
+                region,
+                &starts[first..last],
+                &mut found[first..last],
+            );
+        }
+        first = last;
+        region = end + 1;
+    }
+}
+
+/// Marks each start (an offset in the whole text, `offset` before `region`) whose window,
+/// from the start to the end of `region`, is a protection path. The region's segments are
+/// read once: split at `/` and `\`, empty ones dropped, trimmed. A window reads the same
+/// segments from the one holding its start, that one cut where the start is. With dot
+/// segments resolved, a window keeps exactly the segments that survive resolution over the
+/// whole region from its first segment on: a `..` removes the nearest surviving segment
+/// before it, the same one whichever segment the reading began at, if that one lies in
+/// the window.
+fn judge_region(region: &str, offset: usize, starts: &[usize], found: &mut [bool]) {
+    let mut spans = Vec::new();
+    let mut begin = 0;
+    for (at, c) in region
+        .char_indices()
+        .chain(std::iter::once((region.len(), '/')))
+    {
+        if c == '/' || c == '\\' {
+            if at > begin {
+                spans.push((begin, at));
+            }
+            begin = at + 1;
+        }
+    }
+    let texts: Vec<&str> = spans.iter().map(|&(b, e)| region[b..e].trim()).collect();
+    let count = texts.len();
+    // The first `protection` segment at or after each index, kept and resolved.
+    let mut kept_protection = vec![count; count + 1];
+    for i in (0..count).rev() {
+        kept_protection[i] = if fixed(texts[i], "protection") {
+            i
+        } else {
+            kept_protection[i + 1]
+        };
+    }
+    let mut survivors: Vec<usize> = Vec::new();
+    for (i, text) in texts.iter().enumerate() {
+        match *text {
+            "." => {}
+            ".." => {
+                survivors.pop();
+            }
+            _ => survivors.push(i),
+        }
+    }
+    let surviving = survivors.len();
+    let mut first_survivor = vec![surviving; count + 1];
+    let mut at = surviving;
+    for i in (0..count).rev() {
+        if at > 0 && survivors[at - 1] == i {
+            at -= 1;
+        }
+        first_survivor[i] = at;
+    }
+    let mut resolved_protection = vec![surviving; surviving + 1];
+    for i in (0..surviving).rev() {
+        resolved_protection[i] = if fixed(texts[survivors[i]], "protection") {
+            i
+        } else {
+            resolved_protection[i + 1]
+        };
+    }
+    let mut segment = 0;
+    for (start, flag) in starts.iter().zip(found.iter_mut()) {
+        let start = start - offset;
+        while spans[segment].1 <= start {
+            segment += 1;
+        }
+        // Untrimmed: it begins with a letter, and `fixed` reads trailing white space as
+        // trimming would.
+        let first = &region[start..spans[segment].1];
+        let kept = is_protection(
+            count - segment,
+            |i| if i == 0 { first } else { texts[segment + i] },
+            |i| kept_protection[(segment + i).min(count)] < count,
+        );
+        let at = first_survivor[segment];
+        let resolved = at < surviving
+            && is_protection(
+                surviving - at,
+                |i| {
+                    if i == 0 && survivors[at] == segment {
+                        first
+                    } else {
+                        texts[survivors[at + i]]
+                    }
+                },
+                |i| resolved_protection[(at + i).min(surviving)] < surviving,
+            );
+        *flag |= kept || resolved;
+    }
+}
+
+/// `protection_prefix(reading).is_some()` for a reading of `len` segments given by
+/// `segment`, with `protection_from(i)` telling whether a `protection` segment lies at or
+/// after index `i`: the same decision, in constant time when both answer in constant time.
+fn is_protection<'a>(
+    len: usize,
+    segment: impl Fn(usize) -> &'a str,
+    protection_from: impl Fn(usize) -> bool,
+) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let first = segment(0);
+    let (rest, organization) = if fixed(first, "repos") && len > 3 {
+        (3, false)
+    } else if fixed(first, "repositories") && len > 2 {
+        (2, false)
+    } else if (fixed(first, "orgs") || fixed(first, "organizations")) && len > 2 {
+        (2, true)
+    } else {
+        return false;
+    };
+    let head = segment(rest);
+    fixed(head, "rulesets")
+        || (!organization && fixed(head, "branches") && protection_from(rest + 2))
 }
 
 /// The protection target of the first reading of `path` that is a protection path, as a
@@ -579,13 +781,7 @@ fn decoded(text: &str, strict: bool) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            // Two hex digits exactly: `from_str_radix` alone would take `%+1`.
-            let hex = bytes
-                .get(i + 1..i + 3)
-                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u8::from_str_radix(h, 16).ok());
-            match hex {
+            match escape(bytes, i) {
                 Some(byte) => {
                     out.push(byte);
                     i += 3;
@@ -603,6 +799,92 @@ fn decoded(text: &str, strict: bool) -> Option<String> {
     } else {
         Some(String::from_utf8_lossy(&out).into_owned())
     }
+}
+
+/// The byte a `%` at `at` escapes: two hex digits exactly, since `from_str_radix` alone
+/// would take `%+1`.
+fn escape(bytes: &[u8], at: usize) -> Option<u8> {
+    bytes
+        .get(at + 1..at + 3)
+        .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .and_then(|h| u8::from_str_radix(h, 16).ok())
+}
+
+/// `decoded(text, false)` with each offset in `marks` (ascending, each at a character that
+/// no escape holds) moved to where its character lands, through the lossy conversion too.
+fn decoded_marked(text: &str, marks: &[usize]) -> (String, Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut moved = Vec::with_capacity(marks.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        while moved.len() < marks.len() && marks[moved.len()] <= i {
+            moved.push(out.len());
+        }
+        if bytes[i] == b'%'
+            && let Some(byte) = escape(bytes, i)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    moved.resize(marks.len(), out.len());
+    // `String::from_utf8_lossy`, chunk by chunk, moving each mark with its byte.
+    let mut string = String::with_capacity(out.len());
+    let mut raw = 0;
+    let mut mark = 0;
+    for chunk in out.utf8_chunks() {
+        let valid = chunk.valid();
+        while mark < moved.len() && moved[mark] < raw + valid.len() {
+            moved[mark] = string.len() + moved[mark].saturating_sub(raw);
+            mark += 1;
+        }
+        string.push_str(valid);
+        raw += valid.len();
+        if !chunk.invalid().is_empty() {
+            string.push(char::REPLACEMENT_CHARACTER);
+            raw += chunk.invalid().len();
+        }
+    }
+    for at in &mut moved[mark..] {
+        *at = string.len();
+    }
+    (string, moved)
+}
+
+/// The fold every reading makes, `\t`, `\n` and `\r` removed then lowercased, with each
+/// offset in `marks` (ascending, each at a character that is kept) moved to where its
+/// character lands. Lowercasing changes lengths character by character; `Σ`, the one
+/// letter whose lowercase depends on its neighbours, is two bytes either way.
+fn folded_marked(text: &str, marks: &[usize]) -> (String, Vec<usize>) {
+    let mut filtered = String::with_capacity(text.len());
+    let mut moved = Vec::with_capacity(marks.len());
+    for (at, c) in text.char_indices() {
+        while moved.len() < marks.len() && marks[moved.len()] <= at {
+            moved.push(filtered.len());
+        }
+        if !matches!(c, '\t' | '\n' | '\r') {
+            filtered.push(c);
+        }
+    }
+    moved.resize(marks.len(), filtered.len());
+    let mut lowered = 0;
+    let mut mark = 0;
+    for (at, c) in filtered.char_indices() {
+        while mark < moved.len() && moved[mark] == at {
+            moved[mark] = lowered;
+            mark += 1;
+        }
+        lowered += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    for at in &mut moved[mark..] {
+        *at = lowered;
+    }
+    (filtered.to_lowercase(), moved)
 }
 
 /// JSON's string escapes undone, left to right and anywhere in the text, as the server's
@@ -669,4 +951,209 @@ fn json_unescaped(text: &str) -> String {
 fn shown(text: &str) -> String {
     let escaped: String = text.escape_debug().collect();
     escaped.chars().take(SHOWN).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The round 2 `path_in`, quadratic in its view: every place a path may begin is read
+    /// again to the end of its token. The reference the linear `path_in` must agree with.
+    fn path_in_reference(view: &str) -> Option<String> {
+        let mut previous: Option<char> = None;
+        for (at, c) in view.char_indices() {
+            let rest = &view[at..];
+            if !previous.is_some_and(|p| p.is_alphanumeric())
+                && (rest.starts_with("repos") || rest.starts_with("org"))
+            {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || "\"'`<>".contains(c))
+                    .unwrap_or(rest.len());
+                if let Some(path) = protection_named(&format!("/{}", &rest[..end])) {
+                    return Some(path);
+                }
+            }
+            previous = Some(c);
+        }
+        None
+    }
+
+    /// Pieces a text is built from: every fixed word and family, a name, an id, each
+    /// separator, dot segments, a query and a fragment, suffixes a router strips, escapes
+    /// that decode to a separator, a dot, a query, a `%` or a letter, white space, a quote.
+    const PIECES: [&str; 34] = [
+        "repos",
+        "repositories",
+        "orgs",
+        "organizations",
+        "rulesets",
+        "branches",
+        "protection",
+        "main",
+        "42",
+        "x",
+        "/",
+        "/",
+        "/",
+        "\\",
+        ".",
+        "..",
+        "?",
+        "#",
+        "-",
+        ";",
+        ".json",
+        "%2f",
+        "%5c",
+        "%2e",
+        "%3f",
+        "%25",
+        "%72",
+        "%52",
+        " ",
+        "%20",
+        "\t",
+        "%09",
+        "\"",
+        "Repos",
+    ];
+
+    /// Texts from a fixed seed (xorshift), so a failing text is found again from its case.
+    struct Texts(u64);
+
+    impl Texts {
+        fn next(&mut self) -> usize {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            usize::try_from(x % 1_000_003).expect("small")
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[self.next() % from.len()]
+        }
+
+        /// Three texts in four are shaped like paths, so protection paths are common; the
+        /// rest are pieces at random.
+        fn text(&mut self) -> String {
+            let mut text = String::new();
+            if self.next().is_multiple_of(4) {
+                for _ in 0..1 + self.next() % 16 {
+                    text.push_str(self.pick(&PIECES));
+                }
+                return text;
+            }
+            for _ in 0..self.next() % 3 {
+                text.push_str(self.pick(&PIECES));
+            }
+            text.push_str(self.pick(&FAMILIES));
+            for _ in 0..self.next() % 9 {
+                text.push_str(self.pick(&SEPARATORS));
+                text.push_str(self.pick(&SEGMENTS));
+            }
+            for _ in 0..self.next() % 3 {
+                text.push_str(self.pick(&PIECES));
+            }
+            text
+        }
+    }
+
+    const FAMILIES: [&str; 9] = [
+        "repos",
+        "repos",
+        "repositories",
+        "orgs",
+        "organizations",
+        "x-repos",
+        ".repos",
+        "%72epos",
+        "repos.json",
+    ];
+
+    const SEPARATORS: [&str; 7] = ["/", "/", "/", "\\", "//", "%2f", "/ "];
+
+    const SEGMENTS: [&str; 22] = [
+        "example",
+        "main",
+        "42",
+        "rulesets",
+        "rulesets",
+        "branches",
+        "branches",
+        "protection",
+        "protection",
+        "rulesets.json",
+        "protection;v",
+        ".",
+        "..",
+        "..",
+        "rulesets?x",
+        "x#y",
+        "?q",
+        "%72ulesets",
+        "%2e%2e",
+        " rulesets",
+        "repos",
+        "\t",
+    ];
+
+    /// Texts each equivalence test reads.
+    const CASES: usize = 120_000;
+
+    /// Round 3, B1: the linear `path_in` finds the same first protection path, shown the
+    /// same way, as the round 2 reference, over texts built to reach every rule.
+    #[test]
+    fn linear_path_finding_agrees_with_the_reference() {
+        let mut texts = Texts(0x9E37_79B9_7F4A_7C15);
+        let mut protected = 0;
+        for case in 0..CASES {
+            let text = texts.text();
+            let found = path_in(&text);
+            assert_eq!(found, path_in_reference(&text), "case {case}: {text:?}");
+            protected += usize::from(found.is_some());
+        }
+        assert!(
+            protected > 5_000,
+            "the texts reach too few protection paths: {protected}"
+        );
+        eprintln!("{protected} of {CASES} texts carry a protection path");
+    }
+
+    /// Round 3, B1: the linear judgement marks exactly the starts at which the round 2
+    /// reading finds a protection path, every start of every token, not only the first
+    /// one `path_in` reads again.
+    #[test]
+    fn linear_judgement_marks_exactly_the_protected_starts() {
+        let mut texts = Texts(0x2545_F491_4F6C_DD1D);
+        let mut marked = 0;
+        for case in 0..CASES {
+            let text = texts.text();
+            for token in text.split(|c: char| c.is_whitespace() || "\"'`<>".contains(c)) {
+                let mut starts = Vec::new();
+                let mut previous: Option<char> = None;
+                for (at, c) in token.char_indices() {
+                    if !previous.is_some_and(|p| p.is_alphanumeric())
+                        && (token[at..].starts_with("repos") || token[at..].starts_with("org"))
+                    {
+                        starts.push(at);
+                    }
+                    previous = Some(c);
+                }
+                let expected: Vec<bool> = starts
+                    .iter()
+                    .map(|start| protection_named(&format!("/{}", &token[*start..])).is_some())
+                    .collect();
+                assert_eq!(
+                    protected_starts(token, &starts),
+                    expected,
+                    "case {case}: {token:?} at {starts:?}"
+                );
+                marked += expected.iter().filter(|m| **m).count();
+            }
+        }
+        assert!(marked > 5_000, "the texts mark too few starts: {marked}");
+        eprintln!("{marked} starts marked over {CASES} texts");
+    }
 }

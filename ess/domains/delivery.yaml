@@ -526,7 +526,8 @@ commands:
   # router may strip (a format such as `.json`, matrix parameters after `;`, trailing white
   # space or control characters); any reading that is a protection path counts. A path
   # found in text runs to the next white space, quote, backtick or angle bracket, on past a
-  # `\` (a separator in every reading).
+  # `\` (a separator in every reading). Every place a path may begin is judged, in time
+  # linear in the text.
   # A protection mutation is `createRepositoryRuleset`, `updateRepositoryRuleset`,
   # `deleteRepositoryRuleset`, `createBranchProtectionRule`, `updateBranchProtectionRule`
   # or `deleteBranchProtectionRule` as a whole GraphQL name (no letter, digit or `_` right
@@ -551,7 +552,9 @@ commands:
   # `query` field (the key `query`, any letter case, before the first `=` of a field
   # argument in any spelling: `query=…`, `-Fquery=…`, `-fquery=…`, `-F=query=…`,
   # `--field=query=…`, `--raw-field=query=…`), and `{branch}` anywhere but as a whole field
-  # value (`head={branch}`), cannot be judged.
+  # value (`head={branch}`), cannot be judged; nor can an argument whose fillings (10 to
+  # the power of the segments holding a placeholder, at most 4 of them) times its length
+  # pass 4 MiB.
   # A refusal names a protection path found in text only up to its `rulesets` segment and
   # a numeric ruleset id after it, or up to its `protection` segment, each fixed segment
   # in its plain spelling; no text after that is shown.
@@ -589,7 +592,9 @@ commands:
       - name: undecodable-text
         when: undecodable_texts.count > 0
         error: gates.delivery.UncheckableInput
-      # `--input -` or `@-`: `gh` would read standard input, which cannot be judged.
+      # `--input -` or `@-`: `gh` would read standard input, which cannot be judged. Found
+      # across every argument before any file is read, so it is named before a file that
+      # cannot be read, whichever argument comes first.
       - name: standard-input
         when: {all: [route == GhApi, standard_input == true]}
         error: gates.delivery.UncheckableInput
