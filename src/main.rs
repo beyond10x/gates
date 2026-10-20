@@ -280,6 +280,21 @@ fn execute(args: Args) -> Result<()> {
         // An option that names a file publishes the file, not its path. Scan what
         // is sent; a scratch path under the home directory is not the content.
         const FILE_OPTIONS: [&str; 3] = ["--body-file", "--notes-file", "--input"];
+        // `gates.delivery.BotApi`: a ruleset or branch protection change is refused before
+        // the policy is read and before a token is minted. Files are read where `gh`
+        // reads them, against `--repo`.
+        if command.first().is_some_and(|verb| verb == "api")
+            && let Some(refusal) = b10x_gates::protection::gh_api_refusal(command, |name| {
+                let path = std::path::Path::new(name);
+                fs::read(if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    args.repo.join(path)
+                })
+            })
+        {
+            bail!("{refusal}");
+        }
         let matchers = matchers(args.policy.as_deref())?;
         let mut previous: Option<&str> = None;
         for (i, argument) in command.iter().enumerate() {
@@ -321,6 +336,15 @@ fn execute(args: Args) -> Result<()> {
     } = &args.command
     {
         let raw = input.as_ref().map(fs::read).transpose()?;
+        // `gates.delivery.BotApi`: a ruleset or branch protection change is refused before
+        // the policy is read and before a token is minted.
+        if let Some(refusal) = b10x_gates::protection::protection_write(
+            method,
+            path,
+            raw.as_deref().unwrap_or_default(),
+        ) {
+            bail!("{refusal}");
+        }
         if let Some(raw) = &raw {
             refuse(
                 &matchers(args.policy.as_deref())?,
