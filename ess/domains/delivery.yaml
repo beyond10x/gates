@@ -9,7 +9,8 @@ summary: >-
   result is observed after the no-commit run. `delete-branch` is the one verb that
   is not Git: it deletes a merged remote branch through the REST API as the App,
   after reading the branch, its protection, the rulesets that apply to it and its
-  ancestry with the default branch.
+  ancestry with the default branch. `api` and `gh -- api` refuse a write to a ruleset
+  or to branch protection before a token is minted.
 
 entities:
   # A branch on the GitHub remote, as the App reads it: its tip, whether classic
@@ -71,6 +72,11 @@ types:
   - name: gates.delivery.PolicySource
     kind: enum
     variants: [Compressed, Json, File]
+  # The verb that sends a bot API request: `b10x-gates api` (one method, one path, one
+  # input file) or `b10x-gates gh -- api` (every argument, every file an argument names).
+  - name: gates.delivery.ApiRoute
+    kind: enum
+    variants: [Api, GhApi]
 
 commands:
   - name: gates.delivery.Merge
@@ -505,7 +511,76 @@ commands:
         payload:
           gates.delivery.PolicyPublished: {apply: input.apply}
 
+  # `b10x-gates api` and `b10x-gates gh -- api`, judged before the policy is read and
+  # before a token is minted. The App holds `administration`, so without this the bot
+  # could loosen the protection that limits the bot; reads stay open.
+  # A protection path is a REST path under `/repos/<o>/<r>/rulesets`,
+  # `/repos/<o>/<r>/branches/<b...>/protection` (a branch name may hold `/`),
+  # `/orgs/<o>/rulesets`, or the same paths under `/repositories/<id>/` and
+  # `/organizations/<id>/`. It is judged in every reading a server on the way may make:
+  # as given and after each percent-decoding until stable, lowercased, with `\` as a
+  # separator, repeated separators collapsed, a trailing separator, a query and a
+  # fragment dropped, tab and newline removed, `.` and `..` segments kept and resolved,
+  # and a fixed segment matched with any suffix such as `.json`; any reading that is a
+  # protection path counts. A protection mutation is `createRepositoryRuleset`,
+  # `updateRepositoryRuleset`, `deleteRepositoryRuleset`, `createBranchProtectionRule`,
+  # `updateBranchProtectionRule` or `deleteBranchProtectionRule`, in any case, also
+  # behind a JSON `\u` escape.
+  # `api` judges its method (a write is any method but GET and HEAD, compared
+  # case-insensitively), its path and, for `/graphql`, the input file's bytes. `gh -- api`
+  # judges every argument and the bytes of every file an argument names (`--input`,
+  # `-F`/`--field` `<key>=@<file>` in every spelling), whatever the method: reads go
+  # through `b10x-gates api --method GET`.
+  # `gh` fills `{owner}`, `{repo}` and `{branch}` (also `:owner`, `:repo`, `:branch`) into
+  # the endpoint and `-F` values after the guard has read them. An owner or name holds no
+  # `/`, so an argument holding one is judged as the endpoint with each segment holding a
+  # placeholder tried as another name, `.`, `..` and every fixed segment; a protection
+  # reading counts as a protection path. A placeholder in an argument naming a GraphQL
+  # `query`, and `{branch}` anywhere but as a whole field value (`head={branch}`), cannot
+  # be judged.
+  - name: gates.delivery.BotApi
+    input:
+      - {name: route, type: gates.delivery.ApiRoute}
+      - {name: write, type: Boolean}
+      - {name: path_decodable, type: Boolean}
+      - {name: protection_paths, type: 'List<String>'}
+      - {name: protection_mutations, type: 'List<String>'}
+      - {name: unjudged_placeholders, type: 'List<String>'}
+      - {name: standard_input, type: Boolean}
+      - {name: unreadable_files, type: 'List<String>'}
+    outcomes:
+      # The refusal names the path and says "ruleset and branch protection changes are
+      # the owner's".
+      - name: protection-path
+        when: {all: [{any: [write == true, route == GhApi]}, protection_paths.count > 0]}
+        error: gates.delivery.ProtectionWrite
+      # A `/graphql` request (`api`) or any argument or named file (`gh -- api`).
+      - name: protection-mutation
+        when: protection_mutations.count > 0
+        error: gates.delivery.ProtectionWrite
+      # Fail closed: an `api` write whose path holds a `%` that is not an escape, or
+      # decodes to bytes that are not UTF-8, at any decoding, cannot be judged.
+      - name: undecodable-path
+        when: {all: [route == Api, write == true, path_decodable == false]}
+        error: gates.delivery.ProtectionWrite
+      - name: unjudged-placeholder
+        when: {all: [route == GhApi, unjudged_placeholders.count > 0]}
+        error: gates.delivery.UncheckableInput
+      # `--input -` or `@-`: `gh` would read standard input, which cannot be judged.
+      - name: standard-input
+        when: {all: [route == GhApi, standard_input == true]}
+        error: gates.delivery.UncheckableInput
+      - name: unreadable-file
+        when: {all: [route == GhApi, unreadable_files.count > 0]}
+        error: gates.delivery.UncheckableInput
+      - name: admitted
+        emits: [gates.delivery.ApiAdmitted]
+        payload:
+          gates.delivery.ApiAdmitted: {route: input.route}
+
 events:
+  - name: gates.delivery.ApiAdmitted
+    fields: [{name: route, type: gates.delivery.ApiRoute}]
   - name: gates.delivery.PolicyUnchanged
     fields: [{name: unchanged, type: Boolean}]
   - name: gates.delivery.PolicyPublishPlanned
@@ -602,3 +677,13 @@ errors:
     fields: [{name: written, type: Boolean}]
   - name: gates.delivery.SecretNotReadBack
     fields: [{name: read_back, type: Boolean}]
+  - name: gates.delivery.ProtectionWrite
+    fields:
+      - {name: protection_paths, type: 'List<String>'}
+      - {name: protection_mutations, type: 'List<String>'}
+      - {name: path_decodable, type: Boolean}
+  - name: gates.delivery.UncheckableInput
+    fields:
+      - {name: unjudged_placeholders, type: 'List<String>'}
+      - {name: standard_input, type: Boolean}
+      - {name: unreadable_files, type: 'List<String>'}
