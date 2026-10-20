@@ -220,6 +220,8 @@ normalised! {
     normalised_tab => "/repos/example/example/rule\tsets",
     normalised_format_suffix => "/repos/example/example/rulesets.json",
     normalised_branch_named_protection => "/repos/example/example/branches/protection/protection",
+    normalised_padded_segment => "/repos/example/example/%20rulesets",
+    normalised_parent_segments_read_unresolved => "/repos/example/example/rulesets/../..",
 }
 
 #[test]
@@ -280,12 +282,31 @@ mod graphql {
     }
 }
 
+/// `mutation(name)` with the letter at `at` of the name written as the JSON escape
+/// `\u00XX`. The backslash is `char::from(92)` and the escape is built here, at run time:
+/// a file-writing tool once decoded a literal escape in this source to the plain letter,
+/// and the test then held no escape at all.
+fn escaped_mutation(name: &str, at: usize) -> Vec<u8> {
+    let letter = name[at..].chars().next().unwrap();
+    let escape = format!("{}u{:04x}", char::from(92u8), u32::from(letter));
+    let spelled = format!("{}{escape}{}", &name[..at], &name[at + letter.len_utf8()..]);
+    let body = String::from_utf8(mutation(name))
+        .unwrap()
+        .replacen(name, &spelled, 1);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        parsed["query"].as_str().unwrap().contains(name),
+        "fixture: the escape decodes to {name}"
+    );
+    assert!(!body.contains(name), "fixture: the raw body hides {name}");
+    body.into_bytes()
+}
+
 #[test]
 fn graphql_mutation_behind_a_json_escape_is_refused() {
-    let body =
-        br#"{"query":"mutation { updateRepositoryRuleset(input: {}) { clientMutationId } }"}"#;
+    let body = escaped_mutation("updateRepositoryRuleset", 3);
     refused(
-        &Sandbox::new().api("POST", "/graphql", Some(body)),
+        &Sandbox::new().api("POST", "/graphql", Some(&body)),
         "updateRepositoryRuleset",
     );
 }
@@ -298,6 +319,39 @@ fn graphql_path_is_normalised() {
             "deleteBranchProtectionRule",
         );
     }
+}
+
+/// A `/graphql` path's query string is read as well as the body, in every reading.
+#[test]
+fn graphql_mutation_in_the_query_string_is_refused() {
+    for (method, path, name) in [
+        (
+            "GET",
+            "/graphql?query=mutation%20%7B%20deleteRepositoryRuleset(input%3A%20%7B%7D)%20%7B%20clientMutationId%20%7D%20%7D",
+            "deleteRepositoryRuleset",
+        ),
+        (
+            "POST",
+            "/graphql?query=mutation{createBranchProtectionRule(input:{}){clientMutationId}}",
+            "createBranchProtectionRule",
+        ),
+        (
+            "GET",
+            "/GraphQL/?query=mutation+%7B+update%2552epositoryRuleset+%7D",
+            "updateRepositoryRuleset",
+        ),
+    ] {
+        refused(&Sandbox::new().api(method, path, None), name);
+    }
+}
+
+#[test]
+fn graphql_query_string_naming_no_mutation_reaches_the_token_step() {
+    reached_token(&Sandbox::new().api(
+        "GET",
+        "/graphql?query=query%20%7B%20viewer%20%7B%20login%20%7D%20%7D",
+        None,
+    ));
 }
 
 #[test]
@@ -410,6 +464,7 @@ fn gh_api_field_file_naming_a_mutation_is_refused() {
         &["graphql", "--field", "query=@query.graphql"],
         &["graphql", "--field=query=@query.graphql"],
         &["graphql", "-Fquery=@query.graphql"],
+        &["graphql", "-F=query=@query.graphql"],
         &["graphql", "-iF", "query=@query.graphql"],
     ] {
         let sandbox = Sandbox::new();
@@ -518,4 +573,85 @@ fn gh_api_placeholders_elsewhere_reach_the_token_step() {
         "title=example",
     ]));
     reached_token(&sandbox.gh(&["repos/{owner}/{repo}/commits/main/status"]));
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// GitHub decodes a body sent with `Content-Encoding` (or `Transfer-Encoding`) before it
+/// reads it, so the bytes the guard read are not the request: refused in every spelling
+/// of `-H`/`--header` and any letter case.
+#[test]
+fn gh_api_body_encoding_header_is_refused() {
+    let compressed = gzip(&mutation("deleteBranchProtectionRule"));
+    assert!(
+        !String::from_utf8_lossy(&compressed)
+            .to_lowercase()
+            .contains("deletebranchprotectionrule"),
+        "fixture: the compressed body hides the mutation name"
+    );
+    for header in [
+        &["-H", "Content-Encoding: gzip"][..],
+        &["-Hcontent-encoding:gzip"],
+        &["-H=CONTENT-ENCODING: gzip"],
+        &["--header", "Content-Encoding : gzip"],
+        &["--header=Content-Encoding:gzip"],
+        &["-iH", "Content-Encoding: gzip"],
+        &["-iHContent-Encoding:gzip"],
+        &["-H", "Transfer-Encoding: gzip"],
+    ] {
+        let sandbox = Sandbox::new();
+        sandbox.file("request.json", &compressed);
+        let mut args = vec!["graphql", "--input", "request.json"];
+        args.extend_from_slice(header);
+        let run = sandbox.gh(&args);
+        refused(&run, "Encoding");
+        assert!(run.stderr.contains("argument"), "{}", run.stderr);
+    }
+}
+
+/// A body in UTF-16 or UTF-32 hides a mutation name from a reading of its bytes as UTF-8;
+/// the guard reads those encodings too.
+#[test]
+fn gh_api_input_file_in_utf16_or_utf32_is_read_decoded() {
+    let name = "deleteBranchProtectionRule";
+    let text = String::from_utf8(mutation(name)).unwrap();
+    let encodings: [Vec<u8>; 4] = [
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        text.chars()
+            .flat_map(|c| u32::from(c).to_le_bytes())
+            .collect(),
+        text.chars()
+            .flat_map(|c| u32::from(c).to_be_bytes())
+            .collect(),
+    ];
+    for bytes in encodings {
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(name),
+            "fixture: the encoded body hides {name}"
+        );
+        let sandbox = Sandbox::new();
+        sandbox.file("request.json", &bytes);
+        refused(&sandbox.gh(&["graphql", "--input", "request.json"]), name);
+    }
+}
+
+/// The escape reaches the guard through `gh` too: an `--input` file whose mutation name
+/// holds a JSON `\u` escape.
+#[test]
+fn gh_api_input_file_with_a_json_escape_is_refused() {
+    let sandbox = Sandbox::new();
+    sandbox.file(
+        "request.json",
+        &escaped_mutation("createRepositoryRuleset", 0),
+    );
+    refused(
+        &sandbox.gh(&["graphql", "--input", "request.json"]),
+        "createRepositoryRuleset",
+    );
 }
