@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use b10x_gates::{
     BOT_EMAIL, BOT_NAME,
+    delivery::ApiFailure,
     git::Git,
     policy::{Policy, Repository},
     published_merge::AuthenticatedRead,
 };
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
@@ -23,11 +25,16 @@ const REF: &str = "/repos/example/repository/git/ref/heads/main";
 #[derive(Default)]
 struct Evidence {
     responses: BTreeMap<String, Value>,
+    /// Paths GitHub answers with this status instead, after `Github`'s own retries.
+    failures: BTreeMap<String, StatusCode>,
     calls: Cell<usize>,
 }
 impl AuthenticatedRead for Evidence {
     fn get(&self, path: &str) -> Result<Value> {
         self.calls.set(self.calls.get() + 1);
+        if let Some(status) = self.failures.get(path) {
+            return Err(ApiFailure::new(*status, None).into());
+        }
         self.responses
             .get(path)
             .cloned()
@@ -239,6 +246,10 @@ struct UpdateFixture {
 
 impl UpdateFixture {
     fn new() -> Self {
+        Self::with_merge_subject("GitHub final merge")
+    }
+
+    fn with_merge_subject(merge_subject: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         git(
             dir.path(),
@@ -261,13 +272,7 @@ impl UpdateFixture {
             true,
             "GitHub update branch",
         );
-        let merge = commit(
-            dir.path(),
-            &tree,
-            &[&base, &update],
-            true,
-            "GitHub final merge",
-        );
+        let merge = commit(dir.path(), &tree, &[&base, &update], true, merge_subject);
         let candidate = commit(dir.path(), &tree, &[&merge], false, "candidate");
         git(
             dir.path(),
@@ -3222,4 +3227,432 @@ fn an_api_merge_no_merged_pull_request_binds_refuses() {
             &format!("a merge no pull request binds (private: {private})"),
         );
     }
+}
+
+// GitHub answers `commits/<sha>/pulls` with a 5xx for some merges on every attempt (2026-10-22:
+// 10 of 23 merges of one repository, the App and a personal token alike). The merge's own subject
+// then names the pull request to read instead, and that record is proved as a listed one is.
+
+const SUBJECT: &str = "Merge pull request #5 from example/topic";
+
+type Mutation = (&'static str, fn(&mut Fixture));
+
+fn association_list(oid: &str) -> String {
+    format!("{ROOT}/commits/{oid}/pulls?per_page=100&page=1")
+}
+
+impl Fixture {
+    /// The merge again with `subject`, proved by pull request `number`, and GitHub answering
+    /// `status` for the merge's association list.
+    fn named_merge(&mut self, subject: &str, number: u64, status: StatusCode) {
+        let (baseline, topic) = (self.baseline.clone(), self.topic.clone());
+        self.merge = commit(
+            self.dir.path(),
+            &self.tree,
+            &[&baseline, &topic],
+            true,
+            subject,
+        );
+        self.candidate = commit(
+            self.dir.path(),
+            &self.tree,
+            &[&self.merge],
+            false,
+            "candidate",
+        );
+        self.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(self.merge);
+        self.prove_merge(self.merge.clone(), baseline, topic, number);
+        let list = association_list(&self.merge);
+        self.api.responses.remove(&list);
+        self.api.failures.insert(list, status);
+    }
+
+    fn pull(&mut self, number: u64) -> &mut Value {
+        self.api
+            .responses
+            .get_mut(&format!("{ROOT}/pulls/{number}"))
+            .unwrap()
+    }
+
+    fn refusal(&self, what: &str) -> String {
+        format!(
+            "{:#}",
+            self.verify().expect_err(&format!("{what} admitted"))
+        )
+    }
+}
+
+#[test]
+fn a_failing_association_list_is_replaced_by_the_pull_request_the_merge_names() {
+    for status in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::GATEWAY_TIMEOUT,
+    ] {
+        let mut f = Fixture::new();
+        f.named_merge(SUBJECT, 5, status);
+        assert!(f.verify().is_ok(), "{status}: {:?}", f.verify());
+    }
+}
+
+#[test]
+fn a_failing_association_list_without_a_named_pull_request_refuses_and_names_the_read() {
+    for subject in [
+        "merge",
+        "Merge branch 'main' into topic",
+        "Merge pull request #05 from example/topic",
+        "Merge pull request #5",
+        "Add the topic\n\nMerge pull request #5 from example/topic",
+    ] {
+        let mut f = Fixture::new();
+        f.named_merge(subject, 5, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = f.refusal(subject);
+        let read = format!("GET {}: ", association_list(&f.merge));
+        assert!(
+            error.contains(&read)
+                && error.contains("500")
+                && error.contains("names no pull request"),
+            "{subject:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_client_error_on_the_association_list_never_falls_back() {
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::FORBIDDEN,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let mut f = Fixture::new();
+        f.named_merge(SUBJECT, 5, status);
+        let error = f.refusal(status.as_str());
+        assert!(
+            !error.contains("stand in") && error.contains(status.as_str()),
+            "{status}: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_named_pull_request_must_name_this_commit_as_its_merge() {
+    let mutations: [Mutation; 4] = [
+        ("another merge commit", |f| {
+            let topic = f.topic.clone();
+            f.pull(5)["merge_commit_sha"] = json!(topic);
+        }),
+        ("no merge commit", |f| {
+            f.pull(5)["merge_commit_sha"] = Value::Null
+        }),
+        ("another number", |f| f.pull(5)["number"] = json!(6)),
+        ("no record", |f| {
+            f.api.responses.remove(&format!("{ROOT}/pulls/5"));
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+        mutate(&mut f);
+        let error = f.refusal(what);
+        assert!(error.contains("could not stand in"), "{what}: {error}");
+    }
+}
+
+#[test]
+fn a_subject_naming_another_pull_request_refuses() {
+    // Pull request #6 exists and is complete, but merged another commit.
+    let mut f = Fixture::new();
+    f.named_merge(
+        "Merge pull request #6 from example/topic",
+        5,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    );
+    let mut other = f.pull(5).clone();
+    other["number"] = json!(6);
+    other["merge_commit_sha"] = json!(f.topic);
+    f.api.responses.insert(format!("{ROOT}/pulls/6"), other);
+    let error = f.refusal("a subject naming another pull request");
+    assert!(error.contains("#6 does not name this commit"), "{error}");
+}
+
+#[test]
+fn the_named_pull_request_is_proved_as_strictly_as_a_listed_one() {
+    let mutations: [Mutation; 8] = [
+        ("unmerged", |f| f.pull(5)["merged"] = json!(false)),
+        ("open", |f| f.pull(5)["state"] = json!("open")),
+        ("merged by a person", |f| {
+            f.pull(5)["merged_by"]["login"] = json!("someone")
+        }),
+        ("another head", |f| {
+            let baseline = f.baseline.clone();
+            f.pull(5)["head"]["sha"] = json!(baseline)
+        }),
+        ("another base branch", |f| {
+            f.pull(5)["base"]["ref"] = json!("release")
+        }),
+        ("a fork head", |f| {
+            f.pull(5)["head"]["repo"]["full_name"] = json!("fork/repository")
+        }),
+        ("a foreign base repository id", |f| {
+            f.pull(5)["base"]["repo"]["id"] = json!(124)
+        }),
+        ("an unverified merge", |f| {
+            f.remote_commit()["commit"]["verification"]["verified"] = json!(false)
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(f.verify().is_ok(), "{what}: control refused");
+        mutate(&mut f);
+        f.refusal(what);
+    }
+}
+
+#[test]
+fn a_named_merge_must_still_be_the_clean_local_merge_of_its_parents() {
+    let mut f = Fixture::new();
+    let root = f.dir.path().to_owned();
+    let extra = tree_of(&root, &[("extra", b"not in either parent\n")]);
+    f.tree = extra;
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let error = f.refusal("a merge carrying a change of its own");
+    assert!(error.contains("local merge"), "{error}");
+}
+
+#[test]
+fn the_named_pull_request_s_own_read_failing_refuses_and_names_both_reads() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let pull = format!("{ROOT}/pulls/5");
+    f.api.responses.remove(&pull);
+    f.api
+        .failures
+        .insert(pull.clone(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error = f.refusal("both reads failing");
+    assert!(
+        error.contains(&format!("GET {}: ", association_list(&f.merge)))
+            && error.contains(&format!("GET {pull}: ")),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_private_named_merge_still_needs_the_exact_bot_accounts() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    privatize(&mut f.api.responses);
+    assert!(f.verify().is_ok(), "{:?}", f.verify());
+    f.pull(5)["user"]["id"] = json!(BOT_USER_ID + 1);
+    let error = f.refusal("a private merge opened by another account");
+    assert!(error.contains("opened by the exact bot account"), "{error}");
+}
+
+/// A squash merge onto the baseline whose subject is `subject`, proved by pull request #5,
+/// with its association list failing.
+fn named_squash(subject: &str) -> Fixture {
+    let mut f = Fixture::new();
+    let (baseline, topic, tree) = (f.baseline.clone(), f.topic.clone(), f.tree.clone());
+    f.merge = commit(f.dir.path(), &tree, &[&baseline], true, subject);
+    f.candidate = commit(f.dir.path(), &tree, &[&f.merge], false, "candidate");
+    f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(f.merge);
+    let merge = f.merge.clone();
+    f.api.responses.insert(format!("{ROOT}/commits/{merge}"), json!({
+        "sha":merge,"author":{"login":BOT_NAME},"committer":{"login":"web-flow"},
+        "commit":{"author":{"name":BOT_NAME,"email":BOT_EMAIL},"committer":{"name":"GitHub","email":"noreply@github.com"},"tree":{"sha":tree},"verification":{"verified":true,"reason":"valid"}},
+        "parents":[{"sha":baseline}]
+    }));
+    f.api.responses.insert(format!("{ROOT}/pulls/5"), json!({"number":5,"state":"closed","merged":true,"merge_commit_sha":merge,"merged_by":{"login":BOT_NAME},"head":{"sha":topic,"repo":{"full_name":REPOSITORY,"id":123}},"base":{"ref":"main","sha":baseline,"repo":{"full_name":REPOSITORY,"id":123}}}));
+    f.api
+        .failures
+        .insert(association_list(&merge), StatusCode::INTERNAL_SERVER_ERROR);
+    f
+}
+
+#[test]
+fn a_named_squash_merge_is_admitted_only_where_a_listed_one_is() {
+    let f = named_squash("Add the topic (#5)");
+    assert!(f.verify().is_ok(), "public squash: {:?}", f.verify());
+
+    let mut f = named_squash("Add the topic (#5)");
+    f.pull(5)["base"]["sha"] = json!(f.topic);
+    let error = f.refusal("a squash onto another base");
+    assert!(error.contains("not the pull request base"), "{error}");
+
+    let mut f = named_squash("Add the topic (#5)");
+    privatize(&mut f.api.responses);
+    let error = f.refusal("a private squash");
+    assert!(error.contains("only two-parent"), "{error}");
+
+    let f = named_squash("Add the topic #5");
+    let error = f.refusal("a squash subject without the number form");
+    assert!(error.contains("names no pull request"), "{error}");
+}
+
+fn refusals(results: [Result<()>; 2]) -> Vec<String> {
+    results
+        .into_iter()
+        .map(|result| format!("{:#}", result.expect_err("admitted")))
+        .collect()
+}
+
+#[test]
+fn an_update_branch_s_final_merge_falls_back_to_the_pull_request_it_names() {
+    let mut f = UpdateFixture::with_merge_subject("Merge pull request #404 from example/topic");
+    let list = association_list(&f.merge);
+    f.api.responses.remove(&list);
+    f.api
+        .failures
+        .insert(list, StatusCode::INTERNAL_SERVER_ERROR);
+    for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+        .into_iter()
+        .zip(f.verify())
+    {
+        assert!(result.is_ok(), "{entrypoint} refused: {result:?}");
+    }
+}
+
+#[test]
+fn an_update_branch_s_final_merge_naming_another_pull_request_refuses() {
+    let mut f = UpdateFixture::with_merge_subject("Merge pull request #405 from example/topic");
+    let list = association_list(&f.merge);
+    f.api.responses.remove(&list);
+    f.api
+        .failures
+        .insert(list, StatusCode::INTERNAL_SERVER_ERROR);
+    let mut other = f.pull();
+    other["number"] = json!(405);
+    f.api.responses.insert(format!("{ROOT}/pulls/405"), other);
+    for error in refusals(f.verify()) {
+        assert!(error.contains("tied to another pull request"), "{error}");
+    }
+}
+
+#[test]
+fn a_failing_association_list_of_a_branch_update_refuses() {
+    // A branch update's subject names no pull request, so nothing stands in for its list.
+    let mut f = UpdateFixture::with_merge_subject("Merge pull request #404 from example/topic");
+    let list = association_list(&f.update);
+    f.api.responses.remove(&list);
+    f.api
+        .failures
+        .insert(list.clone(), StatusCode::INTERNAL_SERVER_ERROR);
+    for error in refusals(f.verify()) {
+        assert!(
+            error.contains(&format!("GET {list}: ")) && error.contains("names no pull request"),
+            "{error}"
+        );
+    }
+}
+
+// Security review of the 5xx fallback, 2026-10-22: strictness parity with the list path.
+
+impl Fixture {
+    /// The merge again with `rest` after its committer line (extra headers, the blank line and
+    /// the message), proved by pull request `number`, its association list answering 500.
+    fn raw_named_merge(&mut self, rest: &str, number: u64) {
+        let (baseline, topic) = (self.baseline.clone(), self.topic.clone());
+        let raw = format!(
+            "tree {}\nparent {baseline}\nparent {topic}\nauthor {BOT_NAME} <{BOT_EMAIL}> 1700000000 +0000\ncommitter GitHub <noreply@github.com> 1700000000 +0000\n{rest}",
+            self.tree
+        );
+        self.merge = git(
+            self.dir.path(),
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            raw.as_bytes(),
+        );
+        self.candidate = commit(
+            self.dir.path(),
+            &self.tree,
+            &[&self.merge],
+            false,
+            "candidate",
+        );
+        self.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(self.merge);
+        self.prove_merge(self.merge.clone(), baseline, topic, number);
+        let list = association_list(&self.merge);
+        self.api.responses.remove(&list);
+        self.api
+            .failures
+            .insert(list, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+#[test]
+fn review_a_server_error_on_a_later_page_keeps_the_ambiguity_page_one_showed() {
+    // Page 1 of the merge's association list answers, full (100 entries), and already shows a
+    // second completed pull request naming this merge. The list path refuses that state.
+    fn ambiguous_first_page(f: &mut Fixture) -> String {
+        let first_page = association_list(&f.merge);
+        let named = f.pull(5).clone();
+        let mut second = named.clone();
+        second["number"] = json!(6);
+        let mut entries = vec![named, second];
+        entries.extend((7..105).map(|number| json!({"number":number,"merge_commit_sha":null})));
+        assert_eq!(entries.len(), 100);
+        f.api.failures.remove(&first_page);
+        f.api.responses.insert(first_page, json!(entries));
+        format!("{ROOT}/commits/{}/pulls?per_page=100&page=2", f.merge)
+    }
+
+    let mut listed = Fixture::new();
+    listed.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let second_page = ambiguous_first_page(&mut listed);
+    listed.api.responses.insert(second_page, json!([]));
+    let error = listed.refusal("control: two pull requests naming the merge, every page read");
+    assert!(error.contains("ambiguous"), "{error}");
+
+    // The same evidence, with page 2 answering 500 after the retries: the fallback must not
+    // discard the ambiguity page 1 already showed, so a later page failing refuses outright.
+    let mut partial = Fixture::new();
+    partial.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let second_page = ambiguous_first_page(&mut partial);
+    partial
+        .api
+        .failures
+        .insert(second_page.clone(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error =
+        partial.refusal("two pull requests naming the merge on page 1, page 2 answering 500");
+    assert!(error.contains(&format!("GET {second_page}")), "{error}");
+    assert!(!error.contains("could not stand in"), "{error}");
+}
+
+#[test]
+fn review_a_signed_merge_s_subject_is_read_after_its_signature_only() {
+    // GitHub signs every merge it writes; no other fixture carries a gpgsig header. Its armor's
+    // blank line is a lone space, so the message starts after the signature, never inside it.
+    let signature = |inner: &str| {
+        format!(
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsBcBAABCAAQBQJlAAAACRBK7hj4Ov3rIwAAdHIIAKdU\n {inner}\n =abcd\n -----END PGP SIGNATURE-----\n"
+        )
+    };
+
+    let mut signed = Fixture::new();
+    signed.raw_named_merge(
+        &format!(
+            "{}\nMerge pull request #5 from example/topic\n\nAccepted head.\n",
+            signature("Merge pull request #6 from example/other")
+        ),
+        5,
+    );
+    assert!(
+        signed.verify().is_ok(),
+        "signed merge: {:?}",
+        signed.verify()
+    );
+
+    // A pull request named only inside the signature names none: pull request #5 is complete
+    // and does name this merge, yet the message names nothing, so nothing stands in.
+    let mut hidden = Fixture::new();
+    hidden.raw_named_merge(
+        &format!(
+            "{}\nmerge\n",
+            signature("Merge pull request #5 from example/topic")
+        ),
+        5,
+    );
+    let error = hidden.refusal("a pull request named only inside the signature");
+    assert!(error.contains("names no pull request"), "{error}");
 }

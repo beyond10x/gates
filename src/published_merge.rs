@@ -164,11 +164,34 @@ fn bot_account(value: &Value, pointer: &str) -> bool {
     })
 }
 
-fn pages(api: &impl AuthenticatedRead, path: &str) -> Result<Vec<Value>> {
+/// Every read names its method and path when it fails, so a refusal says which evidence was
+/// unavailable. The path holds only the repository, object ids, numbers and the default branch.
+fn read(api: &impl AuthenticatedRead, path: &str) -> Result<Value> {
+    api.get(path).map_err(|error| {
+        let named = format!("GET {path}: {error}");
+        error.context(named)
+    })
+}
+
+fn page(path: &str, page: u32) -> String {
     let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}per_page=100&page={page}")
+}
+
+fn pages(api: &impl AuthenticatedRead, path: &str) -> Result<Vec<Value>> {
+    let first = read(api, &page(path, 1))?;
+    later_pages(api, path, first)
+}
+
+/// The list from its first page on. A later page that fails refuses: what earlier pages showed
+/// is evidence, so it is never replaced.
+fn later_pages(api: &impl AuthenticatedRead, path: &str, first: Value) -> Result<Vec<Value>> {
     let mut items = Vec::new();
-    for page in 1..=20 {
-        let result = api.get(&format!("{path}{separator}per_page=100&page={page}"))?;
+    let mut result = first;
+    for number in 1..=20 {
+        if number > 1 {
+            result = read(api, &page(path, number))?;
+        }
         let values = result
             .as_array()
             .context("remote list missing or redacted")?;
@@ -179,6 +202,24 @@ fn pages(api: &impl AuthenticatedRead, path: &str) -> Result<Vec<Value>> {
         }
     }
     anyhow::bail!("remote pagination incomplete")
+}
+
+/// The pull request number in a raw commit's subject, in the two forms GitHub writes:
+/// `Merge pull request #<n> from <head>` for a merge and `<title> (#<n>)` for a squash. The
+/// number is decimal, positive and without a leading zero; anything else names none.
+fn pull_request_number(raw: &[u8]) -> Option<u64> {
+    let start = raw.windows(2).position(|pair| pair == b"\n\n")? + 2;
+    let message = std::str::from_utf8(&raw[start..]).ok()?;
+    let subject = message.lines().next()?;
+    let digits = if let Some(rest) = subject.strip_prefix("Merge pull request #") {
+        rest.split_once(" from ")?.0
+    } else {
+        subject.strip_suffix(')')?.rsplit_once(" (#")?.1
+    };
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 pub(crate) fn encoded_segment(value: &str) -> String {
@@ -202,7 +243,7 @@ impl Authority {
         expected_id: &str,
     ) -> Result<Self> {
         let root = format!("/repos/{repository}");
-        let remote = api.get(&root)?;
+        let remote = read(api, &root)?;
         let repository_id: u64 = expected_id
             .parse()
             .context("enrolled numeric repository identity invalid")?;
@@ -226,10 +267,10 @@ impl Authority {
             verify_branch_authority(api, &root)?;
         }
 
-        let reference = api.get(&format!(
-            "{root}/git/ref/heads/{}",
-            encoded_segment(&default_branch)
-        ))?;
+        let reference = read(
+            api,
+            &format!("{root}/git/ref/heads/{}", encoded_segment(&default_branch)),
+        )?;
         ensure!(
             string(&reference, "/ref")? == format!("refs/heads/{default_branch}")
                 && string(&reference, "/object/type")? == "commit",
@@ -271,7 +312,7 @@ fn verify_branch_authority(api: &impl AuthenticatedRead, root: &str) -> Result<(
         .get("id")
         .and_then(Value::as_u64)
         .context("branch authority identity missing")?;
-    let authority = api.get(&format!("{root}/rulesets/{id}"))?;
+    let authority = read(api, &format!("{root}/rulesets/{id}"))?;
     let expected = json!({
         "name":AUTHORITY_NAME,"target":"branch","enforcement":"active",
         "bypass_actors":[{"actor_id":BOT_APP_ID,"actor_type":"Integration","bypass_mode":"always"}],
@@ -309,7 +350,7 @@ impl Authority {
     ) -> Result<()> {
         self.ensure_published(git, oid)?;
         self.verify_remote_commit(api, oid, commit)?;
-        let pulls = self.pull_associations(api, oid)?;
+        let pulls = self.pull_associations(git, api, oid)?;
         let terminal = pulls
             .iter()
             .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str) == Some(oid))
@@ -334,7 +375,7 @@ impl Authority {
         commit_oid: &str,
         commit: &GithubCommit,
     ) -> Result<()> {
-        let remote = api.get(&format!("{}/commits/{commit_oid}", self.root))?;
+        let remote = read(api, &format!("{}/commits/{commit_oid}", self.root))?;
         ensure!(
             oid(&remote, "/sha")? == commit_oid,
             "remote merge identity mismatch"
@@ -377,8 +418,26 @@ impl Authority {
         Ok(())
     }
 
-    fn pull_associations(&self, api: &impl AuthenticatedRead, oid: &str) -> Result<Vec<Value>> {
-        let pulls = pages(api, &format!("{}/commits/{oid}/pulls", self.root))?;
+    fn pull_associations(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        oid: &str,
+    ) -> Result<Vec<Value>> {
+        // Only a list GitHub never began to answer falls back. Once a page has answered, its
+        // entries stay evidence, and a later page failing refuses.
+        let path = format!("{}/commits/{oid}/pulls", self.root);
+        let pulls = match read(api, &page(&path, 1)) {
+            Ok(first) => later_pages(api, &path, first)?,
+            Err(error) if crate::delivery::is_server_error(&error) => {
+                self.named_pull_request(git, api, oid).map_err(|named| {
+                    anyhow::anyhow!(
+                        "{error}; the pull request the merge names could not stand in: {named}"
+                    )
+                })?
+            }
+            Err(error) => return Err(error),
+        };
         for pull in &pulls {
             ensure!(
                 pull.get("number")
@@ -395,6 +454,30 @@ impl Authority {
             );
         }
         Ok(pulls)
+    }
+
+    /// The association list when `commits/<sha>/pulls` keeps answering 5xx: GitHub has done so
+    /// for the same merge on every attempt. The merge's own subject names its pull request, and
+    /// that number is only a candidate; the pull request's record must name this commit as its
+    /// merge commit. The caller then proves the record exactly as it proves a listed one, so no
+    /// check is skipped. What the list adds is that no second pull request also names this merge,
+    /// and that does not change what the merge's tree is proved against. A commit whose subject
+    /// names no pull request (a branch update) has no stand-in and stays refused.
+    fn named_pull_request(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        oid: &str,
+    ) -> Result<Vec<Value>> {
+        let number = pull_request_number(&git.read(&["cat-file", "commit", oid])?)
+            .context("the merge's subject names no pull request")?;
+        let pull = read(api, &format!("{}/pulls/{number}", self.root))?;
+        ensure!(
+            pull.get("number").and_then(Value::as_u64) == Some(number)
+                && pull.get("merge_commit_sha").and_then(Value::as_str) == Some(oid),
+            "pull request #{number} does not name this commit as its merge"
+        );
+        Ok(vec![pull])
     }
 
     fn verify_update_branch(
@@ -477,7 +560,7 @@ impl Authority {
         );
         self.ensure_published(git, merge)?;
         self.verify_remote_commit(api, merge, &merge_commit)?;
-        let merge_pulls = self.pull_associations(api, merge)?;
+        let merge_pulls = self.pull_associations(git, api, merge)?;
         self.verify_terminal_merge(
             git,
             api,
@@ -537,7 +620,7 @@ impl Authority {
         );
         self.ensure_published(git, merge)?;
         self.verify_remote_commit(api, merge, &merge_commit)?;
-        let merge_pulls = self.pull_associations(api, merge)?;
+        let merge_pulls = self.pull_associations(git, api, merge)?;
         self.verify_terminal_merge(
             git,
             api,
@@ -590,7 +673,7 @@ impl Authority {
                 shape.parents.len() == 2 && shape.parents[0] != shape.parents[1],
                 "a commit on the pull request head line is neither the bot's nor a branch update"
             );
-            let pulls = self.pull_associations(api, commit)?;
+            let pulls = self.pull_associations(git, api, commit)?;
             let completed: Vec<_> = pulls
                 .iter()
                 .filter(|pr| pr.get("merge_commit_sha").and_then(Value::as_str).is_some())
@@ -718,7 +801,7 @@ impl Authority {
         number: u64,
         merge: &str,
     ) -> Result<Value> {
-        let pr = api.get(&format!("{}/pulls/{number}", self.root))?;
+        let pr = read(api, &format!("{}/pulls/{number}", self.root))?;
         ensure!(
             pr.get("number").and_then(Value::as_u64) == Some(number),
             "pull request identity mismatch"
@@ -777,5 +860,54 @@ mod tests {
             crate::BOT_EMAIL.starts_with(&format!("{}+", super::BOT_USER_ID)),
             "BOT_USER_ID and BOT_EMAIL name different accounts"
         );
+    }
+
+    fn number(message: &str) -> Option<u64> {
+        let raw = format!("tree 0\nparent 1\nauthor a\ncommitter c\n\n{message}");
+        super::pull_request_number(raw.as_bytes())
+    }
+
+    #[test]
+    fn the_pull_request_number_is_read_only_from_github_s_subject_forms() {
+        for (message, expected) in [
+            (
+                "Merge pull request #20 from beyond10x/release/0.13.3\n\nbody",
+                Some(20),
+            ),
+            ("Merge pull request #7 from o/topic", Some(7)),
+            ("Add the thing (#42)\n\n* one\n* two", Some(42)),
+            (
+                "Merge pull request #18446744073709551615 from o/x",
+                Some(u64::MAX),
+            ),
+            ("Merge pull request #18446744073709551616 from o/x", None),
+            ("Merge pull request #0 from o/x", None),
+            ("Merge pull request #07 from o/x", None),
+            ("Merge pull request #+7 from o/x", None),
+            ("Merge pull request #7x from o/x", None),
+            ("Merge pull request # from o/x", None),
+            ("Merge pull request #7", None),
+            ("merge pull request #7 from o/x", None),
+            (" Merge pull request #7 from o/x", None),
+            ("Add the thing (#42) ", None),
+            ("Add the thing (#4 2)", None),
+            ("Add the thing (#)", None),
+            ("Add the thing #42", None),
+            ("Merge branch 'main' into topic", None),
+            (
+                "Merge branch 'main' into topic\n\nMerge pull request #7 from o/x",
+                None,
+            ),
+            ("subject\n\nAdd the thing (#42)", None),
+            ("", None),
+        ] {
+            assert_eq!(number(message), expected, "{message:?}");
+        }
+        // The subject is the first line after the headers, never a header line.
+        assert_eq!(
+            super::pull_request_number(b"tree 0\nauthor Merge pull request #7 from o/x\n\nnone"),
+            None
+        );
+        assert_eq!(super::pull_request_number(b"no message"), None);
     }
 }

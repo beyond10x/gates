@@ -448,7 +448,8 @@ impl Github {
     }
 
     /// `api` with the success status. A non-2xx answer is an `ApiFailure`, whose
-    /// text is the status alone until `ApiFailure::render` has the matchers.
+    /// text is the status alone until `ApiFailure::render` has the matchers. A GET that
+    /// GitHub answers with a server error is sent again, see `retry_server_errors`.
     pub fn api_response(
         &self,
         method: Method,
@@ -456,6 +457,18 @@ impl Github {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         ensure!(api_path_admitted(path), "invalid GitHub API path");
+        if method == Method::GET {
+            return retry_server_errors(std::thread::sleep, || self.send(Method::GET, path, body));
+        }
+        self.send(method, path, body)
+    }
+
+    fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(StatusCode, Value)> {
         let mut request = self
             .client
             .request(method, format!("https://api.github.com{path}"))
@@ -663,6 +676,40 @@ pub fn ci_candidate_from(
     Ok((git, candidate))
 }
 
+/// How many times a GET is sent in all while GitHub answers it with a server error. On
+/// 2026-10-22 `commits/<sha>/pulls` answered 500 for 10 of 23 merges of one repository, to the
+/// App and to a personal token alike, and one URL answered 500 four times in a row before 200.
+const GET_ATTEMPTS: u32 = 5;
+/// The wait before the second attempt; it doubles before each later one (0.5 s to 4 s).
+const GET_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Send again while the answer is a 5xx `ApiFailure`, at most `GET_ATTEMPTS` times, and return
+/// the last answer. Any other answer or error returns at once. Only GETs come here: a write
+/// that failed with a 5xx may still have happened.
+fn retry_server_errors<T>(
+    mut sleep: impl FnMut(Duration),
+    mut send: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut delay = GET_BACKOFF;
+    for _ in 1..GET_ATTEMPTS {
+        match send() {
+            Err(error) if is_server_error(&error) => {
+                sleep(delay);
+                delay *= 2;
+            }
+            answer => return answer,
+        }
+    }
+    send()
+}
+
+/// Whether the error is GitHub answering with a 5xx status, under any context.
+pub fn is_server_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiFailure>()
+        .is_some_and(|failure| failure.status().is_server_error())
+}
+
 /// A GitHub answer that was not 2xx. Its text is the status alone; GitHub's own
 /// message is shown only by `render`, after the private-rule matchers have read it.
 #[derive(Debug)]
@@ -687,7 +734,7 @@ impl std::error::Error for ApiFailure {}
 const MESSAGE_LIMIT: usize = 300;
 
 impl ApiFailure {
-    fn new(status: StatusCode, body: Option<Value>) -> Self {
+    pub fn new(status: StatusCode, body: Option<Value>) -> Self {
         Self { status, body }
     }
 
@@ -1352,4 +1399,78 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn failure(status: StatusCode) -> anyhow::Error {
+        anyhow::Error::from(ApiFailure::new(status, None)).context("GET /repos/o/r")
+    }
+
+    /// Run `retry_server_errors` over `answers`, one per attempt; return its result, the
+    /// number of sends and the waits it asked for.
+    fn run(answers: Vec<Result<u32>>) -> (Result<u32>, usize, Vec<Duration>) {
+        let answers = RefCell::new(answers.into_iter());
+        let sends = RefCell::new(0);
+        let mut waits = Vec::new();
+        let result = retry_server_errors(
+            |delay| waits.push(delay),
+            || {
+                *sends.borrow_mut() += 1;
+                answers
+                    .borrow_mut()
+                    .next()
+                    .expect("sent more than answered")
+            },
+        );
+        (result, sends.into_inner(), waits)
+    }
+
+    #[test]
+    fn a_server_error_is_sent_again_until_it_answers() {
+        let (result, sends, waits) = run(vec![
+            Err(failure(StatusCode::INTERNAL_SERVER_ERROR)),
+            Err(failure(StatusCode::BAD_GATEWAY)),
+            Ok(7),
+        ]);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(sends, 3);
+        assert_eq!(
+            waits,
+            [Duration::from_millis(500), Duration::from_millis(1000)]
+        );
+    }
+
+    #[test]
+    fn retries_are_bounded_and_the_last_server_error_is_returned() {
+        let answers = (0..GET_ATTEMPTS + 3)
+            .map(|_| Err(failure(StatusCode::INTERNAL_SERVER_ERROR)))
+            .collect();
+        let (result, sends, waits) = run(answers);
+        let error = result.expect_err("a server error that persists must fail");
+        assert!(is_server_error(&error));
+        assert_eq!(sends, GET_ATTEMPTS as usize);
+        assert_eq!(
+            waits.iter().sum::<Duration>(),
+            Duration::from_millis(7500),
+            "{waits:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_error_or_another_error_is_never_sent_again() {
+        for error in [
+            failure(StatusCode::NOT_FOUND),
+            failure(StatusCode::FORBIDDEN),
+            failure(StatusCode::TOO_MANY_REQUESTS),
+            anyhow::anyhow!("GitHub request failed; sensitive response withheld"),
+        ] {
+            let (result, sends, waits) = run(vec![Err(error), Ok(1)]);
+            assert!(result.is_err());
+            assert_eq!((sends, waits.len()), (1, 0));
+        }
+    }
 }
