@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.23 — 2026-10-22
+
+- A GET that GitHub answers with a 5xx status is sent again, at most 5 times in all, waiting
+  0.5, 1, 2 and 4 seconds; any other answer returns at once and writes are never sent again. On
+  2026-10-22 `commits/<sha>/pulls` answered 500 for 10 of 23 merges of one repository, to the App
+  and to a personal token alike, and every such answer refused the bot push.
+- A historical merge whose `commits/<sha>/pulls` still answers 5xx is proved through the pull
+  request its subject names (`Merge pull request #<n> from …`, or `… (#<n>)` for a squash): that
+  record must name the commit as its merge commit and then passes every check a listed one does.
+  A subject naming no pull request, a 4xx on the list, and a record naming another commit refuse.
+- A refused published-merge read names its method and path, as `GET <path>: <status>`.
+
 ## 0.1.22 — 2026-10-20
 
 - `api` and `gh -- api` refuse a write to a ruleset or to branch protection before the policy is
