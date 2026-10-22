@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-22T16:05:55Z",
+  "actor": "human:timo",
+  "artifact": "story:published-merge-server-errors",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "F1 fixed in this unit; F2/F3 deferred to story:published-merge-review-followups",
+    "review": "review-result:published-merge-server-errors-security-review",
+    "outcome": "fixed"
+  }
+}

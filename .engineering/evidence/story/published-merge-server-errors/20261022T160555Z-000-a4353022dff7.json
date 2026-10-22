@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-22T16:05:55Z",
+  "actor": "human:timo",
+  "artifact": "story:published-merge-server-errors",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked --no-fail-fast: 575 passed, 0 failed, 6 ignored; fmt 0; clippy -D warnings 0; ess validate 0; mutants M1-M7 killed"
+  }
+}
