@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `.github/workflows/common.yml` downloads the 0.1.24 binary (was 0.1.21). Its scanning code
+  and limits are those of 0.1.21; on 2026-10-29 both gave the same result on three adopters'
+  `main`.
+
 ## 0.1.24 — 2026-10-29
 
 - `policy publish` writes the whole compressed policy as the repository secret
