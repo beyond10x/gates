@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.24 — 2026-10-29
+
+- `policy publish` writes the whole compressed policy as the repository secret
+  `B10X_GATES_POLICY_GZ` for each repository its targets file lists under `compressed`
+  (private repositories, which the organization secret does not reach), and reads each back
+  with `gh secret list --repo` before the marker moves. The dry run lists these targets and
+  their sizes. A targets file without `compressed` parses as before. A listed repository the
+  policy does not enrol, an invalid name or a repeated one publishes nothing.
+
 ## 0.1.23 — 2026-10-22
 
 - A GET that GitHub answers with a 5xx status is sent again, at most 5 times in all, waiting
