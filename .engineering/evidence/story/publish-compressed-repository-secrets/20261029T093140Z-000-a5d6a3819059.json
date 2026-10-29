@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-29T09:31:40Z",
+  "actor": "human:timo",
+  "artifact": "story:publish-compressed-repository-secrets",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked --no-fail-fast: 583 passed, 0 failed, 6 ignored; fmt 0; clippy -D warnings 0; ess validate 0; mutants M1-M6 killed; security review: flag-like repository and early gh exit fixed in 1f9cf00",
+    "reference": "1f9cf00"
+  }
+}

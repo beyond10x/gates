@@ -2,13 +2,14 @@
 format: aep.planning-md/3
 id: story:publish-compressed-repository-secrets
 kind: story
-status: active
+status: implemented
 title: Publish the compressed policy to repository secrets of private repositories
 summary: policy publish writes B10X_GATES_POLICY_GZ as a repository secret for each repository the targets list under compressed
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-29T09:22:31Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-29T09:22:31Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-29T09:31:40Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Problem
 
