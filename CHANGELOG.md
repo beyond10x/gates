@@ -8,6 +8,9 @@
   with `gh secret list --repo` before the marker moves. The dry run lists these targets and
   their sizes. A targets file without `compressed` parses as before. A listed repository the
   policy does not enrol, an invalid name or a repeated one publishes nothing.
+- `policy publish` refuses a `sliced` or `compressed` repository starting with `-`, which `gh`
+  could read as an option, and a `gh` that exits before reading a secret's value is waited for
+  and reported by its exit status instead of a broken pipe.
 
 ## 0.1.23 — 2026-10-22
 

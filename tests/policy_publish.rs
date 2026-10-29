@@ -606,3 +606,36 @@ fn compressed_repository_invalid_refused() {
         assert_eq!(fixture.sets(), 0, "{invalid}");
     }
 }
+
+/// A repository name gh could read as an option (a leading `-`) is refused as invalid
+/// even when the policy enrols it, so nothing is published and no such argument reaches gh.
+#[test]
+fn compressed_repository_flag_like_name_refused() {
+    let flag_like = "-R/other";
+    let mut committed = policy(NONCE, 0);
+    committed.repositories.insert(
+        flag_like.into(),
+        Repository {
+            id: "123".into(),
+            baseline: "0".repeat(40),
+        },
+    );
+    let fixture = Fixture::with(&committed);
+    fixture.targets(&compressed_targets(&[flag_like]));
+    let output = fixture.publish(&["--apply"]);
+    assert!(
+        !output.status.success(),
+        "{flag_like} was published to: {:?}",
+        fixture
+            .calls()
+            .into_iter()
+            .map(|(args, _)| args)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        stderr(&output).contains("invalid repository"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.sets(), 0);
+}

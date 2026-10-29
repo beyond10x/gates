@@ -188,13 +188,15 @@ fn gh(args: &[String], input: Option<&[u8]>) -> Result<Vec<u8>> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("gh unavailable")?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .context("gh standard input unavailable")?
-            .write_all(input)?;
-    }
+    // A gh that exits before reading its input breaks the pipe; it is still waited for, and
+    // its exit status is the reported cause.
+    let written = match input {
+        Some(input) => match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(input).map_err(anyhow::Error::from),
+            None => Err(anyhow::anyhow!("gh standard input unavailable")),
+        },
+        None => Ok(()),
+    };
     let output = child.wait_with_output()?;
     ensure!(
         output.status.success(),
@@ -203,7 +205,20 @@ fn gh(args: &[String], input: Option<&[u8]>) -> Result<Vec<u8>> {
         args.get(1).map_or("", String::as_str),
         output.status
     );
+    written.with_context(|| {
+        format!(
+            "gh {} {} did not take its input",
+            args.first().map_or("", String::as_str),
+            args.get(1).map_or("", String::as_str)
+        )
+    })?;
     Ok(output.stdout)
+}
+
+/// An `owner/repo` that is safe as the value of gh's `--repo`: valid, and not readable as
+/// an option (GitHub owners never start with `-`).
+fn repository_argument(repository: &str) -> bool {
+    policy::valid_repository(repository) && !repository.starts_with('-')
 }
 
 pub fn publish(options: &Options) -> Result<()> {
@@ -252,7 +267,7 @@ pub fn publish(options: &Options) -> Result<()> {
     );
     for repository in &targets.sliced {
         ensure!(
-            policy::valid_repository(repository),
+            repository_argument(repository),
             "publish targets name an invalid repository"
         );
         ensure!(
@@ -262,7 +277,7 @@ pub fn publish(options: &Options) -> Result<()> {
     }
     for (index, repository) in targets.compressed.iter().enumerate() {
         ensure!(
-            policy::valid_repository(repository),
+            repository_argument(repository),
             "publish targets name an invalid repository"
         );
         ensure!(
