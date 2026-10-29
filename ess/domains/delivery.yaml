@@ -466,7 +466,10 @@ commands:
   # the organization secret `B10X_GATES_POLICY_GZ` (the whole policy, gzip -9 then
   # base64) and, while callers on older pins exist, the sliced `B10X_GATES_POLICY`
   # secrets (the organization's without the listed repositories' exceptions, each listed
-  # repository's with only its own). `unchanged` is true when the policy commit is the
+  # repository's with only its own), and for each repository the targets list under
+  # `compressed` (private repositories, which the organization secret does not reach) the
+  # whole policy as its own repository secret `B10X_GATES_POLICY_GZ`; a listed repository
+  # the policy does not enrol publishes nothing. `unchanged` is true when the policy commit is the
   # one the marker in Gates' state directory names. A dry run (the default) prints the
   # commit, targets and sizes; `--apply` writes each secret with `gh secret set`, the
   # value on standard input, reads the names back with `gh secret list`, and only then

@@ -17,7 +17,7 @@ pub const COMPRESSED_SECRET: &str = "B10X_GATES_POLICY_GZ";
 pub const PLAIN_SECRET: &str = "B10X_GATES_POLICY";
 
 /// The targets file: which secrets are written, kept out of code.
-#[derive(Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Targets {
     /// The organization whose secrets are written. Default: the one owner of every
@@ -31,6 +31,17 @@ pub struct Targets {
     /// repository secret of their own (requires `plain`).
     #[serde(default)]
     pub sliced: Vec<String>,
+    /// Repositories that get the whole policy as a repository secret `B10X_GATES_POLICY_GZ`
+    /// of their own: private repositories, which the organization secret does not reach.
+    #[serde(default)]
+    pub compressed: Vec<String>,
+}
+
+impl Targets {
+    /// Parse a targets file.
+    pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
 }
 
 pub struct Options {
@@ -107,13 +118,9 @@ fn git(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
 
 fn load_targets(path: &Path, explicit: bool) -> Result<Targets> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
+        Ok(bytes) => Targets::parse(&bytes)
             .map_err(|e| anyhow::anyhow!("publish targets {} invalid: {e}", path.display())),
-        Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => Ok(Targets {
-            organization: None,
-            plain: false,
-            sliced: vec![],
-        }),
+        Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => Ok(Targets::default()),
         Err(e) => bail!("publish targets {} unreadable: {e}", path.display()),
     }
 }
@@ -253,12 +260,34 @@ pub fn publish(options: &Options) -> Result<()> {
             "publish targets slice {repository}, which the policy does not enrol"
         );
     }
+    for (index, repository) in targets.compressed.iter().enumerate() {
+        ensure!(
+            policy::valid_repository(repository),
+            "publish targets name an invalid repository"
+        );
+        ensure!(
+            policy.repositories.contains_key(repository),
+            "publish targets list {repository} as compressed, which the policy does not enrol"
+        );
+        ensure!(
+            !targets.compressed[..index].contains(repository),
+            "publish targets list {repository} as compressed more than once"
+        );
+    }
     let org = organization(&targets, &policy)?;
+    let whole = compressed(&serde_json::to_vec(&document)?)?;
     let mut secrets = vec![Secret {
         name: COMPRESSED_SECRET,
         scope: Scope::Organization(org.clone()),
-        value: compressed(&serde_json::to_vec(&document)?)?,
+        value: whole.clone(),
     }];
+    for repository in &targets.compressed {
+        secrets.push(Secret {
+            name: COMPRESSED_SECRET,
+            scope: Scope::Repository(repository.clone()),
+            value: whole.clone(),
+        });
+    }
     if targets.plain {
         secrets.push(Secret {
             name: PLAIN_SECRET,

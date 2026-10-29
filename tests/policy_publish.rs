@@ -135,10 +135,12 @@ impl Fixture {
                  if [ \"$1 $2\" = 'secret set' ]; then\n\
                    [ -e \"$log/../fail-set\" ] && exit 1\n\
                    cat > \"$log/$n.value\"\n\
-                   echo \"$3\" >> \"$log/../secrets\"\n\
+                   echo \"$5 $3\" >> \"$log/../secrets\"\n\
                  elif [ \"$1 $2\" = 'secret list' ]; then\n\
                    [ -e \"$log/../hide-list\" ] && exit 0\n\
-                   sort -u \"$log/../secrets\" | sed 's/$/\\t2026-10-14T00:00:00Z/'\n\
+                   [ \"$(cat \"$log/../hide-scope\" 2>/dev/null)\" = \"$4\" ] && exit 0\n\
+                   grep \"^$4 \" \"$log/../secrets\" | cut -d' ' -f2 | sort -u \\\n\
+                     | sed 's/$/\\t2026-10-14T00:00:00Z/'\n\
                  fi\n",
                 log = log.display()
             ),
@@ -428,4 +430,179 @@ fn missing_read_back_keeps_the_marker() {
         stderr(&output)
     );
     assert!(!fixture.marker().exists());
+}
+
+/// Private repositories do not receive the organization secret, so the targets list them
+/// under `compressed` for a repository secret of their own.
+fn compressed_targets(repositories: &[&str]) -> String {
+    let list: Vec<String> = repositories.iter().map(|r| format!("\"{r}\"")).collect();
+    format!(
+        r#"{{"organization": "example", "plain": true, "sliced": ["{SLICED}"], "compressed": [{}]}}"#,
+        list.join(", ")
+    )
+}
+
+#[test]
+fn compressed_targets_parse_and_default() {
+    let listed =
+        b10x_gates::publish::Targets::parse(compressed_targets(&[OTHER, SLICED]).as_bytes())
+            .unwrap();
+    assert_eq!(
+        listed.compressed,
+        vec![OTHER.to_string(), SLICED.to_string()]
+    );
+    // A targets file written before the field existed still parses, with no repository
+    // getting a compressed secret.
+    let older = b10x_gates::publish::Targets::parse(
+        format!(r#"{{"organization": "example", "plain": true, "sliced": ["{SLICED}"]}}"#)
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(older.compressed.is_empty());
+    assert_eq!(older.sliced, vec![SLICED.to_string()]);
+    let empty = b10x_gates::publish::Targets::parse(b"{}").unwrap();
+    assert!(empty.compressed.is_empty());
+    let fixture = Fixture::new();
+    let output = fixture.publish(&["--apply"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !fixture.calls().iter().any(|(args, value)| value.is_some()
+            && args.get(2).map(String::as_str) == Some("B10X_GATES_POLICY_GZ")
+            && args.iter().any(|a| a == "--repo")),
+        "a targets file without `compressed` wrote a repository compressed secret"
+    );
+}
+
+#[test]
+fn compressed_repositories_planned() {
+    let fixture = Fixture::new();
+    fixture.targets(&compressed_targets(&[OTHER, SLICED]));
+    let output = fixture.publish(&[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    for repository in [OTHER, SLICED] {
+        assert!(
+            out.lines().any(|l| l.starts_with(&format!(
+                "repository {repository} secret B10X_GATES_POLICY_GZ: "
+            )) && l.ends_with(" bytes")),
+            "{out}"
+        );
+    }
+    assert!(out.contains("dry run"), "{out}");
+    assert_eq!(fixture.sets(), 0, "a dry run wrote a secret");
+    assert!(!fixture.marker().exists(), "a dry run moved the marker");
+}
+
+#[test]
+fn compressed_repositories_published_and_read_back() {
+    let fixture = Fixture::new();
+    fixture.targets(&compressed_targets(&[OTHER, SLICED]));
+    let output = fixture.publish(&["--apply"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let committed = serde_json::to_value(
+        Policy::parse(&fs::read(fixture.origin().join("policy.json")).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let organization = fixture.written("B10X_GATES_POLICY_GZ", &["--org", "example"]);
+    for repository in [OTHER, SLICED] {
+        let value = fixture.written("B10X_GATES_POLICY_GZ", &["--repo", repository]);
+        // The whole policy, not a slice, in the encoding `ci` reads.
+        assert_eq!(serde_json::to_value(gunzip(&value)).unwrap(), committed);
+        assert_eq!(value, organization);
+        let set = fixture
+            .calls()
+            .into_iter()
+            .find(|(args, value)| {
+                value.is_some()
+                    && args.get(2).map(String::as_str) == Some("B10X_GATES_POLICY_GZ")
+                    && args.iter().any(|a| a == repository)
+            })
+            .unwrap()
+            .0;
+        assert!(
+            !set.iter().any(|a| a == "--visibility"),
+            "a repository secret has no visibility: {set:?}"
+        );
+        assert!(
+            fixture
+                .calls()
+                .iter()
+                .any(|(args, _)| args[..2] == ["secret", "list"]
+                    && args.iter().any(|a| a == "--repo")
+                    && args.iter().any(|a| a == repository)),
+            "{repository} was not read back"
+        );
+        assert!(
+            stdout(&output).contains(&format!(
+                "read back repository {repository} secret B10X_GATES_POLICY_GZ"
+            )),
+            "{}",
+            stdout(&output)
+        );
+    }
+    // The organization secret, the two plain slices and the two repository copies.
+    assert_eq!(fixture.sets(), 5);
+    let commit = git(fixture.origin(), &["rev-parse", "HEAD"]);
+    assert_eq!(fs::read_to_string(fixture.marker()).unwrap().trim(), commit);
+}
+
+#[test]
+fn compressed_repository_not_read_back_keeps_the_marker() {
+    let fixture = Fixture::new();
+    fixture.targets(&compressed_targets(&[OTHER]));
+    fs::write(fixture.scratch.path().join("hide-scope"), OTHER).unwrap();
+    let output = fixture.publish(&["--apply"]);
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("gh secret list"), "{err}");
+    assert!(err.contains(OTHER), "{err}");
+    assert!(!fixture.marker().exists());
+}
+
+#[test]
+fn compressed_repository_unenrolled_refused() {
+    let fixture = Fixture::new();
+    fixture.targets(&compressed_targets(&[OTHER, "example/unenrolled"]));
+    let output = fixture.publish(&["--apply"]);
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("example/unenrolled"), "{err}");
+    assert!(err.contains("does not enrol"), "{err}");
+    assert_eq!(fixture.sets(), 0);
+    assert!(!fixture.marker().exists());
+}
+
+#[test]
+fn compressed_repository_duplicate_refused() {
+    let fixture = Fixture::new();
+    fixture.targets(&compressed_targets(&[OTHER, OTHER]));
+    let output = fixture.publish(&["--apply"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("more than once"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.sets(), 0);
+}
+
+#[test]
+fn compressed_repository_invalid_refused() {
+    for invalid in [
+        "example",
+        "example/../other",
+        "--org",
+        "example/other/extra",
+    ] {
+        let fixture = Fixture::new();
+        fixture.targets(&compressed_targets(&[invalid]));
+        let output = fixture.publish(&["--apply"]);
+        assert!(!output.status.success(), "{invalid} was accepted");
+        assert!(
+            stderr(&output).contains("invalid repository"),
+            "{invalid}: {}",
+            stderr(&output)
+        );
+        assert_eq!(fixture.sets(), 0, "{invalid}");
+    }
 }
