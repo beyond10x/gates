@@ -429,7 +429,7 @@ fn receipt_rejects_tampering_wrong_repository_signer_policy_and_incomplete_resul
     let receipt =
         evidence::check(&f.policy, &candidate, &f.key, &mut CountScanner::default()).unwrap();
     let mut invalid = receipt.clone();
-    invalid.signature.replace_range(..2, "00");
+    invalid.signature = tampered(&receipt.signature);
     assert!(evidence::verify(&f.policy, &candidate, &invalid).is_err());
     let mut invalid = receipt.clone();
     invalid.payload.binding.repository_id = "999".into();
@@ -461,6 +461,39 @@ fn receipt_rejects_tampering_wrong_repository_signer_policy_and_incomplete_resul
     let mut scanner = CountScanner::default();
     assert!(!evidence::reuse_or_scan(&f.policy, &candidate, Some(&invalid), &mut scanner).unwrap());
     assert_eq!(scanner.calls, 1);
+}
+
+/// `signature` with the lowest bit of its first byte flipped: always a different signature.
+/// Overwriting the first byte with a fixed value is a no-op for one signature in 256.
+fn tampered(signature: &str) -> String {
+    let mut bytes = hex::decode(signature).unwrap();
+    bytes[0] ^= 1;
+    let tampered = hex::encode(bytes);
+    assert_ne!(
+        tampered, signature,
+        "the tamper left the signature unchanged"
+    );
+    tampered
+}
+
+#[test]
+fn a_fixed_byte_tamper_can_leave_a_signature_unchanged_and_a_bit_flip_cannot() {
+    // The first deterministic key whose signature starts with byte 0x00: the former tamper,
+    // `replace_range(..2, "00")`, returned it unchanged, so the receipt still verified.
+    let message = b"b10x.gates.receipt/1\0{}";
+    let signature = (0u32..)
+        .map(|n| {
+            let mut seed = [7u8; 32];
+            seed[..4].copy_from_slice(&n.to_le_bytes());
+            hex::encode(SigningKey::from_bytes(&seed).sign(message).to_bytes())
+        })
+        .take(1 << 16)
+        .find(|signature| signature.starts_with("00"))
+        .expect("a signature starting with 0x00 within 65536 keys");
+    let mut fixed = signature.clone();
+    fixed.replace_range(..2, "00");
+    assert_eq!(fixed, signature);
+    assert_ne!(tampered(&signature), signature);
 }
 
 fn resign(receipt: &mut Receipt, key: &SigningKey) {

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-29T10:06:56Z",
+  "actor": "human:timo",
+  "artifact": "story:receipt-tamper-always-changes",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked --test security (3 named tests) passed; fmt 0; clippy -D warnings 0"
+  }
+}

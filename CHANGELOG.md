@@ -5,6 +5,8 @@
 - `.github/workflows/common.yml` downloads the 0.1.24 binary (was 0.1.21). Its scanning code
   and limits are those of 0.1.21; on 2026-10-29 both gave the same result on three adopters'
   `main`.
+- The receipt tamper test flips a signature bit instead of overwriting the first byte with
+  `00`, which left one signature in 256 unchanged and failed the test at random.
 
 ## 0.1.24 — 2026-10-29
 
