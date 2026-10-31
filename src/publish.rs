@@ -32,7 +32,9 @@ pub struct Targets {
     #[serde(default)]
     pub sliced: Vec<String>,
     /// Repositories that get the whole policy as a repository secret `B10X_GATES_POLICY_GZ`
-    /// of their own: private repositories, which the organization secret does not reach.
+    /// of their own: private repositories, which the organization secret does not reach, and
+    /// any repository whose plain slice outgrew the limit. Their exceptions leave the
+    /// organization's plain secret, as `sliced` ones do.
     #[serde(default)]
     pub compressed: Vec<String>,
 }
@@ -307,7 +309,9 @@ pub fn publish(options: &Options) -> Result<()> {
         secrets.push(Secret {
             name: PLAIN_SECRET,
             scope: Scope::Organization(org.clone()),
-            value: sliced(&document, |r| !targets.sliced.iter().any(|s| s == r))?,
+            value: sliced(&document, |r| {
+                !targets.sliced.iter().any(|s| s == r) && !targets.compressed.iter().any(|c| c == r)
+            })?,
         });
         for repository in &targets.sliced {
             secrets.push(Secret {
