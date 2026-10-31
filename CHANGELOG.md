@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.25 — 2026-10-31
 
 - `policy publish` leaves the exceptions of a repository listed under `compressed` out of the
   organization's plain `B10X_GATES_POLICY` secret, as it already did for `sliced` ones. Such a
