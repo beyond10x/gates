@@ -547,6 +547,38 @@ fn compressed_repositories_published_and_read_back() {
 }
 
 #[test]
+fn compressed_repositories_leave_the_organization_plain_secret() {
+    // `OTHER`'s exceptions alone push the plain organization value over the limit. Listed
+    // under `compressed` (which reads `B10X_GATES_POLICY_GZ`), they leave the plain
+    // organization secret as a `sliced` repository's do, so the rest still publishes.
+    let fixture = Fixture::with(&policy(NONCE, 600));
+    fixture.targets(&format!(
+        r#"{{"organization": "example", "plain": true, "sliced": [], "compressed": ["{OTHER}"]}}"#
+    ));
+    let output = fixture.publish(&["--apply"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let org = fixture.written("B10X_GATES_POLICY", &["--org", "example"]);
+    assert_eq!(exception_repositories(&org), vec![SLICED.to_string()]);
+    let committed = serde_json::to_value(
+        Policy::parse(&fs::read(fixture.origin().join("policy.json")).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let repository = fixture.written("B10X_GATES_POLICY_GZ", &["--repo", OTHER]);
+    assert_eq!(
+        serde_json::to_value(gunzip(&repository)).unwrap(),
+        committed
+    );
+    assert!(
+        !fixture.calls().iter().any(|(args, value)| value.is_some()
+            && args.get(2).map(String::as_str) == Some("B10X_GATES_POLICY")
+            && args.iter().any(|a| a == "--repo")),
+        "a compressed repository got a plain repository secret"
+    );
+    // The organization's compressed and plain secrets and `OTHER`'s compressed copy.
+    assert_eq!(fixture.sets(), 3);
+}
+
+#[test]
 fn compressed_repository_not_read_back_keeps_the_marker() {
     let fixture = Fixture::new();
     fixture.targets(&compressed_targets(&[OTHER]));

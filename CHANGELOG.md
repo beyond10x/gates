@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `policy publish` leaves the exceptions of a repository listed under `compressed` out of the
+  organization's plain `B10X_GATES_POLICY` secret, as it already did for `sliced` ones. Such a
+  repository reads `B10X_GATES_POLICY_GZ`, and with its exceptions in the plain value that value
+  grew past the 48,000-byte limit, so no policy change published.
 - `.github/workflows/common.yml` downloads the 0.1.24 binary (was 0.1.21). Its scanning code
   and limits are those of 0.1.21; on 2026-10-29 both gave the same result on three adopters'
   `main`.
