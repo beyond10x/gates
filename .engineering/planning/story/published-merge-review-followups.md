@@ -2,12 +2,22 @@
 format: aep.planning-md/3
 id: story:published-merge-review-followups
 kind: story
-status: draft
+status: active
 title: Test the GET-only retry guard and print a refused read status once
 summary: Deferred F2 and F3 from the 0.1.23 security review.
 relations:
 - derived_from: story:published-merge-server-errors
-revision: 1
+scope:
+- confidence: inferred
+  path: src/delivery.rs
+- confidence: inferred
+  path: src/published_merge.rs
+- confidence: inferred
+  path: tests/published_merge.rs
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-04T12:07:01Z", actor: "human:timo", revision: 3}
+- {from: "proposed", to: "active", at: "2026-11-04T12:07:01Z", actor: "human:timo", revision: 4}
 ---
 ## Problem
 

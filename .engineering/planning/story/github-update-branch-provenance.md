@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:github-update-branch-provenance
 kind: story
-status: active
+status: implemented
 title: Prove published bot-created GitHub update-branch ancestry
 relations:
 - derived_from: story:public-shared-gates
@@ -19,10 +19,11 @@ scope:
   path: tests/adversary_published_merge.rs
 - confidence: cited
   path: tests/published_merge.rs
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-03T07:20:10Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-03T07:20:10Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-11-04T12:07:18Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Authorization and problem
 

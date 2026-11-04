@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:ci-fetch-head-by-sha
 kind: story
-status: draft
+status: active
 title: ci fetches the pull request head commit by its id and names the refspec git refused
 summary: A pull request whose refs/pull/<n>/head GitHub does not advertise fails ci with no cause; fetch the head by id and name the refused refspec and git's message.
 scope:
@@ -12,7 +12,10 @@ scope:
   path: src/delivery.rs
 - confidence: inferred
   path: tests/ci_policy.rs
-revision: 2
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-04T12:07:01Z", actor: "human:timo", revision: 3}
+- {from: "proposed", to: "active", at: "2026-11-04T12:07:01Z", actor: "human:timo", revision: 4}
 ---
 ## Problem
 
