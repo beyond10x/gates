@@ -1027,10 +1027,15 @@ pub fn is_server_error(error: &anyhow::Error) -> bool {
 pub struct ApiFailure {
     status: StatusCode,
     body: Option<Value>,
+    /// The path of the GET this answered, when the reader named it.
+    read: Option<String>,
 }
 
 impl std::fmt::Display for ApiFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(path) = &self.read {
+            write!(f, "GET {path}: ")?;
+        }
         write!(
             f,
             "GitHub operation failed ({}); response withheld",
@@ -1046,7 +1051,18 @@ const MESSAGE_LIMIT: usize = 300;
 
 impl ApiFailure {
     pub fn new(status: StatusCode, body: Option<Value>) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body,
+            read: None,
+        }
+    }
+
+    /// The same answer, its text led by `GET <path>: `, so a refused read stays this
+    /// failure to every caller that downcasts to it.
+    pub fn answering(mut self, path: &str) -> Self {
+        self.read = Some(path.to_owned());
+        self
     }
 
     pub fn status(&self) -> StatusCode {
