@@ -591,18 +591,20 @@ pub fn ci_candidate_from(
             == Some(trusted.id.as_str()),
         "event repository identity mismatch"
     );
-    let (head, mut fetch_ref) = if let Some(pr) = event.get("pull_request") {
+    // A pull request's head is fetched by its id: GitHub has served that id while not
+    // advertising `refs/pull/<n>/head`. The ref is only the fallback when the id is not
+    // served, which a cross-repository pull request may need; the candidate is the id
+    // either way.
+    let (head, mut fetch_ref, fallback) = if let Some(pr) = event.get("pull_request") {
         let number = pr["number"]
             .as_u64()
             .or_else(|| event["number"].as_u64())
             .context("PR number missing")?;
-        (
-            pr["head"]["sha"]
-                .as_str()
-                .context("PR commit missing")?
-                .to_owned(),
-            format!("refs/pull/{number}/head"),
-        )
+        let head = pr["head"]["sha"]
+            .as_str()
+            .context("PR commit missing")?
+            .to_owned();
+        (head.clone(), head, Some(format!("refs/pull/{number}/head")))
     } else if let Some(group) = event.get("merge_group") {
         // The queue's merge commit is what lands on the protected branch, so it is
         // fetched by its exact id and bound like a push of that commit: the scan runs
@@ -612,14 +614,14 @@ pub fn ci_candidate_from(
             .as_str()
             .context("merge group commit missing")?
             .to_owned();
-        (head.clone(), head)
+        (head.clone(), head, None)
     } else {
         let head = event["after"]
             .as_str()
             .or_else(|| event["inputs"]["head"].as_str())
             .context("push commit missing")?
             .to_owned();
-        (head.clone(), head)
+        (head.clone(), head, None)
     };
     ensure!(crate::git::is_oid(&head), "event must name an exact commit");
     ensure!(!target.exists(), "CI object directory must be new");
@@ -647,33 +649,140 @@ pub fn ci_candidate_from(
     // A private repository serves no objects anonymously, so the workflow token is
     // supplied through the environment rather than argv or a URL: a credential in
     // argv is readable by every process on the runner.
-    let mut fetch = git.command();
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let basic = base64(format!("x-access-token:{token}").as_bytes());
-        fetch
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                format!("AUTHORIZATION: basic {basic}"),
-            );
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let basic = token
+        .as_ref()
+        .map(|token| base64(format!("x-access-token:{token}").as_bytes()));
+    let source = remote(repository);
+    let mut refusals = Vec::new();
+    let mut fetched = false;
+    for wanted in std::iter::once(&fetch_ref).chain(fallback.as_ref()) {
+        let refspecs = [wanted.as_str(), trusted.baseline.as_str()];
+        let mut fetch = git.command();
+        if let Some(basic) = &basic {
+            fetch
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env(
+                    "GIT_CONFIG_VALUE_0",
+                    format!("AUTHORIZATION: basic {basic}"),
+                );
+        }
+        let fetch = fetch
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                &source,
+            ])
+            .args(refspecs)
+            .output()?;
+        if fetch.status.success() {
+            fetched = true;
+            break;
+        }
+        refusals.push(fetch_refusal(
+            &fetch.stderr,
+            &refspecs,
+            Matchers::build(policy).ok().as_ref(),
+            &[token.as_deref(), basic.as_deref()],
+        ));
     }
-    let fetch = fetch
-        .args([
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-recurse-submodules",
-            &remote(repository),
-            &fetch_ref,
-            &trusted.baseline,
-        ])
-        .output()?;
-    ensure!(fetch.status.success(), "candidate object fetch failed");
+    ensure!(
+        fetched,
+        "candidate object fetch failed: {}",
+        refusals.join("; ")
+    );
     let head = git.resolve(&format!("{head}^{{commit}}"))?;
     let tags = tag.map(|value| vec![value.to_owned()]).unwrap_or_default();
     let candidate = git.candidate(policy, repository, &head, &tags)?;
     Ok((git, candidate))
+}
+
+/// One refused `git fetch`: each of `refspecs` that git's standard error names, and
+/// git's last message line. The line is shown only after the credential check and the
+/// private-rule matchers have read the whole of git's standard error as well as the
+/// line, so a cut or a removed control character cannot be what lets either through.
+/// A refspec is named unless it breaks a private rule itself.
+fn fetch_refusal(
+    stderr: &[u8],
+    refspecs: &[&str],
+    matchers: Option<&Matchers>,
+    secrets: &[Option<&str>],
+) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+    let shown = |refspecs: &[&str]| {
+        refspecs
+            .iter()
+            .map(|refspec| {
+                if matchers.is_some_and(|m| m.text(refspec.as_bytes()).is_empty()) {
+                    (*refspec).to_owned()
+                } else {
+                    "a refspec (withheld)".to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Git names the source side of a refspec; a tag is fetched as `<tag>:<tag>`.
+    let named: Vec<&str> = refspecs
+        .iter()
+        .copied()
+        .filter(|refspec| text.contains(refspec.split(':').next().unwrap_or(refspec)))
+        .collect();
+    let subject = if named.is_empty() {
+        format!("git fetch of {} failed", shown(refspecs))
+    } else {
+        format!("git refused {}", shown(&named))
+    };
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| clean(line, MESSAGE_LIMIT))
+        .unwrap_or_default();
+    let message = if line.is_empty() {
+        "git printed no message".to_owned()
+    } else if secrets
+        .iter()
+        .flatten()
+        .filter(|secret| !secret.is_empty())
+        .any(|secret| text.contains(secret) || cleaned.contains(secret))
+    {
+        "git's message withheld: it carries the workflow credential".to_owned()
+    } else if let Some(matchers) = matchers {
+        if [stderr, cleaned.as_bytes(), line.as_bytes()]
+            .into_iter()
+            .any(|text| !matchers.text(text).is_empty())
+        {
+            "git's message withheld: it matches a private rule".to_owned()
+        } else {
+            line
+        }
+    } else {
+        "git's message withheld: trusted policy unavailable".to_owned()
+    };
+    format!("{subject}: {message}")
+}
+
+/// `fetch_refusal` for a test, with `token` as the workflow credential.
+#[doc(hidden)]
+pub fn fetch_refusal_for_test(
+    stderr: &[u8],
+    refspecs: &[&str],
+    policy: &Policy,
+    token: &str,
+) -> String {
+    let basic = base64(format!("x-access-token:{token}").as_bytes());
+    fetch_refusal(
+        stderr,
+        refspecs,
+        Matchers::build(policy).ok().as_ref(),
+        &[Some(token), Some(&basic)],
+    )
 }
 
 /// How many times a GET is sent in all while GitHub answers it with a server error. On
