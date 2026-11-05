@@ -196,12 +196,13 @@ commands:
           gates.delivery.BotCommitted:
             revision: input.revision
 
-  # `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, through
-  # the REST API as the App, never through `git push`. The argument shape and the
-  # name are refused before a credential is minted; the App then reads the default
-  # branch, the branch, the comparison of its tip with the default branch, the
-  # rulesets that apply to the branch and the branch again, and deletes only
-  # `refs/heads/<branch>`.
+  # `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, checked
+  # through the REST API as the App, never a `push` the caller passes. The argument
+  # shape and the name are refused before a credential is minted; the App then reads
+  # the default branch, the branch, the comparison of its tip with the default branch,
+  # the rulesets that apply to the branch and the branch again, and deletes only
+  # `refs/heads/<branch>`, by a Git push that carries the tip read as the expected old
+  # object, which the remote compares and deletes in one step.
   - name: gates.delivery.DeleteBranch
     input:
       - {name: name, type: String}
@@ -302,7 +303,8 @@ commands:
       - name: several-restricting-rulesets
         when: restricting_rulesets.count > 1
         error: gates.delivery.SeveralRestrictingRulesets
-      # The tip read again before the DELETE differs from the one compared.
+      # The tip differs from the one compared: read again before the deletion, or found
+      # by the deletion itself, which the remote refuses and the bot names.
       - name: moved-tip
         when_subject:
           predicate: tip != input.current_tip

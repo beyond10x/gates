@@ -60,8 +60,19 @@ impl AuthenticatedRead for PushEvidence {
 pub trait RemoteBranches {
     /// A GET; `None` when GitHub answers 404.
     fn read(&self, path: &str) -> Result<Option<Value>>;
-    /// A DELETE that succeeded.
-    fn delete(&self, path: &str) -> Result<()>;
+    /// Delete `refs/heads/<branch>` of `repository` only while it points at `tip`, one
+    /// compare-and-delete the remote decides (`compare_and_delete_branch`).
+    fn delete(&self, repository: &str, branch: &str, tip: &str) -> Result<CompareAndDelete>;
+}
+
+/// What a compare-and-delete of a branch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareAndDelete {
+    /// The branch pointed at the expected tip and is deleted.
+    Deleted,
+    /// The branch did not point at the expected tip, so the remote kept it: `Some` is
+    /// the tip it points at now, `None` that it no longer exists.
+    Moved(Option<String>),
 }
 
 impl RemoteBranches for Github {
@@ -79,17 +90,149 @@ impl RemoteBranches for Github {
         }
     }
 
-    fn delete(&self, path: &str) -> Result<()> {
-        self.api_response(Method::DELETE, path, None).map(|_| ())
+    /// GitHub's REST ref deletion takes no expected tip, so the deletion is a Git push
+    /// to the repository's GitHub URL. The installation token reaches Git as
+    /// `Github::git` passes it for `push`.
+    fn delete(&self, repository: &str, branch: &str, tip: &str) -> Result<CompareAndDelete> {
+        ensure!(
+            crate::bot_args::repository_shaped(repository),
+            "`{}` is not <owner>/<repo>",
+            repository.escape_debug()
+        );
+        compare_and_delete_branch(
+            &format!("https://github.com/{repository}.git"),
+            branch,
+            tip,
+            Some(&self.token),
+        )
     }
+}
+
+/// `delete-branch`'s one write, `git push --force-with-lease=refs/heads/<branch>:<tip>
+/// -- <remote> :refs/heads/<branch>`. The lease refuses before anything is sent when the
+/// remote advertises another tip, and the push carries `tip` as the ref's old object,
+/// which the remote compares under its ref lock, so a push that lands after the last
+/// read is never deleted with the branch. A refused deletion reads the branch again
+/// (`git ls-remote`) to say where it is now. Git runs in a new empty repository, so no
+/// hook, configuration or remote of the caller's repository applies, and `credential`
+/// reaches Git through `bot_command`: in the environment, read by the credential
+/// helper, never in argv or the URL. Public so a test can delete in a local repository.
+#[doc(hidden)]
+pub fn compare_and_delete_branch(
+    remote: &str,
+    branch: &str,
+    tip: &str,
+    credential: Option<&str>,
+) -> Result<CompareAndDelete> {
+    ensure!(
+        full_object_id(tip),
+        "`{}` is not a full object id",
+        tip.escape_debug()
+    );
+    ensure!(
+        crate::bot_args::branch_to_delete(branch).ok().as_deref() == Some(branch),
+        "`{}` is not a branch name",
+        branch.escape_debug()
+    );
+    let reference = format!("refs/heads/{branch}");
+    let scratch = tempfile::Builder::new()
+        .prefix("b10x-gates-delete-branch-")
+        .tempdir()
+        .context("no scratch repository for the deletion")?;
+    // `GIT_DIR` set, so a repository named by the caller's environment is never used.
+    let git = |credential: Option<&str>| {
+        let mut command = bot_command(scratch.path(), credential);
+        command
+            .env("GIT_DIR", scratch.path())
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        command
+    };
+    let init = git(None)
+        .args(["-c", "init.templateDir=", "init", "--bare", "--quiet"])
+        .output()
+        .context("Git could not start")?;
+    ensure!(
+        init.status.success(),
+        "the scratch repository for the deletion could not be created"
+    );
+    let push = git(credential)
+        .args(["push", "--porcelain"])
+        .arg(format!("--force-with-lease={reference}:{tip}"))
+        .arg("--")
+        .arg(remote)
+        .arg(format!(":{reference}"))
+        .output()
+        .context("Git could not start")?;
+    // Porcelain: `<flag>\t<from>:<to>\t<summary>`; `-` is a deleted ref.
+    let deleted = String::from_utf8_lossy(&push.stdout).lines().any(|line| {
+        let mut fields = line.split('\t');
+        fields.next() == Some("-")
+            && fields
+                .next()
+                .and_then(|refs| refs.rsplit_once(':'))
+                .is_some_and(|(_, to)| to == reference)
+    });
+    if push.status.success() {
+        ensure!(
+            deleted,
+            "Git pushed without reporting {reference} deleted ({})",
+            exit(push.status)
+        );
+        return Ok(CompareAndDelete::Deleted);
+    }
+    let listed = git(credential)
+        .args(["ls-remote", "--", remote, &reference])
+        .output()
+        .context("Git could not start")?;
+    ensure!(
+        listed.status.success(),
+        "Git refused the deletion of {reference} ({}), and the branch could not be read \
+         again ({}); Git's output is above",
+        exit(push.status),
+        exit(listed.status)
+    );
+    let mut now = None;
+    for line in String::from_utf8_lossy(&listed.stdout).lines() {
+        if let Some((id, name)) = line.split_once('\t')
+            && name == reference
+        {
+            ensure!(
+                full_object_id(id),
+                "Git listed {reference} at `{}`, not an object id",
+                clean(id, 80)
+            );
+            now = Some(id.to_string());
+        }
+    }
+    if now.as_deref() == Some(tip) {
+        bail!(
+            "Git refused the deletion of {reference} ({}) while it is at {tip}; Git's output \
+             is above",
+            exit(push.status)
+        );
+    }
+    Ok(CompareAndDelete::Moved(now))
+}
+
+/// A full SHA-1 or SHA-256 object id in lower case.
+fn full_object_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64)
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// `gates.delivery.DeleteBranch` after the argument check: refuse the default branch,
 /// an unknown branch, a branch with classic protection enabled or a ruleset beyond the
 /// bot-authority rules, a tip that is not an ancestor of the default branch and a tip
-/// that moved, then DELETE `refs/heads/<branch>` and nothing else.
+/// that moved, then delete `refs/heads/<branch>` and nothing else, only while it still
+/// points at the tip checked; a tip that moved after the last read is kept and named.
 /// Returns the line to print. Every segment of every path is percent-encoded, so no
-/// name can change which resource is read or deleted.
+/// name can change which resource is read.
 pub fn delete_remote_branch(
     api: &impl RemoteBranches,
     deletion: &crate::bot_args::BranchDeletion,
@@ -202,13 +345,25 @@ pub fn delete_remote_branch(
              it was checked; run it again"
         );
     }
-    api.delete(&format!("{repo_path}/git/refs/heads/{}", encoded(branch)))
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "bot delete-branch: DELETE of refs/heads/{branch} in {repository} failed: {error}"
-            )
-        })?;
-    Ok(format!("deleted {branch} at {first}"))
+    // A push between the read above and this deletion is kept: the deletion carries
+    // `first`, and the remote deletes only while the branch still points at it.
+    let deleted = api.delete(repository, branch, &first).map_err(|error| {
+        anyhow::anyhow!(
+            "bot delete-branch: the deletion of refs/heads/{branch} in {repository} failed: \
+             {error:#}"
+        )
+    })?;
+    match deleted {
+        CompareAndDelete::Deleted => Ok(format!("deleted {branch} at {first}")),
+        CompareAndDelete::Moved(Some(now)) => bail!(
+            "bot delete-branch refuses `{branch}`: its tip moved from {first} to {now} after \
+             it was checked, so the remote kept it; run it again"
+        ),
+        CompareAndDelete::Moved(None) => bail!(
+            "bot delete-branch: remote branch `{branch}` no longer exists in {repository}; it \
+             was at {first} when checked, and the bot deleted nothing"
+        ),
+    }
 }
 
 /// Rule types the organization's bot-authority ruleset puts on every branch, each once and

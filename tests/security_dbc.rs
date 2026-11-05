@@ -9,7 +9,7 @@
 use b10x_gates::{
     BOT_EMAIL, BOT_NAME,
     bot_args::delete_branch,
-    delivery::{RemoteBranches, api_path_admitted, delete_remote_branch},
+    delivery::{CompareAndDelete, RemoteBranches, api_path_admitted, delete_remote_branch},
     hooks::Config,
     policy::{Policy, Repository},
 };
@@ -41,8 +41,9 @@ enum Answer {
 }
 
 /// GitHub as answers per path, taken in order with the last repeated. A path with no
-/// answer fails the request, as an unreachable resource would. Both verbs apply the
-/// guard `Github::api_response` applies before recording anything as sent.
+/// answer fails the request, as an unreachable resource would. A read applies the
+/// guard `Github::api_response` applies before recording anything as sent; the
+/// deletion is a compare-and-delete with no request path.
 #[derive(Default)]
 struct Fake {
     answers: RefCell<HashMap<String, VecDeque<Answer>>>,
@@ -81,10 +82,16 @@ impl RemoteBranches for Fake {
         }
     }
 
-    fn delete(&self, path: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
-        self.deletes.borrow_mut().push(path.to_string());
-        Ok(())
+    fn delete(
+        &self,
+        repository: &str,
+        branch: &str,
+        tip: &str,
+    ) -> anyhow::Result<CompareAndDelete> {
+        self.deletes
+            .borrow_mut()
+            .push(format!("{repository} refs/heads/{branch} at {tip}"));
+        Ok(CompareAndDelete::Deleted)
     }
 }
 

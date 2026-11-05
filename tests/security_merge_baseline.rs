@@ -6,7 +6,7 @@
 //! `delivery::RemoteBranches`, so no credential is ever minted.
 use b10x_gates::{
     bot_args::{delete_branch, delete_branch_repository},
-    delivery::{RemoteBranches, api_path_admitted, delete_remote_branch},
+    delivery::{CompareAndDelete, RemoteBranches, api_path_admitted, delete_remote_branch},
 };
 use serde_json::{Value, json};
 use std::{
@@ -33,10 +33,16 @@ impl RemoteBranches for Fake {
             .clone())
     }
 
-    fn delete(&self, path: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
-        self.deletes.borrow_mut().push(path.to_string());
-        Ok(())
+    fn delete(
+        &self,
+        repository: &str,
+        branch: &str,
+        tip: &str,
+    ) -> anyhow::Result<CompareAndDelete> {
+        self.deletes
+            .borrow_mut()
+            .push(format!("{repository} refs/heads/{branch} at {tip}"));
+        Ok(CompareAndDelete::Deleted)
     }
 }
 
