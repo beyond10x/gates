@@ -68,11 +68,17 @@ pub trait RemoteBranches {
 /// What a compare-and-delete of a branch did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompareAndDelete {
-    /// The branch pointed at the expected tip and is deleted.
+    /// The remote reported the branch deleted at the expected tip.
     Deleted,
-    /// The branch did not point at the expected tip, so the remote kept it: `Some` is
-    /// the tip it points at now, `None` that it no longer exists.
+    /// The deletion was refused, so the bot deleted nothing, and the branch read again
+    /// is not at the expected tip: `Some` is the tip it points at now, `None` that it
+    /// no longer exists.
     Moved(Option<String>),
+    /// Git ended without reporting what the remote did with the deletion (a lost
+    /// connection, a remote that stopped), and the branch read again is not at the
+    /// expected tip: `Some` is the tip it points at now, `None` that it no longer
+    /// exists, deleted by this push or by another.
+    Unknown(Option<String>),
 }
 
 impl RemoteBranches for Github {
@@ -112,11 +118,15 @@ impl RemoteBranches for Github {
 /// -- <remote> :refs/heads/<branch>`. The lease refuses before anything is sent when the
 /// remote advertises another tip, and the push carries `tip` as the ref's old object,
 /// which the remote compares under its ref lock, so a push that lands after the last
-/// read is never deleted with the branch. A refused deletion reads the branch again
-/// (`git ls-remote`) to say where it is now. Git runs in a new empty repository, so no
-/// hook, configuration or remote of the caller's repository applies, and `credential`
-/// reaches Git through `bot_command`: in the environment, read by the credential
-/// helper, never in argv or the URL. Public so a test can delete in a local repository.
+/// read is never deleted with the branch. A deletion the remote did not report deleted
+/// reads the branch again (`git ls-remote`) to say where it is now; only a refusal Git
+/// reported proves the bot deleted nothing, and without any report the outcome is
+/// `Unknown`. Git runs in a new empty repository made without templates, with no Git
+/// variable of the caller's environment but its trace destinations
+/// (`scratch_environment`), so no hook, configuration, template or remote of the
+/// caller's applies, and `credential` reaches Git through `bot_command`: in the
+/// environment, read by the credential helper, never in argv or the URL. Public so a
+/// test can delete in a local repository.
 #[doc(hidden)]
 pub fn compare_and_delete_branch(
     remote: &str,
@@ -144,15 +154,16 @@ pub fn compare_and_delete_branch(
         let mut command = bot_command(scratch.path(), credential);
         command
             .env("GIT_DIR", scratch.path())
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit());
+        scratch_environment(&mut command);
         command
     };
+    // `--template=` wins over `GIT_TEMPLATE_DIR` and `init.templateDir`: no hook or
+    // configuration is copied in.
     let init = git(None)
-        .args(["-c", "init.templateDir=", "init", "--bare", "--quiet"])
+        .args(["init", "--bare", "--quiet", "--template="])
         .output()
         .context("Git could not start")?;
     ensure!(
@@ -167,33 +178,46 @@ pub fn compare_and_delete_branch(
         .arg(format!(":{reference}"))
         .output()
         .context("Git could not start")?;
-    // Porcelain: `<flag>\t<from>:<to>\t<summary>`; `-` is a deleted ref.
-    let deleted = String::from_utf8_lossy(&push.stdout).lines().any(|line| {
-        let mut fields = line.split('\t');
-        fields.next() == Some("-")
-            && fields
-                .next()
-                .and_then(|refs| refs.rsplit_once(':'))
-                .is_some_and(|(_, to)| to == reference)
-    });
-    if push.status.success() {
-        ensure!(
-            deleted,
-            "Git pushed without reporting {reference} deleted ({})",
-            exit(push.status)
-        );
+    // Porcelain: `<flag>\t<from>:<to>\t<summary>`, one line for each ref Git learned the
+    // outcome of: `-` the remote deleted it, `!` Git or the remote refused it. With no
+    // line for the reference, Git ended before it learned what the remote did.
+    let reported = String::from_utf8_lossy(&push.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split('\t');
+            let flag = fields.next()?;
+            let (_, to) = fields.next()?.rsplit_once(':')?;
+            (to == reference).then(|| flag.to_string())
+        });
+    if reported.as_deref() == Some("-") {
         return Ok(CompareAndDelete::Deleted);
     }
+    let refused = reported.as_deref() == Some("!");
+    let outcome = if refused {
+        format!(
+            "Git refused the deletion of {reference} ({})",
+            exit(push.status)
+        )
+    } else {
+        format!(
+            "Git ended ({}) without reporting what the remote did with the deletion of \
+             {reference}",
+            exit(push.status)
+        )
+    };
     let listed = git(credential)
         .args(["ls-remote", "--", remote, &reference])
         .output()
         .context("Git could not start")?;
     ensure!(
         listed.status.success(),
-        "Git refused the deletion of {reference} ({}), and the branch could not be read \
-         again ({}); Git's output is above",
-        exit(push.status),
-        exit(listed.status)
+        "{outcome}, and the branch could not be read again ({}){}; Git's output is above",
+        exit(listed.status),
+        if refused {
+            ""
+        } else {
+            ", so whether it is deleted is unknown"
+        }
     );
     let mut now = None;
     for line in String::from_utf8_lossy(&listed.stdout).lines() {
@@ -209,13 +233,35 @@ pub fn compare_and_delete_branch(
         }
     }
     if now.as_deref() == Some(tip) {
-        bail!(
-            "Git refused the deletion of {reference} ({}) while it is at {tip}; Git's output \
-             is above",
-            exit(push.status)
-        );
+        bail!("{outcome} while it is at {tip}, so it is not deleted; Git's output is above");
     }
-    Ok(CompareAndDelete::Moved(now))
+    Ok(if refused {
+        CompareAndDelete::Moved(now)
+    } else {
+        CompareAndDelete::Unknown(now)
+    })
+}
+
+/// The scratch repository's Git takes no `GIT_*` variable of the caller's environment
+/// but the ones `command` already sets or removes and Git's trace destinations
+/// (`GIT_TRACE*`; `bot_command` removes `GIT_TRACE2_ENV_VARS` and sets
+/// `GIT_TRACE_REDACT`), and no `SSH_ASKPASS`. The rest choose the repository, object
+/// store, templates, namespace, configuration, transport and TLS settings or programs
+/// Git runs, and the scratch push needs none of them. Removing every `GIT_` name rather
+/// than a list keeps a variable Git adds later out as well.
+fn scratch_environment(command: &mut Command) {
+    let named: Vec<std::ffi::OsString> = command
+        .get_envs()
+        .map(|(name, _)| name.to_os_string())
+        .collect();
+    for (name, _) in std::env::vars_os() {
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"GIT_") && !bytes.starts_with(b"GIT_TRACE") && !named.contains(&name)
+        {
+            command.env_remove(&name);
+        }
+    }
+    command.env_remove("SSH_ASKPASS");
 }
 
 /// A full SHA-1 or SHA-256 object id in lower case.
@@ -349,8 +395,7 @@ pub fn delete_remote_branch(
     // `first`, and the remote deletes only while the branch still points at it.
     let deleted = api.delete(repository, branch, &first).map_err(|error| {
         anyhow::anyhow!(
-            "bot delete-branch: the deletion of refs/heads/{branch} in {repository} failed: \
-             {error:#}"
+            "bot delete-branch: deleting refs/heads/{branch} in {repository}: {error:#}"
         )
     })?;
     match deleted {
@@ -362,6 +407,16 @@ pub fn delete_remote_branch(
         CompareAndDelete::Moved(None) => bail!(
             "bot delete-branch: remote branch `{branch}` no longer exists in {repository}; it \
              was at {first} when checked, and the bot deleted nothing"
+        ),
+        CompareAndDelete::Unknown(Some(now)) => bail!(
+            "bot delete-branch: Git ended without reporting what the remote did with the \
+             deletion of `{branch}` in {repository}, so its outcome is unknown; the branch now \
+             points at {now}, not at {first} as checked; run it again"
+        ),
+        CompareAndDelete::Unknown(None) => bail!(
+            "bot delete-branch: Git ended without reporting what the remote did with the \
+             deletion of `{branch}` in {repository}, so its outcome is unknown; the branch no \
+             longer exists, deleted by this push or by another; it was at {first} when checked"
         ),
     }
 }
@@ -1212,9 +1267,10 @@ pub fn api_success_report(
 pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result<()> {
     if args.first().is_some_and(|verb| verb == "delete-branch") {
         bail!(
-            "bot delete-branch is not a Git command: it runs through the REST API as \
-             `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, never \
-             through Git"
+            "bot delete-branch is not a Git command the bot passes on: run `b10x-gates bot \
+             --repository <owner>/<repo> -- delete-branch <branch>`, which checks the branch \
+             through the REST API as the App, then deletes it with a Git push of its own that \
+             carries the checked tip"
         );
     }
     // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
@@ -1248,20 +1304,49 @@ fn run_bot(root: &Path, args: &[String], mut command: Command) -> Result<()> {
     )
 }
 
-/// `git` in `root` with the bot identity, no global or system configuration, no
-/// configuration from the caller's environment and, when a credential is given, the
-/// push rewrite and credential helper that use it. `GIT_CONFIG_PARAMETERS` and
-/// `GIT_CONFIG_COUNT` would carry what the `-c` refusal forbids in argv, such as a
-/// `core.hooksPath` that skips `pre-commit` and `pre-push`; without the count, the
-/// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs are never read.
+/// Variables of the caller's environment no bot Git process inherits.
+/// `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` would carry what the `-c` refusal
+/// forbids in argv, such as a `core.hooksPath` that skips `pre-commit` and `pre-push`;
+/// without the count, the `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs are never
+/// read. `GIT_CONFIG` and `GIT_CONFIG_SYSTEM` name other configuration files. The
+/// repository, its object store, index and ref namespace are `root`'s, never another
+/// named by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+/// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` or `GIT_NAMESPACE`.
+/// `GIT_EXEC_PATH` would choose every `git-*` program Git runs, the remote helper that
+/// is handed the credential among them, and `GIT_TEMPLATE_DIR` the hooks and
+/// configuration a new repository starts with. `GIT_TRACE2_ENV_VARS` names variables
+/// whose values Git writes into its trace, `B10X_BOT_TOKEN` among them.
+const CALLER_GIT_ENVIRONMENT: [&str; 14] = [
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_TRACE2_ENV_VARS",
+];
+
+/// `git` in `root` with the bot identity, no global or system configuration, none of
+/// `CALLER_GIT_ENVIRONMENT`, trace redaction on (`GIT_TRACE_REDACT`, so a caller's
+/// `GIT_TRACE_CURL` shows no `Authorization` header) and, when a credential is given,
+/// the push rewrite and credential helper that use it.
 fn bot_command(root: &Path, credential: Option<&str>) -> Command {
     let mut command = Command::new("git");
+    command.current_dir(root);
+    for name in CALLER_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
     command
-        .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_TRACE_REDACT", "1")
         .env("GIT_AUTHOR_NAME", BOT_NAME)
         .env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
         .env("GIT_COMMITTER_NAME", BOT_NAME)
@@ -1672,29 +1757,20 @@ fn commit_names_changes(args: &[String]) -> bool {
 }
 
 /// A merge commits the whole index even when its tree equals HEAD, so an index equal
-/// to HEAD is not "nothing staged" while one is in progress.
+/// to HEAD is not "nothing staged" while one is in progress. Asked in the bot's own
+/// environment, so of the repository the bot's Git runs in.
 fn merge_in_progress(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+    bot_command(root, None)
         .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
         .stdout(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
 
-/// Asked of Git after it refused, in the same repository, rather than read from
-/// its localised message.
+/// Asked of Git after it refused, in the same repository and environment, rather than
+/// read from its localised message.
 fn index_equals_head(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+    bot_command(root, None)
         .args(["diff", "--cached", "--quiet"])
         .status()
         .is_ok_and(|status| status.success())

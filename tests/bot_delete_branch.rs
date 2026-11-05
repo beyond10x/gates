@@ -1,6 +1,7 @@
-//! `b10x-gates bot [--repository <owner>/<repo>] -- delete-branch <branch>` deletes a
-//! remote branch through the REST API as the App, only when its tip is an ancestor of
-//! the default branch (`story:bot-delete-branch` and
+//! `b10x-gates bot [--repository <owner>/<repo>] -- delete-branch <branch>` checks a
+//! remote branch through the REST API as the App and deletes it with a Git push that
+//! carries the checked tip, only when its tip is an ancestor of the default branch
+//! (`story:bot-delete-branch` and
 //! `story:bot-delete-branch-defaults`, modelled as `gates.delivery.DeleteBranch` in
 //! `ess/domains/delivery.yaml`). Without `--repository` the repository is the
 //! installed hooks' configuration's. Each test is named
@@ -19,6 +20,7 @@ use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    ffi::OsStr,
     process::{Command, Stdio},
 };
 
@@ -624,6 +626,37 @@ fn refuses_a_branch_deleted_after_the_last_read() {
     assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
 }
 
+/// A deletion the remote applied but whose report never reached Git (the remote's
+/// process ends once the ref transaction is committed, as a lost connection would) is
+/// told as an unknown outcome, never as "the bot deleted nothing".
+#[test]
+fn an_unreported_deletion_is_told_as_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+    let (remote, tip) = BareRemote::new();
+    let result = delete_over_git(&remote, &tip, &|remote| {
+        let hook = remote.dir.path().join("hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" = committed ] && kill -9 $PPID\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    assert_eq!(
+        remote.tip("wave/one"),
+        None,
+        "fixture: the remote did not apply the deletion: {result:?}"
+    );
+    let text = format!(
+        "{:#}",
+        result.expect_err("an unreported deletion was reported deleted")
+    );
+    assert!(text.contains("outcome is unknown"), "{text}");
+    assert!(text.contains("no longer exists"), "{text}");
+    assert!(!text.contains("deleted nothing"), "{text}");
+}
+
 /// The Git deletion compares only a full object id and addresses only a branch name the
 /// name rules admit; anything else is refused before Git runs and deletes nothing.
 #[test]
@@ -903,7 +936,9 @@ fn push_delete_refusal_names_delete_branch() {
     }
 }
 
-/// `delete-branch` is not a Git command: the library's Git route refuses it before Git.
+/// `delete-branch` is not a Git command the bot passes on: the library's Git route
+/// refuses it before Git and names the bot verb, which checks through the REST API and
+/// deletes by a push of its own.
 #[test]
 fn library_git_never_runs_delete_branch() {
     let dir = tempfile::tempdir().unwrap();
@@ -912,6 +947,8 @@ fn library_git_never_runs_delete_branch() {
         bot_git(dir.path(), &args("delete-branch wave/one"), None).unwrap_err()
     );
     assert!(text.contains("REST API"), "{text}");
+    assert!(text.contains("-- delete-branch <branch>"), "{text}");
+    assert!(text.contains("Git push of its own"), "{text}");
     assert!(!text.contains("failed (exit"), "reached Git: {text}");
 }
 
@@ -1095,4 +1132,133 @@ fn refuses_unlisted_rulesets() {
     let page = Value::Array((0..100).map(|_| rule("update")).collect());
     let text = refused(&ruled(Some(page)), "wave/one");
     assert!(text.contains("more than one page"), "{text}");
+}
+
+/// Run `child` of this test binary with `env`; its `BDB ` lines. The caller's
+/// environment reaches the code under test only this way, so no test changes this
+/// process's environment.
+fn run_child(child: &str, env: &[(&str, &OsStr)]) -> String {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            child,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{child}: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        // libtest prints `test <name> ... ` before the child's first line.
+        .filter_map(|line| line.find("BDB ").map(|at| &line[at..]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A directory standing in for a caller's `GIT_EXEC_PATH`: its `git-upload-pack` and
+/// `git-receive-pack` create `marker` and fail.
+fn caller_programs(dir: &std::path::Path, marker: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let programs = dir.join("programs");
+    std::fs::create_dir_all(&programs).unwrap();
+    for name in ["git-upload-pack", "git-receive-pack"] {
+        let path = programs.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    programs
+}
+
+#[test]
+#[ignore = "child process entry point: run by the_git_deletion_takes_no_git_variable_of_the_callers"]
+fn child_delete_in_the_callers_environment() {
+    let remote = std::env::var("BDB_REMOTE").unwrap();
+    let tip = std::env::var("BDB_TIP").unwrap();
+    let outcome = compare_and_delete_branch(&remote, "wave/one", &tip, None)
+        .map_err(|error| format!("{error:#}"));
+    println!("BDB {outcome:?}");
+}
+
+/// The deletion's scratch repository and push take no `GIT_*` variable of the caller's
+/// environment: `GIT_DEFAULT_HASH` would make the scratch repository another kind of
+/// repository than the remote, `GIT_EXEC_PATH` would run the caller's
+/// `git-receive-pack` and `GIT_NAMESPACE` would address another ref.
+#[test]
+fn the_git_deletion_takes_no_git_variable_of_the_callers() {
+    let (remote, tip) = BareRemote::new();
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("caller-program-ran");
+    let programs = caller_programs(work.path(), &marker);
+    let outcome = run_child(
+        "child_delete_in_the_callers_environment",
+        &[
+            ("BDB_REMOTE", OsStr::new(remote.url())),
+            ("BDB_TIP", OsStr::new(&tip)),
+            ("GIT_DEFAULT_HASH", OsStr::new("sha256")),
+            ("GIT_EXEC_PATH", programs.as_os_str()),
+            ("GIT_NAMESPACE", OsStr::new("other")),
+        ],
+    );
+    assert_eq!(outcome, "BDB Ok(Deleted)");
+    assert!(!marker.exists(), "the caller's program ran");
+    assert_eq!(remote.tip("wave/one"), None);
+    assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
+}
+
+#[test]
+#[ignore = "child process entry point: run by bot_git_runs_in_its_root_with_gits_own_programs"]
+fn child_fetch_in_the_callers_environment() {
+    let root = std::env::var("BDB_ROOT").unwrap();
+    let remote = std::env::var("BDB_REMOTE").unwrap();
+    let outcome = bot_git(
+        std::path::Path::new(&root),
+        &["fetch".to_string(), remote, "refs/heads/main".to_string()],
+        None,
+    )
+    .map_err(|error| format!("{error:#}"));
+    println!("BDB {outcome:?}");
+}
+
+/// Bot Git runs in the root it is given, with Git's own programs: the caller's
+/// `GIT_DIR` would fetch into another repository, and its `GIT_EXEC_PATH` would run
+/// the caller's `git-upload-pack` with the bot's environment.
+#[test]
+fn bot_git_runs_in_its_root_with_gits_own_programs() {
+    let (remote, _) = BareRemote::new();
+    let root = repository_without_hooks();
+    let decoy = repository_without_hooks();
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("caller-program-ran");
+    let programs = caller_programs(work.path(), &marker);
+    let outcome = run_child(
+        "child_fetch_in_the_callers_environment",
+        &[
+            ("BDB_ROOT", root.path().as_os_str()),
+            ("BDB_REMOTE", OsStr::new(remote.url())),
+            ("GIT_DIR", decoy.path().join(".git").as_os_str()),
+            ("GIT_EXEC_PATH", programs.as_os_str()),
+        ],
+    );
+    let fetched = |dir: &tempfile::TempDir| dir.path().join(".git/FETCH_HEAD").exists();
+    assert!(
+        outcome == "BDB Ok(())" && !marker.exists() && fetched(&root) && !fetched(&decoy),
+        "{outcome}: the caller's program ran {}, fetched into the root {}, into the \
+         caller's GIT_DIR {}",
+        marker.exists(),
+        fetched(&root),
+        fetched(&decoy)
+    );
 }
