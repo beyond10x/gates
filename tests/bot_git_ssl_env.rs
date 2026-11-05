@@ -190,7 +190,7 @@ fn inherited(record: &Path, hook: &str) -> Vec<&'static str> {
 }
 
 #[test]
-#[ignore = "child process entry point: run by a_bot_push_inherits_no_tls_setting_of_the_caller, a_bot_fetch_inherits_no_tls_setting_of_the_caller, a_repository_wide_ssl_verify_off_does_not_reach_the_bot, every_repository_tls_setting_is_overridden_for_the_bot_push, every_included_repository_tls_setting_is_overridden_for_the_bot_push, no_repository_rewrite_moves_a_github_url_of_the_bot, a_github_rewrite_the_bot_cannot_override_is_refused_before_anything_is_sent and the_bot_credential_answers_the_repository_and_no_proxy"]
+#[ignore = "child process entry point: run by a_bot_push_inherits_no_tls_setting_of_the_caller, a_bot_fetch_inherits_no_tls_setting_of_the_caller, a_repository_wide_ssl_verify_off_does_not_reach_the_bot, every_repository_tls_setting_is_overridden_for_the_bot_push, every_included_repository_tls_setting_is_overridden_for_the_bot_push, no_repository_rewrite_moves_a_github_url_of_the_bot, a_github_rewrite_the_bot_cannot_override_is_refused_before_anything_is_sent, the_bot_credential_answers_the_repository_and_no_proxy and a_bot_push_from_an_ssh_origin_still_gets_the_credential"]
 fn child_bot_git() {
     let root = std::env::var("W2U2_ROOT").unwrap();
     let args: Vec<String> = std::env::var("W2U2_ARGS")
@@ -773,4 +773,62 @@ fn the_bot_credential_answers_the_repository_and_no_proxy() {
             "the bot's helper answers a {name} request with the credential"
         );
     }
+}
+
+/// The two origin forms every organization checkout uses, the SCP-like
+/// `git@github.com:beyond10x/gates.git` and `ssh://git@github.com/beyond10x/gates.git`,
+/// name the SSH user `git`, and the bot's push rewrite drops it with the prefix it
+/// replaces: the `pre-push` hook asks Git's credential system, with the push's own
+/// configuration, for the push URL of a remote at each form and at the plain HTTPS URL,
+/// and each gets the credential. Only an HTTPS URL that itself names a user,
+/// `https://someone@github.com/beyond10x/gates.git`, gets nothing.
+#[test]
+fn a_bot_push_from_an_ssh_origin_still_gets_the_credential() {
+    let remotes = [
+        ("scp", "git@github.com:beyond10x/gates.git"),
+        ("ssh", "ssh://git@github.com/beyond10x/gates.git"),
+        ("https", "https://github.com/beyond10x/gates.git"),
+        ("named", "https://someone@github.com/beyond10x/gates.git"),
+    ];
+    let config: Vec<(String, &str)> = remotes
+        .iter()
+        .map(|(name, url)| (format!("remote.{name}.url"), *url))
+        .collect();
+    let config: Vec<(&str, &str)> = config.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let hook = "for remote in scp ssh https named; do\n\
+         url=$(git remote get-url --push $remote)\n\
+         printf '%s\\n' \"$url\" > \"$RECORD/$remote-url\"\n\
+         printf 'url=%s\\n\\n' \"$url\" | GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \\\n\
+         git credential fill > \"$RECORD/$remote\" 2> /dev/null\n\
+         done";
+    let hooked = hooked_push(&config, hook);
+    assert!(
+        hooked.lines.contains("W2U2 push Ok(())"),
+        "fixture: the push failed:\n{}\n{}",
+        hooked.lines,
+        hooked.stderr
+    );
+    let read = |name: &str| {
+        fs::read_to_string(hooked.record.path().join(name))
+            .unwrap_or_else(|_| panic!("fixture: the pre-push hook did not run"))
+    };
+    for name in ["scp", "ssh", "https"] {
+        assert_eq!(
+            read(&format!("{name}-url")).trim(),
+            "https://github.com/beyond10x/gates.git",
+            "the bot pushes the {name} origin to another URL"
+        );
+        assert!(
+            read(name).contains(&format!("password={CREDENTIAL}")),
+            "the bot's push from the {name} origin gets no credential: {:?}",
+            read(name)
+                .lines()
+                .filter(|l| !l.starts_with("password="))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !read("named").contains(CREDENTIAL),
+        "the bot's helper answers an HTTPS URL that names a user with the credential"
+    );
 }
