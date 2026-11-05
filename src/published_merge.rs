@@ -176,9 +176,9 @@ fn read(api: &impl AuthenticatedRead, path: &str) -> Result<Value> {
     })
 }
 
-/// A refused read. Its text is `GET <path>: ` and the inner error's own text, and it has no
-/// source, so the one-line form `main` prints and the full chain both show the path and the
-/// status once each. The inner error stays reachable only to `server_error`.
+/// A refused read. Its text is `GET <path>: ` and the inner error's own top-level text, and its
+/// source is the cause below that text, so the one-line form `main` prints and the full chain
+/// show the path and the status once each, and every deeper cause stays in the chain once.
 struct ReadFailure {
     path: String,
     error: anyhow::Error,
@@ -205,7 +205,11 @@ impl std::fmt::Debug for ReadFailure {
     }
 }
 
-impl std::error::Error for ReadFailure {}
+impl std::error::Error for ReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
 
 fn page(path: &str, page: u32) -> String {
     let separator = if path.contains('?') { '&' } else { '?' };

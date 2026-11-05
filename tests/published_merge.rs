@@ -3752,3 +3752,49 @@ fn review_a_refused_read_prints_its_path_and_status_once_each() {
         &[(&second_page, StatusCode::INTERNAL_SERVER_ERROR)],
     );
 }
+
+/// `Evidence`, except that `path` fails with an error carrying a cause below its own message,
+/// as `PushEvidence` does when its credential is missing.
+struct DeeperCause<'a> {
+    evidence: &'a Evidence,
+    path: &'a str,
+}
+
+impl AuthenticatedRead for DeeperCause<'_> {
+    fn get(&self, path: &str) -> Result<Value> {
+        if path == self.path {
+            return Err(anyhow::anyhow!("environment variable not found")
+                .context("authenticated push evidence unavailable"));
+        }
+        self.evidence.get(path)
+    }
+}
+
+#[test]
+fn review_a_refused_read_keeps_every_cause_below_its_own_once() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let git = Git::new(f.dir.path()).unwrap();
+    let api = DeeperCause {
+        evidence: &f.api,
+        path: AUTHORITY,
+    };
+    let error =
+        b10x_gates::delivery::verify_publication(&git, &f.policy, REPOSITORY, &f.candidate, &api)
+            .expect_err("an unavailable credential admitted");
+    let read = format!("GET {AUTHORITY}: ");
+    let line = format!("{error}");
+    assert_eq!(
+        line,
+        format!("{read}authenticated push evidence unavailable")
+    );
+    for text in [format!("{error:#}"), format!("{error:?}")] {
+        for part in [
+            read.as_str(),
+            "authenticated push evidence unavailable",
+            "environment variable not found",
+        ] {
+            assert_eq!(text.matches(part).count(), 1, "{part}: {text}");
+        }
+    }
+}
