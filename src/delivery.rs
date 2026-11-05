@@ -44,12 +44,14 @@ pub fn verify_publication(
 
 /// Hooks receive the App credential from `Github::git`. Read it only when a
 /// historical merge needs proof; exact direct commits still need no API read.
-pub(crate) struct PushEvidence;
+#[doc(hidden)]
+pub struct PushEvidence;
 
 impl AuthenticatedRead for PushEvidence {
     fn get(&self, path: &str) -> Result<Value> {
         Github::from_token(
-            std::env::var("B10X_BOT_TOKEN").context("authenticated push evidence unavailable")?,
+            crate::secret_env::required("B10X_BOT_TOKEN")
+                .context("authenticated push evidence unavailable")?,
         )?
         .get(path)
     }
@@ -858,7 +860,8 @@ pub fn ci_candidate_from(
     // A private repository serves no objects anonymously, so the workflow token is
     // supplied through the environment rather than argv or a URL: a credential in
     // argv is readable by every process on the runner.
-    let token = std::env::var("GITHUB_TOKEN").ok();
+    // A token that is set but not Unicode is refused, not dropped for an anonymous fetch.
+    let token = crate::secret_env::optional("GITHUB_TOKEN")?;
     let basic = token
         .as_ref()
         .map(|token| base64(format!("x-access-token:{token}").as_bytes()));
