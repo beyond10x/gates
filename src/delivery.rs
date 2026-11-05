@@ -1012,11 +1012,13 @@ fn retry_server_errors<T>(
     send()
 }
 
-/// Whether the error is GitHub answering with a 5xx status, under any context.
+/// Whether the error is GitHub answering with a 5xx status, under any context or cause.
 pub fn is_server_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<ApiFailure>()
-        .is_some_and(|failure| failure.status().is_server_error())
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiFailure>()
+            .is_some_and(|failure| failure.status().is_server_error())
+    })
 }
 
 /// A GitHub answer that was not 2xx. Its text is the status alone; GitHub's own

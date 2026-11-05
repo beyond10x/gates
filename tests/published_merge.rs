@@ -3798,3 +3798,81 @@ fn review_a_refused_read_keeps_every_cause_below_its_own_once() {
         }
     }
 }
+
+/// `Evidence`, except that each listed path fails with the error its function builds.
+struct Failing<'a> {
+    evidence: &'a Evidence,
+    failures: Vec<(String, fn() -> anyhow::Error)>,
+}
+
+impl AuthenticatedRead for Failing<'_> {
+    fn get(&self, path: &str) -> Result<Value> {
+        match self.failures.iter().find(|(failing, _)| failing == path) {
+            Some((_, failure)) => Err(failure()),
+            None => self.evidence.get(path),
+        }
+    }
+}
+
+impl Fixture {
+    fn verify_through(&self, failures: Vec<(String, fn() -> anyhow::Error)>) -> anyhow::Error {
+        let git = Git::new(self.dir.path()).unwrap();
+        let api = Failing {
+            evidence: &self.api,
+            failures,
+        };
+        b10x_gates::delivery::verify_publication(
+            &git,
+            &self.policy,
+            REPOSITORY,
+            &self.candidate,
+            &api,
+        )
+        .expect_err("a refused read admitted")
+    }
+}
+
+#[test]
+fn review_a_refused_read_under_the_reader_s_context_is_a_server_error() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let error = f.verify_through(vec![(AUTHORITY.into(), || {
+        anyhow::Error::from(ApiFailure::new(StatusCode::SERVICE_UNAVAILABLE, None))
+            .context("reader layer")
+    })]);
+    assert_eq!(format!("{error}"), format!("GET {AUTHORITY}: reader layer"));
+    assert!(
+        b10x_gates::delivery::is_server_error(&error),
+        "a 503 under the reader's context is not a server error: {error:#}"
+    );
+}
+
+#[test]
+fn review_the_fallback_keeps_the_list_s_deeper_causes_once() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let list = association_list(&f.merge);
+    let pull = format!("{ROOT}/pulls/5");
+    let error = f.verify_through(vec![
+        (list.clone(), || {
+            anyhow::Error::from(ApiFailure::new(StatusCode::BAD_GATEWAY, None))
+                .context("list inner layer")
+                .context("list outer layer")
+        }),
+        (pull.clone(), || {
+            ApiFailure::new(StatusCode::NOT_FOUND, None).into()
+        }),
+    ]);
+    for text in [format!("{error:#}"), format!("{error:?}")] {
+        for part in [
+            format!("GET {list}: "),
+            format!("GET {pull}: "),
+            "list outer layer".into(),
+            "list inner layer".into(),
+            StatusCode::BAD_GATEWAY.to_string(),
+            StatusCode::NOT_FOUND.to_string(),
+        ] {
+            assert_eq!(text.matches(&part).count(), 1, "{part}: {text}");
+        }
+    }
+}
