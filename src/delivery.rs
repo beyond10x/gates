@@ -688,10 +688,19 @@ pub fn ci_candidate_from(
             &[token.as_deref(), basic.as_deref()],
         ));
     }
+    // A fallback ref that git served without the head, as after a force-push, leaves the
+    // id's refusal as the cause: that refusal is what `ci` reports.
+    let kind = git.text(&["cat-file", "-t", &head]).ok();
     ensure!(
-        fetched,
+        fetched && (kind.is_some() || refusals.is_empty()),
         "candidate object fetch failed: {}",
         refusals.join("; ")
+    );
+    // The candidate is the pull request's head id, so that id must be a commit: peeling a
+    // tag object would bind a commit the event did not name.
+    ensure!(
+        fallback.is_none() || kind.as_deref() == Some("commit"),
+        "event must name an exact commit"
     );
     let head = git.resolve(&format!("{head}^{{commit}}"))?;
     let tags = tag.map(|value| vec![value.to_owned()]).unwrap_or_default();
@@ -749,7 +758,7 @@ fn fetch_refusal(
         .iter()
         .flatten()
         .filter(|secret| !secret.is_empty())
-        .any(|secret| text.contains(secret) || cleaned.contains(secret))
+        .any(|secret| carries_secret(stderr, secret))
     {
         "git's message withheld: it carries the workflow credential".to_owned()
     } else if let Some(matchers) = matchers {
@@ -765,6 +774,30 @@ fn fetch_refusal(
         "git's message withheld: trusted policy unavailable".to_owned()
     };
     format!("{subject}: {message}")
+}
+
+/// The longest run of a credential that may appear in a message shown: a longer run of
+/// it, or all of a shorter credential, withholds the message.
+const SECRET_RUN: usize = 12;
+
+/// Whether `bytes` carry `secret` once every byte outside the secret's own alphabet is
+/// removed. Whatever splits it, an invalid byte, a control or a format character, a
+/// space, is then gone; a split by a byte of its own alphabet leaves a long run of it.
+fn carries_secret(bytes: &[u8], secret: &str) -> bool {
+    let secret = secret.as_bytes();
+    let mut alphabet = [false; 256];
+    for &byte in secret {
+        alphabet[usize::from(byte)] = true;
+    }
+    let reduced: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|&byte| alphabet[usize::from(byte)])
+        .collect();
+    let run = secret.len().min(SECRET_RUN);
+    secret
+        .windows(run)
+        .any(|part| reduced.windows(run).any(|window| window == part))
 }
 
 /// `fetch_refusal` for a test, with `token` as the workflow credential.
@@ -1638,6 +1671,29 @@ mod tests {
         assert_eq!(
             (sends, waits),
             (GET_ATTEMPTS as usize, GET_ATTEMPTS as usize - 1)
+        );
+    }
+
+    #[test]
+    fn a_token_split_by_a_byte_of_its_own_alphabet_is_withheld() {
+        // Removing every byte outside the token's alphabet rejoins a token split by an
+        // invalid byte or a format character, not one split by a letter: the line shown
+        // then carries the token with one byte added. Any long run of it is withheld.
+        let token = ["ghs", "_", "synthetic", "Unit", "Token", "ForLocalTest0123"].concat();
+        let (left, right) = token.split_at(20);
+        let joint = token.chars().next().unwrap();
+        let stderr =
+            format!("fatal: couldn't find remote ref refs/pull/7/head {left}{joint}{right}\n");
+        let shown = fetch_refusal(
+            stderr.as_bytes(),
+            &["refs/pull/7/head"],
+            None,
+            &[Some(&token)],
+        );
+        assert!(!shown.contains(right), "{shown}");
+        assert!(
+            shown.ends_with("git's message withheld: it carries the workflow credential"),
+            "{shown}"
         );
     }
 }
