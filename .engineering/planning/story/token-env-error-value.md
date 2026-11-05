@@ -2,13 +2,23 @@
 format: aep.planning-md/3
 id: story:token-env-error-value
 kind: story
-status: draft
+status: active
 title: Name the token variable, never its value, when it cannot be read
 tags:
 - from-finding
 relations:
 - informed_by: story:published-merge-review-followups
-revision: 1
+scope:
+- confidence: inferred
+  path: src/delivery.rs
+- confidence: inferred
+  path: src/main.rs
+- confidence: inferred
+  path: tests/token_env_error_value.rs
+revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-05T02:57:28Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-11-05T02:57:28Z", actor: "human:timo", revision: 3}
 ---
 ## Problem
 

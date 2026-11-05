@@ -2,13 +2,23 @@
 format: aep.planning-md/3
 id: story:api-writes-no-redirect
 kind: story
-status: draft
+status: active
 title: Send a GitHub write once, to an admitted path, never along a redirect
 tags:
 - from-finding
 relations:
 - informed_by: review-result:review-followups-adversary-1
-revision: 3
+scope:
+- confidence: inferred
+  path: README.md
+- confidence: inferred
+  path: src/delivery.rs
+- confidence: inferred
+  path: tests/api_writes_no_redirect.rs
+revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-05T02:57:29Z", actor: "human:timo", revision: 4}
+- {from: "proposed", to: "active", at: "2026-11-05T02:57:29Z", actor: "human:timo", revision: 5}
 ---
 ## Problem
 
