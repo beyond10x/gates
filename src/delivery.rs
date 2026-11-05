@@ -52,9 +52,12 @@ pub struct PushEvidence;
 
 impl AuthenticatedRead for PushEvidence {
     fn get(&self, path: &str) -> Result<Value> {
+        // The reason is part of the top-level text: a refused evidence read and `main`
+        // print only that, and it must name the variable. It holds no byte of the value.
         Github::from_token(
-            crate::secret_env::required("B10X_BOT_TOKEN")
-                .context("authenticated push evidence unavailable")?,
+            crate::secret_env::required("B10X_BOT_TOKEN").map_err(|error| {
+                anyhow::anyhow!("authenticated push evidence unavailable: {error}")
+            })?,
         )?
         .get(path)
     }

@@ -15,7 +15,12 @@ pub fn optional(name: &str) -> Result<Option<String>> {
     }
 }
 
-/// The variable's value, refused when it is not set or not Unicode.
+/// The variable's value, refused when it is not set, empty or not Unicode. An empty
+/// credential is as unusable as a missing one, and is refused naming the variable.
 pub fn required(name: &str) -> Result<String> {
-    optional(name)?.ok_or_else(|| anyhow!("{name} is not set"))
+    match optional(name)? {
+        Some(value) if value.is_empty() => Err(anyhow!("{name} is empty")),
+        Some(value) => Ok(value),
+        None => Err(anyhow!("{name} is not set")),
+    }
 }
