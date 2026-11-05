@@ -7,6 +7,7 @@ use b10x_gates::{
     hooks,
     policy::{self, Policy},
     scan::{self, Gitleaks, SecretFinding, SecretScanner},
+    secret_env,
 };
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -555,18 +556,8 @@ fn execute(args: Args) -> Result<()> {
     let key_path = args.key.unwrap_or_else(|| root.join("signing-key"));
     let scanner_path = args.gitleaks.unwrap_or_else(|| root.join("bin/gitleaks"));
     let policy = if matches!(args.command, Action::Ci { .. }) {
-        let compressed = match std::env::var("B10X_GATES_POLICY_GZ") {
-            Err(std::env::VarError::NotUnicode(_)) => {
-                bail!("B10X_GATES_POLICY_GZ is not standard base64")
-            }
-            value => value.ok(),
-        };
-        let json = match std::env::var("B10X_GATES_POLICY_JSON") {
-            Err(std::env::VarError::NotUnicode(_)) => {
-                bail!("B10X_GATES_POLICY_JSON is not UTF-8")
-            }
-            value => value.ok(),
-        };
+        let compressed = secret_env::optional("B10X_GATES_POLICY_GZ")?;
+        let json = secret_env::optional("B10X_GATES_POLICY_JSON")?;
         match policy::ci_policy(compressed.as_deref(), json.as_deref())? {
             Some((policy, _)) => policy,
             None => load_policy(&policy_path)?,
@@ -578,8 +569,9 @@ fn execute(args: Args) -> Result<()> {
         binary: scanner_path.clone(),
     };
     if let Action::Ci { event, objects } = &args.command {
+        // Read before the fetch, so a run without a usable workflow token fetches nothing.
+        let token = secret_env::required("GITHUB_TOKEN")?;
         let (_, candidate) = delivery::ci_candidate(&policy, event, objects)?;
-        let token = std::env::var("GITHUB_TOKEN").context("workflow token unavailable")?;
         let github = Github::from_token(token)?;
         let receipts = github
             .receipts(&candidate.binding.repository, &candidate.binding.head)

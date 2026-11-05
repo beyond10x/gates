@@ -10,6 +10,7 @@ pub mod protection;
 pub mod publish;
 pub mod published_merge;
 pub mod scan;
+pub mod secret_env;
 
 use sha2::{Digest, Sha256};
 
