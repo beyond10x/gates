@@ -1333,16 +1333,51 @@ const CALLER_GIT_ENVIRONMENT: [&str; 14] = [
     "GIT_TRACE2_ENV_VARS",
 ];
 
+/// The prefix of the caller's variables that set up TLS for Git's HTTP transport; no
+/// bot Git process inherits one. `GIT_SSL_NO_VERIFY` turns certificate verification
+/// off; `GIT_SSL_CAINFO` and `GIT_SSL_CAPATH` make Git trust whichever authority they
+/// name, an interceptor's among them; `GIT_SSL_VERSION` and `GIT_SSL_CIPHER_LIST` admit
+/// an older protocol or weaker ciphers; `GIT_SSL_CERT`, `GIT_SSL_KEY`, their `_TYPE`s
+/// and `GIT_SSL_CERT_PASSWORD_PROTECTED` offer the remote a client certificate the bot
+/// does not use. Removing the prefix rather than a list keeps a variable Git adds
+/// later out as well.
+const CALLER_TLS_PREFIX: &[u8] = b"GIT_SSL_";
+
+/// `SSLKEYLOGFILE` makes the TLS library Git uses write each session's secrets to the
+/// file it names, and they decrypt the request that carries the installation token.
+///
+/// Kept from the caller: the proxy (`https_proxy`, `GIT_HTTP_PROXY_AUTHMETHOD`,
+/// `GIT_PROXY_SSL_*`), which carries Git's own TLS session with the remote through a
+/// tunnel and never sees inside it; `GIT_CURL_VERBOSE`, which writes what
+/// `GIT_TRACE_CURL` writes, under the redaction `bot_command` forces; and the timing,
+/// retry and user-agent settings (`GIT_HTTP_LOW_SPEED_*`, `GIT_HTTP_MAX_*`,
+/// `GIT_HTTP_RETRY_AFTER`, `GIT_HTTP_USER_AGENT`).
+const CALLER_TLS_KEY_LOG: &str = "SSLKEYLOGFILE";
+
+/// Remove every caller variable of `CALLER_TLS_PREFIX`, and `CALLER_TLS_KEY_LOG`, from
+/// `command`'s environment.
+fn remove_caller_tls(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(CALLER_TLS_PREFIX) {
+            command.env_remove(&name);
+        }
+    }
+    command.env_remove(CALLER_TLS_KEY_LOG);
+}
+
 /// `git` in `root` with the bot identity, no global or system configuration, none of
-/// `CALLER_GIT_ENVIRONMENT`, trace redaction on (`GIT_TRACE_REDACT`, so a caller's
-/// `GIT_TRACE_CURL` shows no `Authorization` header) and, when a credential is given,
-/// the push rewrite and credential helper that use it.
+/// `CALLER_GIT_ENVIRONMENT` or the caller's TLS settings (`remove_caller_tls`), trace
+/// redaction on (`GIT_TRACE_REDACT`, so a caller's `GIT_TRACE_CURL` shows no
+/// `Authorization` header), certificate verification on (`http.sslVerify`, which wins
+/// over the same key in the repository's configuration) and, when a credential is
+/// given, the push rewrite and credential helper that use it.
 fn bot_command(root: &Path, credential: Option<&str>) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
     for name in CALLER_GIT_ENVIRONMENT {
         command.env_remove(name);
     }
+    remove_caller_tls(&mut command);
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1356,6 +1391,8 @@ fn bot_command(root: &Path, credential: Option<&str>) -> Command {
             &format!("user.name={BOT_NAME}"),
             "-c",
             &format!("user.email={BOT_EMAIL}"),
+            "-c",
+            "http.sslVerify=true",
         ]);
     if let Some(token) = credential {
         command
