@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.27 — 2026-11-05
+
+- The bot's Git (push, fetch, the `delete-branch` push and the `ci` fetch) no longer takes the
+  caller's `GIT_SSL_*` variables or `SSLKEYLOGFILE`, and runs with `http.sslVerify=true`.
+- The repository's own configuration no longer weakens TLS for the bot's push, including
+  through `include.path` or a URL-scoped key. Each TLS key it sets (`sslVerify`, `sslCAInfo`,
+  `sslCAPath`, `sslCert`, `sslKey`, `sslBackend` and the rest) is set again to the bot's
+  value, and the bot names each key it overrides. A repository that relies on its own CA
+  bundle, client certificate or TLS backend for github.com now fails the bot's HTTPS push.
+- A `url.<base>.insteadOf` or `pushInsteadOf` in the repository no longer moves a GitHub URL
+  of the bot. A rewrite whose prefix no configuration key can name is refused before Git
+  runs. Origins of the forms `git@github.com:<owner>/<repo>.git` and
+  `ssh://git@github.com/<owner>/<repo>.git` still push over HTTPS with the App token.
+- The bot's credential helper answers only an HTTPS request for a repository on github.com
+  that names no user. A proxy URL with a user, or an HTTPS remote URL that names a user
+  (`https://<user>@github.com/...`), gets no token.
+- An error about a credential or policy variable (`B10X_BOT_TOKEN`, `GITHUB_TOKEN`,
+  `B10X_GATES_POLICY_GZ`, `B10X_GATES_POLICY_JSON`) names the variable and says whether it is
+  missing, empty or not Unicode, and never prints a byte of its value. An empty
+  `GITHUB_TOKEN` is now refused before `ci` reads the event.
+- The GitHub API client sends a write once and never along a redirect: a 3xx answer to it is
+  refused. A GET or HEAD follows at most 10 redirects, and only to an admitted path on the API
+  host written exactly as requested. A read redirected to another host is now refused.
+- `.github/workflows/common.yml` downloads the 0.1.26 binary (was 0.1.24).
+
 ## 0.1.26 — 2026-11-05
 
 - `check`, `ci`, the hooks and `audit` scan a candidate in batches of at most 256 MiB, each
