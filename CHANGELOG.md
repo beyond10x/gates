@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.26 — 2026-11-05
+
+- `check`, `ci`, the hooks and `audit` scan a candidate in batches of at most 256 MiB, each
+  changed file counted with its predecessor, instead of reading every unit into memory and
+  refusing a candidate over 512 MiB ("candidate exceeds scan limit"). A main far past its
+  adoption baseline is no longer refused for its size. A candidate keeps per unit only its
+  location, object ids, digests and lengths, and every byte read when its batch is scanned
+  must match the digest bound at build. A blob over 128 MiB is still refused, and a single
+  commit or tag object over 256 MiB is now refused. The binding, `objects_digest`, receipt and
+  findings of a candidate that fits one batch are unchanged; `ci` reports one scanner
+  invocation per batch.
+- `ci` fetches a pull request's head commit by its id, and `refs/pull/<n>/head` only when the
+  id is refused; the candidate is bound to the id, which must name a commit. A refused fetch
+  names each refspec git refused and git's message line, withheld when it breaks a private
+  rule or carries the token.
+- `bot -- delete-branch` deletes with a Git push that carries the checked tip
+  (`--force-with-lease`), run in an empty scratch repository, so a push landing after the
+  last read keeps the branch and the refusal names the moved tip. A push whose result was not
+  reported is told as unknown after the branch is read again. The bot's Git no longer takes
+  the caller's `GIT_DIR`, template, object, index, namespace, exec-path, config or
+  `GIT_TRACE2_ENV_VARS` variables, and runs with `GIT_TRACE_REDACT=1`.
+- A GitHub request is sent again after a 5xx only when it is a GET; a test now holds that for
+  every other method. A refused published-merge read prints its GET path and status once,
+  keeps every deeper cause, and is still a server error to `is_server_error`.
+- A policy exception admits a historical `personal-paths` finding at its exact repository,
+  rule, location, line and content; allowances still never do (now tested and documented).
+- This repository's own source gate runs the 0.1.24 scanner and reads the compressed policy
+  secret.
+
 ## 0.1.25 — 2026-10-31
 
 - `policy publish` leaves the exceptions of a repository listed under `compressed` out of the

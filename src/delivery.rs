@@ -60,8 +60,25 @@ impl AuthenticatedRead for PushEvidence {
 pub trait RemoteBranches {
     /// A GET; `None` when GitHub answers 404.
     fn read(&self, path: &str) -> Result<Option<Value>>;
-    /// A DELETE that succeeded.
-    fn delete(&self, path: &str) -> Result<()>;
+    /// Delete `refs/heads/<branch>` of `repository` only while it points at `tip`, one
+    /// compare-and-delete the remote decides (`compare_and_delete_branch`).
+    fn delete(&self, repository: &str, branch: &str, tip: &str) -> Result<CompareAndDelete>;
+}
+
+/// What a compare-and-delete of a branch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareAndDelete {
+    /// The remote reported the branch deleted at the expected tip.
+    Deleted,
+    /// The deletion was refused, so the bot deleted nothing, and the branch read again
+    /// is not at the expected tip: `Some` is the tip it points at now, `None` that it
+    /// no longer exists.
+    Moved(Option<String>),
+    /// Git ended without reporting what the remote did with the deletion (a lost
+    /// connection, a remote that stopped), and the branch read again is not at the
+    /// expected tip: `Some` is the tip it points at now, `None` that it no longer
+    /// exists, deleted by this push or by another.
+    Unknown(Option<String>),
 }
 
 impl RemoteBranches for Github {
@@ -79,17 +96,189 @@ impl RemoteBranches for Github {
         }
     }
 
-    fn delete(&self, path: &str) -> Result<()> {
-        self.api_response(Method::DELETE, path, None).map(|_| ())
+    /// GitHub's REST ref deletion takes no expected tip, so the deletion is a Git push
+    /// to the repository's GitHub URL. The installation token reaches Git as
+    /// `Github::git` passes it for `push`.
+    fn delete(&self, repository: &str, branch: &str, tip: &str) -> Result<CompareAndDelete> {
+        ensure!(
+            crate::bot_args::repository_shaped(repository),
+            "`{}` is not <owner>/<repo>",
+            repository.escape_debug()
+        );
+        compare_and_delete_branch(
+            &format!("https://github.com/{repository}.git"),
+            branch,
+            tip,
+            Some(&self.token),
+        )
     }
+}
+
+/// `delete-branch`'s one write, `git push --force-with-lease=refs/heads/<branch>:<tip>
+/// -- <remote> :refs/heads/<branch>`. The lease refuses before anything is sent when the
+/// remote advertises another tip, and the push carries `tip` as the ref's old object,
+/// which the remote compares under its ref lock, so a push that lands after the last
+/// read is never deleted with the branch. A deletion the remote did not report deleted
+/// reads the branch again (`git ls-remote`) to say where it is now; only a refusal Git
+/// reported proves the bot deleted nothing, and without any report the outcome is
+/// `Unknown`. Git runs in a new empty repository made without templates, with no Git
+/// variable of the caller's environment but its trace destinations
+/// (`scratch_environment`), so no hook, configuration, template or remote of the
+/// caller's applies, and `credential` reaches Git through `bot_command`: in the
+/// environment, read by the credential helper, never in argv or the URL. Public so a
+/// test can delete in a local repository.
+#[doc(hidden)]
+pub fn compare_and_delete_branch(
+    remote: &str,
+    branch: &str,
+    tip: &str,
+    credential: Option<&str>,
+) -> Result<CompareAndDelete> {
+    ensure!(
+        full_object_id(tip),
+        "`{}` is not a full object id",
+        tip.escape_debug()
+    );
+    ensure!(
+        crate::bot_args::branch_to_delete(branch).ok().as_deref() == Some(branch),
+        "`{}` is not a branch name",
+        branch.escape_debug()
+    );
+    let reference = format!("refs/heads/{branch}");
+    let scratch = tempfile::Builder::new()
+        .prefix("b10x-gates-delete-branch-")
+        .tempdir()
+        .context("no scratch repository for the deletion")?;
+    // `GIT_DIR` set, so a repository named by the caller's environment is never used.
+    let git = |credential: Option<&str>| {
+        let mut command = bot_command(scratch.path(), credential);
+        command
+            .env("GIT_DIR", scratch.path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        scratch_environment(&mut command);
+        command
+    };
+    // `--template=` wins over `GIT_TEMPLATE_DIR` and `init.templateDir`: no hook or
+    // configuration is copied in.
+    let init = git(None)
+        .args(["init", "--bare", "--quiet", "--template="])
+        .output()
+        .context("Git could not start")?;
+    ensure!(
+        init.status.success(),
+        "the scratch repository for the deletion could not be created"
+    );
+    let push = git(credential)
+        .args(["push", "--porcelain"])
+        .arg(format!("--force-with-lease={reference}:{tip}"))
+        .arg("--")
+        .arg(remote)
+        .arg(format!(":{reference}"))
+        .output()
+        .context("Git could not start")?;
+    // Porcelain: `<flag>\t<from>:<to>\t<summary>`, one line for each ref Git learned the
+    // outcome of: `-` the remote deleted it, `!` Git or the remote refused it. With no
+    // line for the reference, Git ended before it learned what the remote did.
+    let reported = String::from_utf8_lossy(&push.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split('\t');
+            let flag = fields.next()?;
+            let (_, to) = fields.next()?.rsplit_once(':')?;
+            (to == reference).then(|| flag.to_string())
+        });
+    if reported.as_deref() == Some("-") {
+        return Ok(CompareAndDelete::Deleted);
+    }
+    let refused = reported.as_deref() == Some("!");
+    let outcome = if refused {
+        format!(
+            "Git refused the deletion of {reference} ({})",
+            exit(push.status)
+        )
+    } else {
+        format!(
+            "Git ended ({}) without reporting what the remote did with the deletion of \
+             {reference}",
+            exit(push.status)
+        )
+    };
+    let listed = git(credential)
+        .args(["ls-remote", "--", remote, &reference])
+        .output()
+        .context("Git could not start")?;
+    ensure!(
+        listed.status.success(),
+        "{outcome}, and the branch could not be read again ({}){}; Git's output is above",
+        exit(listed.status),
+        if refused {
+            ""
+        } else {
+            ", so whether it is deleted is unknown"
+        }
+    );
+    let mut now = None;
+    for line in String::from_utf8_lossy(&listed.stdout).lines() {
+        if let Some((id, name)) = line.split_once('\t')
+            && name == reference
+        {
+            ensure!(
+                full_object_id(id),
+                "Git listed {reference} at `{}`, not an object id",
+                clean(id, 80)
+            );
+            now = Some(id.to_string());
+        }
+    }
+    if now.as_deref() == Some(tip) {
+        bail!("{outcome} while it is at {tip}, so it is not deleted; Git's output is above");
+    }
+    Ok(if refused {
+        CompareAndDelete::Moved(now)
+    } else {
+        CompareAndDelete::Unknown(now)
+    })
+}
+
+/// The scratch repository's Git takes no `GIT_*` variable of the caller's environment
+/// but the ones `command` already sets or removes and Git's trace destinations
+/// (`GIT_TRACE*`; `bot_command` removes `GIT_TRACE2_ENV_VARS` and sets
+/// `GIT_TRACE_REDACT`), and no `SSH_ASKPASS`. The rest choose the repository, object
+/// store, templates, namespace, configuration, transport and TLS settings or programs
+/// Git runs, and the scratch push needs none of them. Removing every `GIT_` name rather
+/// than a list keeps a variable Git adds later out as well.
+fn scratch_environment(command: &mut Command) {
+    let named: Vec<std::ffi::OsString> = command
+        .get_envs()
+        .map(|(name, _)| name.to_os_string())
+        .collect();
+    for (name, _) in std::env::vars_os() {
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"GIT_") && !bytes.starts_with(b"GIT_TRACE") && !named.contains(&name)
+        {
+            command.env_remove(&name);
+        }
+    }
+    command.env_remove("SSH_ASKPASS");
+}
+
+/// A full SHA-1 or SHA-256 object id in lower case.
+fn full_object_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64)
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// `gates.delivery.DeleteBranch` after the argument check: refuse the default branch,
 /// an unknown branch, a branch with classic protection enabled or a ruleset beyond the
 /// bot-authority rules, a tip that is not an ancestor of the default branch and a tip
-/// that moved, then DELETE `refs/heads/<branch>` and nothing else.
+/// that moved, then delete `refs/heads/<branch>` and nothing else, only while it still
+/// points at the tip checked; a tip that moved after the last read is kept and named.
 /// Returns the line to print. Every segment of every path is percent-encoded, so no
-/// name can change which resource is read or deleted.
+/// name can change which resource is read.
 pub fn delete_remote_branch(
     api: &impl RemoteBranches,
     deletion: &crate::bot_args::BranchDeletion,
@@ -202,13 +391,34 @@ pub fn delete_remote_branch(
              it was checked; run it again"
         );
     }
-    api.delete(&format!("{repo_path}/git/refs/heads/{}", encoded(branch)))
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "bot delete-branch: DELETE of refs/heads/{branch} in {repository} failed: {error}"
-            )
-        })?;
-    Ok(format!("deleted {branch} at {first}"))
+    // A push between the read above and this deletion is kept: the deletion carries
+    // `first`, and the remote deletes only while the branch still points at it.
+    let deleted = api.delete(repository, branch, &first).map_err(|error| {
+        anyhow::anyhow!(
+            "bot delete-branch: deleting refs/heads/{branch} in {repository}: {error:#}"
+        )
+    })?;
+    match deleted {
+        CompareAndDelete::Deleted => Ok(format!("deleted {branch} at {first}")),
+        CompareAndDelete::Moved(Some(now)) => bail!(
+            "bot delete-branch refuses `{branch}`: its tip moved from {first} to {now} after \
+             it was checked, so the remote kept it; run it again"
+        ),
+        CompareAndDelete::Moved(None) => bail!(
+            "bot delete-branch: remote branch `{branch}` no longer exists in {repository}; it \
+             was at {first} when checked, and the bot deleted nothing"
+        ),
+        CompareAndDelete::Unknown(Some(now)) => bail!(
+            "bot delete-branch: Git ended without reporting what the remote did with the \
+             deletion of `{branch}` in {repository}, so its outcome is unknown; the branch now \
+             points at {now}, not at {first} as checked; run it again"
+        ),
+        CompareAndDelete::Unknown(None) => bail!(
+            "bot delete-branch: Git ended without reporting what the remote did with the \
+             deletion of `{branch}` in {repository}, so its outcome is unknown; the branch no \
+             longer exists, deleted by this push or by another; it was at {first} when checked"
+        ),
+    }
 }
 
 /// Rule types the organization's bot-authority ruleset puts on every branch, each once and
@@ -449,7 +659,7 @@ impl Github {
 
     /// `api` with the success status. A non-2xx answer is an `ApiFailure`, whose
     /// text is the status alone until `ApiFailure::render` has the matchers. A GET that
-    /// GitHub answers with a server error is sent again, see `retry_server_errors`.
+    /// GitHub answers with a server error is sent again, see `send_once_or_retried`.
     pub fn api_response(
         &self,
         method: Method,
@@ -457,10 +667,9 @@ impl Github {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         ensure!(api_path_admitted(path), "invalid GitHub API path");
-        if method == Method::GET {
-            return retry_server_errors(std::thread::sleep, || self.send(Method::GET, path, body));
-        }
-        self.send(method, path, body)
+        send_once_or_retried(&method, std::thread::sleep, || {
+            self.send(method.clone(), path, body)
+        })
     }
 
     fn send(
@@ -591,18 +800,20 @@ pub fn ci_candidate_from(
             == Some(trusted.id.as_str()),
         "event repository identity mismatch"
     );
-    let (head, mut fetch_ref) = if let Some(pr) = event.get("pull_request") {
+    // A pull request's head is fetched by its id: GitHub has served that id while not
+    // advertising `refs/pull/<n>/head`. The ref is only the fallback when the id is not
+    // served, which a cross-repository pull request may need; the candidate is the id
+    // either way.
+    let (head, mut fetch_ref, fallback) = if let Some(pr) = event.get("pull_request") {
         let number = pr["number"]
             .as_u64()
             .or_else(|| event["number"].as_u64())
             .context("PR number missing")?;
-        (
-            pr["head"]["sha"]
-                .as_str()
-                .context("PR commit missing")?
-                .to_owned(),
-            format!("refs/pull/{number}/head"),
-        )
+        let head = pr["head"]["sha"]
+            .as_str()
+            .context("PR commit missing")?
+            .to_owned();
+        (head.clone(), head, Some(format!("refs/pull/{number}/head")))
     } else if let Some(group) = event.get("merge_group") {
         // The queue's merge commit is what lands on the protected branch, so it is
         // fetched by its exact id and bound like a push of that commit: the scan runs
@@ -612,14 +823,14 @@ pub fn ci_candidate_from(
             .as_str()
             .context("merge group commit missing")?
             .to_owned();
-        (head.clone(), head)
+        (head.clone(), head, None)
     } else {
         let head = event["after"]
             .as_str()
             .or_else(|| event["inputs"]["head"].as_str())
             .context("push commit missing")?
             .to_owned();
-        (head.clone(), head)
+        (head.clone(), head, None)
     };
     ensure!(crate::git::is_oid(&head), "event must name an exact commit");
     ensure!(!target.exists(), "CI object directory must be new");
@@ -647,33 +858,173 @@ pub fn ci_candidate_from(
     // A private repository serves no objects anonymously, so the workflow token is
     // supplied through the environment rather than argv or a URL: a credential in
     // argv is readable by every process on the runner.
-    let mut fetch = git.command();
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let basic = base64(format!("x-access-token:{token}").as_bytes());
-        fetch
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                format!("AUTHORIZATION: basic {basic}"),
-            );
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let basic = token
+        .as_ref()
+        .map(|token| base64(format!("x-access-token:{token}").as_bytes()));
+    let source = remote(repository);
+    let mut refusals = Vec::new();
+    let mut fetched = false;
+    for wanted in std::iter::once(&fetch_ref).chain(fallback.as_ref()) {
+        let refspecs = [wanted.as_str(), trusted.baseline.as_str()];
+        let mut fetch = git.command();
+        if let Some(basic) = &basic {
+            fetch
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env(
+                    "GIT_CONFIG_VALUE_0",
+                    format!("AUTHORIZATION: basic {basic}"),
+                );
+        }
+        let fetch = fetch
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                &source,
+            ])
+            .args(refspecs)
+            .output()?;
+        if fetch.status.success() {
+            fetched = true;
+            break;
+        }
+        refusals.push(fetch_refusal(
+            &fetch.stderr,
+            &refspecs,
+            Matchers::build(policy).ok().as_ref(),
+            &[token.as_deref(), basic.as_deref()],
+        ));
     }
-    let fetch = fetch
-        .args([
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-recurse-submodules",
-            &remote(repository),
-            &fetch_ref,
-            &trusted.baseline,
-        ])
-        .output()?;
-    ensure!(fetch.status.success(), "candidate object fetch failed");
+    // A fallback ref that git served without the head, as after a force-push, leaves the
+    // id's refusal as the cause: that refusal is what `ci` reports.
+    let kind = git.text(&["cat-file", "-t", &head]).ok();
+    ensure!(
+        fetched && (kind.is_some() || refusals.is_empty()),
+        "candidate object fetch failed: {}",
+        refusals.join("; ")
+    );
+    // The candidate is the pull request's head id, so that id must be a commit: peeling a
+    // tag object would bind a commit the event did not name.
+    ensure!(
+        fallback.is_none() || kind.as_deref() == Some("commit"),
+        "event must name an exact commit"
+    );
     let head = git.resolve(&format!("{head}^{{commit}}"))?;
     let tags = tag.map(|value| vec![value.to_owned()]).unwrap_or_default();
     let candidate = git.candidate(policy, repository, &head, &tags)?;
     Ok((git, candidate))
+}
+
+/// One refused `git fetch`: each of `refspecs` that git's standard error names, and
+/// git's last message line. The line is shown only after the credential check and the
+/// private-rule matchers have read the whole of git's standard error as well as the
+/// line, so a cut or a removed control character cannot be what lets either through.
+/// A refspec is named unless it breaks a private rule itself.
+fn fetch_refusal(
+    stderr: &[u8],
+    refspecs: &[&str],
+    matchers: Option<&Matchers>,
+    secrets: &[Option<&str>],
+) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+    let shown = |refspecs: &[&str]| {
+        refspecs
+            .iter()
+            .map(|refspec| {
+                if matchers.is_some_and(|m| m.text(refspec.as_bytes()).is_empty()) {
+                    (*refspec).to_owned()
+                } else {
+                    "a refspec (withheld)".to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Git names the source side of a refspec; a tag is fetched as `<tag>:<tag>`.
+    let named: Vec<&str> = refspecs
+        .iter()
+        .copied()
+        .filter(|refspec| text.contains(refspec.split(':').next().unwrap_or(refspec)))
+        .collect();
+    let subject = if named.is_empty() {
+        format!("git fetch of {} failed", shown(refspecs))
+    } else {
+        format!("git refused {}", shown(&named))
+    };
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| clean(line, MESSAGE_LIMIT))
+        .unwrap_or_default();
+    let message = if line.is_empty() {
+        "git printed no message".to_owned()
+    } else if secrets
+        .iter()
+        .flatten()
+        .filter(|secret| !secret.is_empty())
+        .any(|secret| carries_secret(stderr, secret))
+    {
+        "git's message withheld: it carries the workflow credential".to_owned()
+    } else if let Some(matchers) = matchers {
+        if [stderr, cleaned.as_bytes(), line.as_bytes()]
+            .into_iter()
+            .any(|text| !matchers.text(text).is_empty())
+        {
+            "git's message withheld: it matches a private rule".to_owned()
+        } else {
+            line
+        }
+    } else {
+        "git's message withheld: trusted policy unavailable".to_owned()
+    };
+    format!("{subject}: {message}")
+}
+
+/// The longest run of a credential that may appear in a message shown: a longer run of
+/// it, or all of a shorter credential, withholds the message.
+const SECRET_RUN: usize = 12;
+
+/// Whether `bytes` carry `secret` once every byte outside the secret's own alphabet is
+/// removed. Whatever splits it, an invalid byte, a control or a format character, a
+/// space, is then gone; a split by a byte of its own alphabet leaves a long run of it.
+fn carries_secret(bytes: &[u8], secret: &str) -> bool {
+    let secret = secret.as_bytes();
+    let mut alphabet = [false; 256];
+    for &byte in secret {
+        alphabet[usize::from(byte)] = true;
+    }
+    let reduced: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|&byte| alphabet[usize::from(byte)])
+        .collect();
+    let run = secret.len().min(SECRET_RUN);
+    secret
+        .windows(run)
+        .any(|part| reduced.windows(run).any(|window| window == part))
+}
+
+/// `fetch_refusal` for a test, with `token` as the workflow credential.
+#[doc(hidden)]
+pub fn fetch_refusal_for_test(
+    stderr: &[u8],
+    refspecs: &[&str],
+    policy: &Policy,
+    token: &str,
+) -> String {
+    let basic = base64(format!("x-access-token:{token}").as_bytes());
+    fetch_refusal(
+        stderr,
+        refspecs,
+        Matchers::build(policy).ok().as_ref(),
+        &[Some(token), Some(&basic)],
+    )
 }
 
 /// How many times a GET is sent in all while GitHub answers it with a server error. On
@@ -682,6 +1033,19 @@ pub fn ci_candidate_from(
 const GET_ATTEMPTS: u32 = 5;
 /// The wait before the second attempt; it doubles before each later one (0.5 s to 4 s).
 const GET_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Send a request of `method`: a GET through `retry_server_errors`, any other method once.
+/// A write that failed with a 5xx may still have happened, so it is never sent again.
+fn send_once_or_retried<T>(
+    method: &Method,
+    sleep: impl FnMut(Duration),
+    mut send: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    if *method == Method::GET {
+        return retry_server_errors(sleep, send);
+    }
+    send()
+}
 
 /// Send again while the answer is a 5xx `ApiFailure`, at most `GET_ATTEMPTS` times, and return
 /// the last answer. Any other answer or error returns at once. Only GETs come here: a write
@@ -703,11 +1067,13 @@ fn retry_server_errors<T>(
     send()
 }
 
-/// Whether the error is GitHub answering with a 5xx status, under any context.
+/// Whether the error is GitHub answering with a 5xx status, under any context or cause.
 pub fn is_server_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<ApiFailure>()
-        .is_some_and(|failure| failure.status().is_server_error())
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiFailure>()
+            .is_some_and(|failure| failure.status().is_server_error())
+    })
 }
 
 /// A GitHub answer that was not 2xx. Its text is the status alone; GitHub's own
@@ -716,10 +1082,15 @@ pub fn is_server_error(error: &anyhow::Error) -> bool {
 pub struct ApiFailure {
     status: StatusCode,
     body: Option<Value>,
+    /// The path of the GET this answered, when the reader named it.
+    read: Option<String>,
 }
 
 impl std::fmt::Display for ApiFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(path) = &self.read {
+            write!(f, "GET {path}: ")?;
+        }
         write!(
             f,
             "GitHub operation failed ({}); response withheld",
@@ -735,7 +1106,18 @@ const MESSAGE_LIMIT: usize = 300;
 
 impl ApiFailure {
     pub fn new(status: StatusCode, body: Option<Value>) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body,
+            read: None,
+        }
+    }
+
+    /// The same answer, its text led by `GET <path>: `, so a refused read stays this
+    /// failure to every caller that downcasts to it.
+    pub fn answering(mut self, path: &str) -> Self {
+        self.read = Some(path.to_owned());
+        self
     }
 
     pub fn status(&self) -> StatusCode {
@@ -885,9 +1267,10 @@ pub fn api_success_report(
 pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result<()> {
     if args.first().is_some_and(|verb| verb == "delete-branch") {
         bail!(
-            "bot delete-branch is not a Git command: it runs through the REST API as \
-             `b10x-gates bot --repository <owner>/<repo> -- delete-branch <branch>`, never \
-             through Git"
+            "bot delete-branch is not a Git command the bot passes on: run `b10x-gates bot \
+             --repository <owner>/<repo> -- delete-branch <branch>`, which checks the branch \
+             through the REST API as the App, then deletes it with a Git push of its own that \
+             carries the checked tip"
         );
     }
     // The same check `b10x-gates bot` runs before minting, so the two cannot drift.
@@ -921,20 +1304,49 @@ fn run_bot(root: &Path, args: &[String], mut command: Command) -> Result<()> {
     )
 }
 
-/// `git` in `root` with the bot identity, no global or system configuration, no
-/// configuration from the caller's environment and, when a credential is given, the
-/// push rewrite and credential helper that use it. `GIT_CONFIG_PARAMETERS` and
-/// `GIT_CONFIG_COUNT` would carry what the `-c` refusal forbids in argv, such as a
-/// `core.hooksPath` that skips `pre-commit` and `pre-push`; without the count, the
-/// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs are never read.
+/// Variables of the caller's environment no bot Git process inherits.
+/// `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` would carry what the `-c` refusal
+/// forbids in argv, such as a `core.hooksPath` that skips `pre-commit` and `pre-push`;
+/// without the count, the `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs are never
+/// read. `GIT_CONFIG` and `GIT_CONFIG_SYSTEM` name other configuration files. The
+/// repository, its object store, index and ref namespace are `root`'s, never another
+/// named by `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+/// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` or `GIT_NAMESPACE`.
+/// `GIT_EXEC_PATH` would choose every `git-*` program Git runs, the remote helper that
+/// is handed the credential among them, and `GIT_TEMPLATE_DIR` the hooks and
+/// configuration a new repository starts with. `GIT_TRACE2_ENV_VARS` names variables
+/// whose values Git writes into its trace, `B10X_BOT_TOKEN` among them.
+const CALLER_GIT_ENVIRONMENT: [&str; 14] = [
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_TRACE2_ENV_VARS",
+];
+
+/// `git` in `root` with the bot identity, no global or system configuration, none of
+/// `CALLER_GIT_ENVIRONMENT`, trace redaction on (`GIT_TRACE_REDACT`, so a caller's
+/// `GIT_TRACE_CURL` shows no `Authorization` header) and, when a credential is given,
+/// the push rewrite and credential helper that use it.
 fn bot_command(root: &Path, credential: Option<&str>) -> Command {
     let mut command = Command::new("git");
+    command.current_dir(root);
+    for name in CALLER_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
     command
-        .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_TRACE_REDACT", "1")
         .env("GIT_AUTHOR_NAME", BOT_NAME)
         .env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
         .env("GIT_COMMITTER_NAME", BOT_NAME)
@@ -1345,29 +1757,20 @@ fn commit_names_changes(args: &[String]) -> bool {
 }
 
 /// A merge commits the whole index even when its tree equals HEAD, so an index equal
-/// to HEAD is not "nothing staged" while one is in progress.
+/// to HEAD is not "nothing staged" while one is in progress. Asked in the bot's own
+/// environment, so of the repository the bot's Git runs in.
 fn merge_in_progress(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+    bot_command(root, None)
         .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
         .stdout(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
 
-/// Asked of Git after it refused, in the same repository, rather than read from
-/// its localised message.
+/// Asked of Git after it refused, in the same repository and environment, rather than
+/// read from its localised message.
 fn index_equals_head(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
+    bot_command(root, None)
         .args(["diff", "--cached", "--quiet"])
         .status()
         .is_ok_and(|status| status.success())
@@ -1472,5 +1875,74 @@ mod tests {
             assert!(result.is_err());
             assert_eq!((sends, waits.len()), (1, 0));
         }
+    }
+
+    /// Run `send_once_or_retried` for `method` over answers that are all 5xx; return the
+    /// result, the number of sends and the number of waits.
+    fn run_method(method: &Method) -> (Result<u32>, usize, usize) {
+        let sends = RefCell::new(0);
+        let mut waits = 0;
+        let result = send_once_or_retried(
+            method,
+            |_| waits += 1,
+            || {
+                *sends.borrow_mut() += 1;
+                Err(failure(StatusCode::INTERNAL_SERVER_ERROR))
+            },
+        );
+        (result, sends.into_inner(), waits)
+    }
+
+    #[test]
+    fn a_write_that_answers_a_server_error_is_sent_once() {
+        // A write answered with a 5xx may still have happened, so it is never sent again.
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ] {
+            let (result, sends, waits) = run_method(&method);
+            let error = result.expect_err("a server error must fail");
+            assert!(is_server_error(&error), "{method}");
+            assert_eq!((sends, waits), (1, 0), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_get_that_answers_a_server_error_is_sent_again() {
+        let (result, sends, waits) = run_method(&Method::GET);
+        assert!(is_server_error(
+            &result.expect_err("a persisting server error must fail")
+        ));
+        assert_eq!(
+            (sends, waits),
+            (GET_ATTEMPTS as usize, GET_ATTEMPTS as usize - 1)
+        );
+    }
+
+    #[test]
+    fn a_token_split_by_a_byte_of_its_own_alphabet_is_withheld() {
+        // Removing every byte outside the token's alphabet rejoins a token split by an
+        // invalid byte or a format character, not one split by a letter: the line shown
+        // then carries the token with one byte added. Any long run of it is withheld.
+        let token = ["ghs", "_", "synthetic", "Unit", "Token", "ForLocalTest0123"].concat();
+        let (left, right) = token.split_at(20);
+        let joint = token.chars().next().unwrap();
+        let stderr =
+            format!("fatal: couldn't find remote ref refs/pull/7/head {left}{joint}{right}\n");
+        let shown = fetch_refusal(
+            stderr.as_bytes(),
+            &["refs/pull/7/head"],
+            None,
+            &[Some(&token)],
+        );
+        assert!(!shown.contains(right), "{shown}");
+        assert!(
+            shown.ends_with("git's message withheld: it carries the workflow credential"),
+            "{shown}"
+        );
     }
 }

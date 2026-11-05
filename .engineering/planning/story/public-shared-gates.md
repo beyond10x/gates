@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:public-shared-gates
 kind: story
-status: active
+status: implemented
 title: Publish independent common gates and adopt Eventlog, ESS and AEP
 scope:
 - confidence: cited
@@ -25,10 +25,11 @@ scope:
   path: src/
 - confidence: cited
   path: tests/
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-09-10T09:02:00Z", actor: "human:timo", revision: 3, imported: true}
 - {from: "proposed", to: "active", at: "2026-09-10T09:02:00Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-11-04T12:07:18Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":2}}}
 ---
 ## Intent and authority
 

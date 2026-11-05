@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-04T12:07:17Z",
+  "actor": "human:timo",
+  "artifact": "story:github-update-branch-provenance",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Gates correctness (cargo test --locked, fmt, clippy -D warnings) success on release 0.1.12 commit 824f18d, which contains delivering commit 47c0686",
+    "reference": "https://github.com/beyond10x/gates/actions/runs/37111387700"
+  }
+}

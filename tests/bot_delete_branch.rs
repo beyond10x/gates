@@ -1,20 +1,27 @@
-//! `b10x-gates bot [--repository <owner>/<repo>] -- delete-branch <branch>` deletes a
-//! remote branch through the REST API as the App, only when its tip is an ancestor of
-//! the default branch (`story:bot-delete-branch` and
+//! `b10x-gates bot [--repository <owner>/<repo>] -- delete-branch <branch>` checks a
+//! remote branch through the REST API as the App and deletes it with a Git push that
+//! carries the checked tip, only when its tip is an ancestor of the default branch
+//! (`story:bot-delete-branch` and
 //! `story:bot-delete-branch-defaults`, modelled as `gates.delivery.DeleteBranch` in
 //! `ess/domains/delivery.yaml`). Without `--repository` the repository is the
 //! installed hooks' configuration's. Each test is named
 //! after the outcome it holds the implementation to. GitHub is a fake behind
-//! `delivery::RemoteBranches`, so no credential is ever minted.
+//! `delivery::RemoteBranches`, so no credential is ever minted; the compare-and-delete
+//! (`story:bot-delete-branch-atomic`) also runs for real against a local bare
+//! repository.
 use b10x_gates::{
     bot_args::{check, delete_branch, delete_branch_repository},
-    delivery::{RemoteBranches, api_path_admitted, bot_git, delete_remote_branch},
+    delivery::{
+        CompareAndDelete, RemoteBranches, api_path_admitted, bot_git, compare_and_delete_branch,
+        delete_remote_branch,
+    },
 };
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    process::Command,
+    ffi::OsStr,
+    process::{Command, Stdio},
 };
 
 const REPOSITORY: &str = "example/sample";
@@ -83,11 +90,22 @@ impl RemoteBranches for Fake {
         })
     }
 
-    fn delete(&self, path: &str) -> anyhow::Result<()> {
-        self.deletes.borrow_mut().push(path.to_string());
-        guard(path)?;
-        Ok(())
+    fn delete(
+        &self,
+        repository: &str,
+        branch: &str,
+        tip: &str,
+    ) -> anyhow::Result<CompareAndDelete> {
+        self.deletes
+            .borrow_mut()
+            .push(format!("{repository} refs/heads/{branch} at {tip}"));
+        Ok(CompareAndDelete::Deleted)
     }
+}
+
+/// The deletion the fake records for `branch` of `example/sample` at `TIP`.
+fn deleted(branch: &str) -> String {
+    format!("{REPOSITORY} refs/heads/{branch} at {TIP}")
 }
 
 /// The real client's path guard: a path `Github::api_response` refuses is refused here.
@@ -196,10 +214,10 @@ fn deletes_a_merged_branch() {
         assert_eq!(printed, format!("deleted wave/one at {TIP}"));
         assert_eq!(
             *fake.deletes.borrow(),
-            vec!["/repos/example/sample/git/refs/heads/wave/one".to_string()],
+            vec![deleted("wave/one")],
             "{status}"
         );
-        // The branch is read twice: before the comparison and again before the DELETE.
+        // The branch is read twice: before the comparison and again before the deletion.
         let reads = fake.reads.borrow();
         assert_eq!(
             reads
@@ -213,22 +231,23 @@ fn deletes_a_merged_branch() {
     // `refs/heads/<b>` names the same branch, never anything else.
     let fake = Fake::merged("wave/one", "wave/one", "ahead");
     delete_remote_branch(&fake, &deletion("refs/heads/wave/one")).unwrap();
-    assert_eq!(
-        *fake.deletes.borrow(),
-        vec!["/repos/example/sample/git/refs/heads/wave/one".to_string()]
-    );
+    assert_eq!(*fake.deletes.borrow(), vec![deleted("wave/one")]);
 }
 
 /// Whatever passes the name rules cannot change the request path: each segment is
-/// percent-encoded, `/` separates segments and nothing else does.
+/// percent-encoded, `/` separates segments and nothing else does. The deletion is no
+/// request path: it names the branch as it is.
 #[test]
 fn encodes_branch_path_segments() {
     let fake = Fake::merged("wave/a#b%c&d+e", "wave/a%23b%25c%26d%2Be", "ahead");
     delete_remote_branch(&fake, &deletion("wave/a#b%c&d+e")).unwrap();
-    assert_eq!(
-        *fake.deletes.borrow(),
-        vec!["/repos/example/sample/git/refs/heads/wave/a%23b%25c%26d%2Be".to_string()]
-    );
+    for path in [
+        "/repos/example/sample/branches/wave/a%23b%25c%26d%2Be".to_string(),
+        rules_path("wave/a%23b%25c%26d%2Be"),
+    ] {
+        assert!(fake.reads.borrow().contains(&path), "{path}");
+    }
+    assert_eq!(*fake.deletes.borrow(), vec![deleted("wave/a#b%c&d+e")]);
 }
 
 #[test]
@@ -282,10 +301,7 @@ fn deletes_a_merged_branch_under_the_bot_authority_ruleset() {
         panic!("a ruleset-only branch with protection.enabled false was refused: {e:#}")
     });
     assert_eq!(printed, format!("deleted wave/one at {TIP}"));
-    assert_eq!(
-        *fake.deletes.borrow(),
-        vec!["/repos/example/sample/git/refs/heads/wave/one".to_string()]
-    );
+    assert_eq!(*fake.deletes.borrow(), vec![deleted("wave/one")]);
 }
 
 /// A branch answer that does not say, as a JSON boolean, whether classic protection is
@@ -355,10 +371,7 @@ fn deletes_a_merged_branch_through_an_admitted_comparison_path() {
     let printed = delete_remote_branch(&fake, &deletion("wave/2026-10-13-w3"))
         .unwrap_or_else(|e| panic!("{e:#}"));
     assert_eq!(printed, format!("deleted wave/2026-10-13-w3 at {TIP}"));
-    assert_eq!(
-        *fake.deletes.borrow(),
-        vec!["/repos/example/sample/git/refs/heads/wave/2026-10-13-w3".to_string()]
-    );
+    assert_eq!(*fake.deletes.borrow(), vec![deleted("wave/2026-10-13-w3")]);
     assert!(
         fake.reads.borrow().contains(&compare_path()),
         "{:?}",
@@ -366,7 +379,8 @@ fn deletes_a_merged_branch_through_an_admitted_comparison_path() {
     );
 }
 
-/// Every path `delete_remote_branch` requests, read or DELETE, passes the guard.
+/// Every path `delete_remote_branch` requests passes the guard; all five are reads,
+/// and the one deletion is the compare-and-delete.
 #[test]
 fn every_requested_path_passes_the_client_guard() {
     for (name, encoded) in [
@@ -376,17 +390,12 @@ fn every_requested_path_passes_the_client_guard() {
     ] {
         let fake = Fake::merged(name, encoded, "identical");
         delete_remote_branch(&fake, &deletion(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
-        let requested: Vec<String> = fake
-            .reads
-            .borrow()
-            .iter()
-            .chain(fake.deletes.borrow().iter())
-            .cloned()
-            .collect();
-        assert_eq!(requested.len(), 6, "{name}: {requested:?}");
-        for path in requested {
-            assert!(api_path_admitted(&path), "{name}: guard refuses {path}");
+        let requested = fake.reads.borrow();
+        assert_eq!(requested.len(), 5, "{name}: {requested:?}");
+        for path in requested.iter() {
+            assert!(api_path_admitted(path), "{name}: guard refuses {path}");
         }
+        assert_eq!(*fake.deletes.borrow(), vec![deleted(name)], "{name}");
     }
 }
 
@@ -422,6 +431,257 @@ fn refuses_a_moved_tip() {
         .answer("/repos/example/sample/branches/wave/one", None);
     let text = refused(&fake, "wave/one");
     assert!(text.contains("wave/one"), "{text}");
+}
+
+/// A bare repository standing in for the Git remote of `example/sample`.
+struct BareRemote {
+    dir: tempfile::TempDir,
+}
+
+impl BareRemote {
+    /// `main` and `wave/one` at one commit, which is returned.
+    fn new() -> (Self, String) {
+        let remote = BareRemote {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        remote.git(&["init", "--quiet", "--bare"]);
+        let tip = remote.commit(None);
+        remote.git(&["update-ref", "refs/heads/main", &tip]);
+        remote.git(&["update-ref", "refs/heads/wave/one", &tip]);
+        (remote, tip)
+    }
+
+    fn command(&self, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(self.dir.path())
+            .args([
+                "-c",
+                "user.name=example",
+                "-c",
+                "user.email=example@example.invalid",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = self.command(args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A new commit of the empty tree on `parent`.
+    fn commit(&self, parent: Option<&str>) -> String {
+        let tree = self.git(&["mktree"]);
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", "change"];
+        args.extend(parent.map(|parent| ["-p", parent]).into_iter().flatten());
+        self.git(&args)
+    }
+
+    /// Where `refs/heads/<branch>` points; `None` when it does not exist.
+    fn tip(&self, branch: &str) -> Option<String> {
+        let output = self.command(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]);
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
+    }
+
+    fn url(&self) -> &str {
+        self.dir.path().to_str().unwrap()
+    }
+}
+
+/// GitHub's reads from the fake, and the real compare-and-delete against `remote`.
+/// `between` runs after the last read and before the deletion, where a push can land.
+struct OverGit<'a> {
+    reads: Fake,
+    remote: &'a BareRemote,
+    between: &'a dyn Fn(&BareRemote),
+}
+
+impl RemoteBranches for OverGit<'_> {
+    fn read(&self, path: &str) -> anyhow::Result<Option<Value>> {
+        self.reads.read(path)
+    }
+
+    fn delete(
+        &self,
+        repository: &str,
+        branch: &str,
+        tip: &str,
+    ) -> anyhow::Result<CompareAndDelete> {
+        assert_eq!(repository, REPOSITORY);
+        let reads = self.reads.reads.borrow().clone();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|path| *path == "/repos/example/sample/branches/wave/one")
+                .count(),
+            2,
+            "the deletion came before the last read: {reads:?}"
+        );
+        (self.between)(self.remote);
+        compare_and_delete_branch(self.remote.url(), branch, tip, None)
+    }
+}
+
+/// `delete-branch wave/one` where GitHub answers that `wave/one` is merged at `tip`.
+fn delete_over_git(
+    remote: &BareRemote,
+    tip: &str,
+    between: &dyn Fn(&BareRemote),
+) -> anyhow::Result<String> {
+    let reads = Fake::default()
+        .answer(
+            "/repos/example/sample",
+            Some(json!({"default_branch": "main"})),
+        )
+        .answer(
+            "/repos/example/sample/branches/wave/one",
+            Some(branch("wave/one", tip, false)),
+        )
+        .answer(
+            &format!("/repos/example/sample/compare/{tip}%2E%2E%2Emain"),
+            Some(json!({"status": "identical", "merge_base_commit": {"sha": tip}})),
+        )
+        .answer(&rules_path("wave/one"), Some(bot_authority()));
+    let api = OverGit {
+        reads,
+        remote,
+        between,
+    };
+    delete_remote_branch(&api, &deletion("wave/one"))
+}
+
+/// `story:bot-delete-branch-atomic`: a push that moves the tip after the last read and
+/// before the deletion is never deleted. The remote keeps the branch at the moved tip,
+/// and the refusal names it.
+#[test]
+fn keeps_a_branch_whose_tip_moves_after_the_last_read() {
+    let (remote, tip) = BareRemote::new();
+    let moved = RefCell::new(None);
+    let result = delete_over_git(&remote, &tip, &|remote| {
+        let next = remote.commit(Some(tip.as_str()));
+        remote.git(&["update-ref", "refs/heads/wave/one", &next]);
+        *moved.borrow_mut() = Some(next);
+    });
+    let moved = moved
+        .into_inner()
+        .expect("the deletion was never attempted");
+    assert_eq!(
+        remote.tip("wave/one").as_deref(),
+        Some(moved.as_str()),
+        "the branch moved to {moved} after the last read was not kept: {result:?}"
+    );
+    let text = format!("{:#}", result.expect_err("the deletion was not refused"));
+    assert!(
+        text.contains(&format!("moved from {tip} to {moved}")),
+        "{text}"
+    );
+    assert!(text.contains("kept"), "{text}");
+}
+
+/// The control: a tip that did not move is deleted through Git, and only
+/// `refs/heads/wave/one` is: `main` and a tag of the same name stay.
+#[test]
+fn deletes_through_git_at_the_checked_tip_and_nothing_else() {
+    let (remote, tip) = BareRemote::new();
+    remote.git(&["update-ref", "refs/tags/wave/one", &tip]);
+    let printed = delete_over_git(&remote, &tip, &|_| {}).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(printed, format!("deleted wave/one at {tip}"));
+    assert_eq!(remote.tip("wave/one"), None);
+    assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
+    assert_eq!(remote.git(&["rev-parse", "refs/tags/wave/one"]), tip);
+}
+
+/// A branch someone deleted after the last read is refused as gone, naming the tip it
+/// was checked at.
+#[test]
+fn refuses_a_branch_deleted_after_the_last_read() {
+    let (remote, tip) = BareRemote::new();
+    let result = delete_over_git(&remote, &tip, &|remote| {
+        remote.git(&["update-ref", "-d", "refs/heads/wave/one"]);
+    });
+    let text = format!(
+        "{:#}",
+        result.expect_err("a deleted branch was reported deleted")
+    );
+    assert!(text.contains("no longer exists"), "{text}");
+    assert!(text.contains(&tip), "{text}");
+    assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
+}
+
+/// A deletion the remote applied but whose report never reached Git (the remote's
+/// process ends once the ref transaction is committed, as a lost connection would) is
+/// told as an unknown outcome, never as "the bot deleted nothing".
+#[test]
+fn an_unreported_deletion_is_told_as_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+    let (remote, tip) = BareRemote::new();
+    let result = delete_over_git(&remote, &tip, &|remote| {
+        let hook = remote.dir.path().join("hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" = committed ] && kill -9 $PPID\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    assert_eq!(
+        remote.tip("wave/one"),
+        None,
+        "fixture: the remote did not apply the deletion: {result:?}"
+    );
+    let text = format!(
+        "{:#}",
+        result.expect_err("an unreported deletion was reported deleted")
+    );
+    assert!(text.contains("outcome is unknown"), "{text}");
+    assert!(text.contains("no longer exists"), "{text}");
+    assert!(!text.contains("deleted nothing"), "{text}");
+}
+
+/// The Git deletion compares only a full object id and addresses only a branch name the
+/// name rules admit; anything else is refused before Git runs and deletes nothing.
+#[test]
+fn the_git_deletion_refuses_what_it_cannot_compare() {
+    let (remote, tip) = BareRemote::new();
+    let upper = tip.to_ascii_uppercase();
+    let admitted: Vec<String> = [
+        ("wave/one", &tip[..12]),
+        ("wave/one", "HEAD"),
+        ("wave/one", upper.as_str()),
+        ("refs/heads/wave/one", tip.as_str()),
+        ("wave/*", tip.as_str()),
+        ("wave/one:main", tip.as_str()),
+        ("a..b", tip.as_str()),
+    ]
+    .into_iter()
+    .filter_map(|(branch, expected)| {
+        compare_and_delete_branch(remote.url(), branch, expected, None)
+            .ok()
+            .map(|outcome| format!("{branch} at {expected}: {outcome:?}"))
+    })
+    .collect();
+    assert!(admitted.is_empty(), "admitted: {admitted:#?}");
+    assert_eq!(remote.tip("wave/one").as_deref(), Some(tip.as_str()));
+    assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
 }
 
 #[test]
@@ -676,7 +936,9 @@ fn push_delete_refusal_names_delete_branch() {
     }
 }
 
-/// `delete-branch` is not a Git command: the library's Git route refuses it before Git.
+/// `delete-branch` is not a Git command the bot passes on: the library's Git route
+/// refuses it before Git and names the bot verb, which checks through the REST API and
+/// deletes by a push of its own.
 #[test]
 fn library_git_never_runs_delete_branch() {
     let dir = tempfile::tempdir().unwrap();
@@ -685,6 +947,8 @@ fn library_git_never_runs_delete_branch() {
         bot_git(dir.path(), &args("delete-branch wave/one"), None).unwrap_err()
     );
     assert!(text.contains("REST API"), "{text}");
+    assert!(text.contains("-- delete-branch <branch>"), "{text}");
+    assert!(text.contains("Git push of its own"), "{text}");
     assert!(!text.contains("failed (exit"), "reached Git: {text}");
 }
 
@@ -868,4 +1132,133 @@ fn refuses_unlisted_rulesets() {
     let page = Value::Array((0..100).map(|_| rule("update")).collect());
     let text = refused(&ruled(Some(page)), "wave/one");
     assert!(text.contains("more than one page"), "{text}");
+}
+
+/// Run `child` of this test binary with `env`; its `BDB ` lines. The caller's
+/// environment reaches the code under test only this way, so no test changes this
+/// process's environment.
+fn run_child(child: &str, env: &[(&str, &OsStr)]) -> String {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            child,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{child}: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        // libtest prints `test <name> ... ` before the child's first line.
+        .filter_map(|line| line.find("BDB ").map(|at| &line[at..]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A directory standing in for a caller's `GIT_EXEC_PATH`: its `git-upload-pack` and
+/// `git-receive-pack` create `marker` and fail.
+fn caller_programs(dir: &std::path::Path, marker: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let programs = dir.join("programs");
+    std::fs::create_dir_all(&programs).unwrap();
+    for name in ["git-upload-pack", "git-receive-pack"] {
+        let path = programs.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    programs
+}
+
+#[test]
+#[ignore = "child process entry point: run by the_git_deletion_takes_no_git_variable_of_the_callers"]
+fn child_delete_in_the_callers_environment() {
+    let remote = std::env::var("BDB_REMOTE").unwrap();
+    let tip = std::env::var("BDB_TIP").unwrap();
+    let outcome = compare_and_delete_branch(&remote, "wave/one", &tip, None)
+        .map_err(|error| format!("{error:#}"));
+    println!("BDB {outcome:?}");
+}
+
+/// The deletion's scratch repository and push take no `GIT_*` variable of the caller's
+/// environment: `GIT_DEFAULT_HASH` would make the scratch repository another kind of
+/// repository than the remote, `GIT_EXEC_PATH` would run the caller's
+/// `git-receive-pack` and `GIT_NAMESPACE` would address another ref.
+#[test]
+fn the_git_deletion_takes_no_git_variable_of_the_callers() {
+    let (remote, tip) = BareRemote::new();
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("caller-program-ran");
+    let programs = caller_programs(work.path(), &marker);
+    let outcome = run_child(
+        "child_delete_in_the_callers_environment",
+        &[
+            ("BDB_REMOTE", OsStr::new(remote.url())),
+            ("BDB_TIP", OsStr::new(&tip)),
+            ("GIT_DEFAULT_HASH", OsStr::new("sha256")),
+            ("GIT_EXEC_PATH", programs.as_os_str()),
+            ("GIT_NAMESPACE", OsStr::new("other")),
+        ],
+    );
+    assert_eq!(outcome, "BDB Ok(Deleted)");
+    assert!(!marker.exists(), "the caller's program ran");
+    assert_eq!(remote.tip("wave/one"), None);
+    assert_eq!(remote.tip("main").as_deref(), Some(tip.as_str()));
+}
+
+#[test]
+#[ignore = "child process entry point: run by bot_git_runs_in_its_root_with_gits_own_programs"]
+fn child_fetch_in_the_callers_environment() {
+    let root = std::env::var("BDB_ROOT").unwrap();
+    let remote = std::env::var("BDB_REMOTE").unwrap();
+    let outcome = bot_git(
+        std::path::Path::new(&root),
+        &["fetch".to_string(), remote, "refs/heads/main".to_string()],
+        None,
+    )
+    .map_err(|error| format!("{error:#}"));
+    println!("BDB {outcome:?}");
+}
+
+/// Bot Git runs in the root it is given, with Git's own programs: the caller's
+/// `GIT_DIR` would fetch into another repository, and its `GIT_EXEC_PATH` would run
+/// the caller's `git-upload-pack` with the bot's environment.
+#[test]
+fn bot_git_runs_in_its_root_with_gits_own_programs() {
+    let (remote, _) = BareRemote::new();
+    let root = repository_without_hooks();
+    let decoy = repository_without_hooks();
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("caller-program-ran");
+    let programs = caller_programs(work.path(), &marker);
+    let outcome = run_child(
+        "child_fetch_in_the_callers_environment",
+        &[
+            ("BDB_ROOT", root.path().as_os_str()),
+            ("BDB_REMOTE", OsStr::new(remote.url())),
+            ("GIT_DIR", decoy.path().join(".git").as_os_str()),
+            ("GIT_EXEC_PATH", programs.as_os_str()),
+        ],
+    );
+    let fetched = |dir: &tempfile::TempDir| dir.path().join(".git/FETCH_HEAD").exists();
+    assert!(
+        outcome == "BDB Ok(())" && !marker.exists() && fetched(&root) && !fetched(&decoy),
+        "{outcome}: the caller's program ran {}, fetched into the root {}, into the \
+         caller's GIT_DIR {}",
+        marker.exists(),
+        fetched(&root),
+        fetched(&decoy)
+    );
 }

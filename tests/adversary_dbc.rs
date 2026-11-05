@@ -6,7 +6,7 @@
 use b10x_gates::{
     BOT_EMAIL, BOT_NAME,
     bot_args::delete_branch,
-    delivery::{RemoteBranches, api_path_admitted, delete_remote_branch},
+    delivery::{CompareAndDelete, RemoteBranches, api_path_admitted, delete_remote_branch},
     hooks::Config,
     policy::{Policy, Repository},
 };
@@ -52,10 +52,16 @@ impl RemoteBranches for Fake {
             .map_or(Ok(None), |v| Ok(Some(v)))
     }
 
-    fn delete(&self, path: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(api_path_admitted(path), "invalid GitHub API path");
-        self.deletes.borrow_mut().push(path.to_string());
-        Ok(())
+    fn delete(
+        &self,
+        repository: &str,
+        branch: &str,
+        tip: &str,
+    ) -> anyhow::Result<CompareAndDelete> {
+        self.deletes
+            .borrow_mut()
+            .push(format!("{repository} refs/heads/{branch} at {tip}"));
+        Ok(CompareAndDelete::Deleted)
     }
 }
 
@@ -142,9 +148,7 @@ fn percent_sequences_in_names_cannot_forge_the_comparison_separator() {
     assert_eq!(compare.matches("%2E%2E%2E").count(), 1, "{compare}");
     assert_eq!(
         *fake.deletes.borrow(),
-        vec![format!(
-            "/repos/example/sample/git/refs/heads/{encoded_branch}"
-        )]
+        vec![format!("example/sample refs/heads/{branch} at {TIP}")]
     );
 
     // A default branch carrying a literal `..` (no valid ref does) never reaches GitHub.

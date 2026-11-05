@@ -143,7 +143,7 @@ fn index_is_scanned_independently_of_unstaged_content() {
     git(f.dir.path(), &["add", "readme"]);
     fs::write(&path, "clean unstaged content").unwrap();
     let git = Git::new(f.dir.path()).unwrap();
-    let report = scan::run(
+    let report = scan::run_batches(
         &f.policy,
         REPOSITORY,
         &git.staged().unwrap(),
@@ -154,7 +154,7 @@ fn index_is_scanned_independently_of_unstaged_content() {
     git.read(&["add", "readme"]).unwrap();
     fs::write(&path, home()).unwrap();
     assert!(
-        scan::run(
+        scan::run_batches(
             &f.policy,
             REPOSITORY,
             &git.staged().unwrap(),
@@ -189,7 +189,7 @@ fn filenames_messages_author_and_committer_are_scanned() {
     let denied = f.policy.forbidden_literals[0].clone();
     let head = f.commit(&denied, b"safe", &denied);
     let candidate = f.candidate(&head);
-    let report = scan::run(
+    let report = scan::run_batches(
         &f.policy,
         REPOSITORY,
         &candidate.units,
@@ -241,7 +241,8 @@ fn filenames_messages_author_and_committer_are_scanned() {
         workflow: false,
         inherited: None,
     });
-    let report = scan::run(&f.policy, REPOSITORY, &units, &mut CountScanner::default()).unwrap();
+    let report =
+        scan::run_batches(&f.policy, REPOSITORY, &units, &mut CountScanner::default()).unwrap();
     assert!(report.results["private-identifiers"].findings >= 4);
 }
 
@@ -256,7 +257,7 @@ fn annotated_tag_messages_identities_and_names_are_bound() {
         .candidate(&f.policy, REPOSITORY, &head, std::slice::from_ref(denied))
         .unwrap();
     assert_eq!(candidate.binding.tags.len(), 1);
-    let report = scan::run(
+    let report = scan::run_batches(
         &f.policy,
         REPOSITORY,
         &candidate.units,
@@ -322,7 +323,7 @@ fn candidate_ignore_files_comments_and_unbounded_exceptions_do_not_disable_rules
     let f = Fixture::new();
     let input = format!("{} # gitleaks:allow\n", f.policy.forbidden_literals[0]);
     let head = f.commit(".gitleaksignore", input.as_bytes(), "attempt ignore");
-    let report = scan::run(
+    let report = scan::run_batches(
         &f.policy,
         REPOSITORY,
         &f.candidate(&head).units,
@@ -393,7 +394,7 @@ fn hostile_fork_content_is_read_as_data_and_symlinks_are_not_followed() {
     }
     let head = git(f.dir.path(), &["rev-parse", "HEAD"]);
     let candidate = f.candidate(&head);
-    let _ = scan::run(
+    let _ = scan::run_batches(
         &f.policy,
         REPOSITORY,
         &candidate.units,
@@ -2718,10 +2719,9 @@ fn review_blob_bytes_that_look_like_batch_protocol_survive_the_stream_exactly() 
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "edit every file"]);
     let head = git(root, &["rev-parse", "HEAD"]);
-    let candidate = f.candidate(&head);
+    let candidate = f.candidate(&head).units.read_all().unwrap();
     let found = |path: &str| -> Vec<&Unit> {
         candidate
-            .units
             .iter()
             .filter(|u| u.location == format!("file:{path}"))
             .collect()

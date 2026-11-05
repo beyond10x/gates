@@ -2,12 +2,13 @@
 format: aep.planning-md/3
 id: story:ci-compressed-policy
 kind: story
-status: active
+status: implemented
 title: Read the CI policy from a compressed secret under the 48 KB limit
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T07:12:16Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-14T07:12:16Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-11-04T12:07:17Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Problem
 

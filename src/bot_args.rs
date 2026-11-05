@@ -1,14 +1,16 @@
 //! The argument check `b10x-gates bot` runs before any credential is minted.
 //!
 //! The bot runs `commit`, `tag`, `push`, `fetch`, `merge` and `revert` as Git, and
-//! `delete-branch` through the REST API. Everything else is refused with the supported
-//! route in the text, so an agent does not have to find it alone. `Github::git` runs
-//! this same check again, so the two cannot drift.
+//! `delete-branch` as its own verb: it checks the branch through the REST API, then
+//! deletes it with a Git push of its own that carries the checked tip, never a push the
+//! caller passes. Everything else is refused with the supported route in the text, so
+//! an agent does not have to find it alone. `Github::git` runs this same check again,
+//! so the two cannot drift.
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 const SUPPORTED: &str = "bot Git command must be commit, tag, push, fetch, merge or revert, \
-                         or the API verb delete-branch";
+                         or the bot's own verb delete-branch";
 const GUARD: &str = "bot delivery cannot bypass hooks or inject Git configuration";
 const MERGE_ROUTE: &str =
     "run `b10x-gates bot -- merge <branch>`, which commits the merge as the bot";
@@ -520,6 +522,7 @@ pub fn installed_configuration(
 fn common_directory(root: &Path, verb: &str, remedy: &str) -> Result<Option<PathBuf>> {
     let git = crate::git::Git {
         root: root.to_path_buf(),
+        batch: crate::git::BATCH_LIMIT,
     };
     let output = git
         .command()
@@ -548,7 +551,7 @@ fn common_directory(root: &Path, verb: &str, remedy: &str) -> Result<Option<Path
 
 /// `<owner>/<repo>`: two non-empty segments of ASCII letters, digits, `-`, `_` and `.`,
 /// neither a dot segment, so the repository can never change the request path.
-fn repository_shaped(repository: &str) -> bool {
+pub(crate) fn repository_shaped(repository: &str) -> bool {
     let mut segments = repository.split('/');
     let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
     else {
@@ -564,7 +567,7 @@ fn repository_shaped(repository: &str) -> bool {
 
 /// The branch a name addresses, or the cause it is refused. Only `refs/heads/` is
 /// addressed, so a tag is never deleted; the rest follows `git check-ref-format`.
-fn branch_to_delete(name: &str) -> Result<String> {
+pub(crate) fn branch_to_delete(name: &str) -> Result<String> {
     let refuse = |cause: &str| -> Result<String> {
         bail!(
             "bot delete-branch refuses the branch name `{}`: {cause}",

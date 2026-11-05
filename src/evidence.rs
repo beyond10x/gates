@@ -1,7 +1,7 @@
 //! Versioned Ed25519 receipts. Verification never invokes a scanner.
 use crate::{
     GITLEAKS_VERSION, VERSION, digest,
-    git::{Binding, Candidate, Git, Unit},
+    git::{Binding, Candidate, Git, Units},
     policy::{self, Policy},
     scan::{self, RuleResult, SecretScanner},
 };
@@ -92,16 +92,17 @@ fn enrolled(policy: &Policy, candidate: &Candidate, key: &SigningKey) -> Result<
 /// Scan `units` and, when they pass, sign the full statement for `candidate`: the common
 /// checks passed for every commit from the baseline to its head. `units` is the whole
 /// candidate, or the part of it no verified receipt already covers; in both cases the
-/// signed results are what a successful scan of the whole candidate reports.
+/// signed results are what a successful scan of the whole candidate reports. They are
+/// scanned in batches, so their total size is no limit.
 fn sign(
     policy: &Policy,
     candidate: &Candidate,
     key: &SigningKey,
     signer: String,
     scanner: &mut dyn SecretScanner,
-    units: &[Unit],
+    units: &Units,
 ) -> Result<Receipt> {
-    scan::run(policy, &candidate.binding.repository, units, scanner)?.require_success()?;
+    scan::run_batches(policy, &candidate.binding.repository, units, scanner)?.require_success()?;
     let payload = Payload {
         version: 1,
         binding: candidate.binding.clone(),
@@ -285,7 +286,7 @@ pub fn reuse_or_scan(
     if receipt.is_some_and(|r| verify(policy, candidate, r).is_ok()) {
         return Ok(true);
     }
-    scan::run(
+    scan::run_batches(
         policy,
         &candidate.binding.repository,
         &candidate.units,

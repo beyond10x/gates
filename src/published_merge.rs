@@ -6,6 +6,7 @@
 //! must be Git's own clean merge of its parents, recomputed locally.
 use crate::{
     BOT_EMAIL, BOT_NAME,
+    delivery::ApiFailure,
     git::{Git, exact_identity, is_oid, unique_header},
     policy::{Policy, valid_repository},
 };
@@ -166,11 +167,57 @@ fn bot_account(value: &Value, pointer: &str) -> bool {
 
 /// Every read names its method and path when it fails, so a refusal says which evidence was
 /// unavailable. The path holds only the repository, object ids, numbers and the default branch.
+/// GitHub's own refusal leads its text with the path and stays an `ApiFailure`, so a caller's
+/// downcast still finds its status; any other error is wrapped in a `ReadFailure`.
 fn read(api: &impl AuthenticatedRead, path: &str) -> Result<Value> {
     api.get(path).map_err(|error| {
-        let named = format!("GET {path}: {error}");
-        error.context(named)
+        let error = if error
+            .chain()
+            .next()
+            .is_some_and(|top| top.is::<ApiFailure>())
+        {
+            match error.downcast::<ApiFailure>() {
+                Ok(failure) => return failure.answering(path).into(),
+                Err(error) => error,
+            }
+        } else {
+            error
+        };
+        ReadFailure::wrap(format!("GET {path}"), error)
     })
+}
+
+/// A refused read. Its text is what was read (`GET <path>`), `: ` and the inner error's own
+/// top-level text, and its source is the cause below that text, so the one-line form `main`
+/// prints and the full chain show the path and the status once each, and every deeper cause
+/// stays in the chain once.
+struct ReadFailure {
+    what: String,
+    error: anyhow::Error,
+}
+
+impl ReadFailure {
+    fn wrap(what: String, error: anyhow::Error) -> anyhow::Error {
+        Self { what, error }.into()
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.error)
+    }
+}
+
+impl std::fmt::Debug for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for ReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
 }
 
 fn page(path: &str, page: u32) -> String {
@@ -430,9 +477,12 @@ impl Authority {
         let pulls = match read(api, &page(&path, 1)) {
             Ok(first) => later_pages(api, &path, first)?,
             Err(error) if crate::delivery::is_server_error(&error) => {
+                // The list's refusal in full, then the named read's own chain below it, so each
+                // read's path, status and deeper causes print once.
                 self.named_pull_request(git, api, oid).map_err(|named| {
-                    anyhow::anyhow!(
-                        "{error}; the pull request the merge names could not stand in: {named}"
+                    ReadFailure::wrap(
+                        format!("{error:#}; the pull request the merge names could not stand in"),
+                        named,
                     )
                 })?
             }

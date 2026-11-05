@@ -3,13 +3,26 @@ use b10x_gates::{
     artifact,
     delivery::{self, Github},
     evidence::{self, Receipt},
-    git::Git,
+    git::{Git, Unit},
     hooks,
     policy::{self, Policy},
-    scan::{self, Gitleaks},
+    scan::{self, Gitleaks, SecretFinding, SecretScanner},
 };
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, path::PathBuf};
+
+/// Counts the scanner's invocations: one for each batch a check scans.
+struct Invocations<'a> {
+    scanner: &'a mut dyn SecretScanner,
+    count: usize,
+}
+
+impl SecretScanner for Invocations<'_> {
+    fn scan(&mut self, units: &[Unit]) -> Result<Vec<SecretFinding>> {
+        self.count += 1;
+        self.scanner.scan(units)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -256,7 +269,8 @@ fn execute(args: Args) -> Result<()> {
         // Refuse an unsupported operation before any credential is minted.
         b10x_gates::bot_args::check(command, repository.as_deref())?;
         if command.first().is_some_and(|verb| verb == "delete-branch") {
-            // The REST API as the App, never Git; the shape was refused above.
+            // Checked through the REST API as the App, then deleted by a Git push that
+            // carries the checked tip; the shape was refused above.
             let deletion = b10x_gates::bot_args::delete_branch(command, repository.as_deref())?;
             println!(
                 "{}",
@@ -573,10 +587,14 @@ fn execute(args: Args) -> Result<()> {
         let valid = receipts
             .iter()
             .find(|r| evidence::verify(&policy, &candidate, r).is_ok());
-        let reused = evidence::reuse_or_scan(&policy, &candidate, valid, &mut scanner)?;
+        let mut counted = Invocations {
+            scanner: &mut scanner,
+            count: 0,
+        };
+        let reused = evidence::reuse_or_scan(&policy, &candidate, valid, &mut counted)?;
         println!(
             "common checks passed; evidence_reused={reused}; scanner_invocations={}",
-            if reused { 0 } else { 1 }
+            counted.count
         );
         return Ok(());
     }
@@ -647,7 +665,7 @@ fn execute(args: Args) -> Result<()> {
     let git = Git::new(&args.repo)?;
     if let Action::Audit { output } = &args.command {
         let units = git.historical(&policy.repository(&repository)?.baseline)?;
-        let report = scan::run(&policy, &repository, &units, &mut scanner)?;
+        let report = scan::run_batches(&policy, &repository, &units, &mut scanner)?;
         policy::private_write(output, &serde_json::to_vec(&report.findings)?)?;
         println!(
             "historical baseline: {} finding(s); detailed report retained locally",
