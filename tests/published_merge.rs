@@ -3656,3 +3656,145 @@ fn review_a_signed_merge_s_subject_is_read_after_its_signature_only() {
     let error = hidden.refusal("a pull request named only inside the signature");
     assert!(error.contains("names no pull request"), "{error}");
 }
+
+// Security review of the 5xx fallback, F3: a refused read names its `GET <path>` and its status
+// once each, in the one line `main` prints and in the full chain alike.
+
+/// Each read in `reads` appears in `error` as `GET <path>: ` exactly once, and each status as
+/// often as the reads that answered it, in `{}` and in `{:#}`.
+fn assert_each_read_once(what: &str, error: &anyhow::Error, reads: &[(&str, StatusCode)]) {
+    for text in [format!("{error}"), format!("{error:#}")] {
+        for (path, status) in reads {
+            assert_eq!(
+                text.matches(&format!("GET {path}: ")).count(),
+                1,
+                "{what}: GET {path}: {text}"
+            );
+            let answered = reads.iter().filter(|(_, other)| other == status).count();
+            assert_eq!(
+                text.matches(&status.to_string()).count(),
+                answered,
+                "{what}: {status}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_a_refused_read_prints_its_path_and_status_once_each() {
+    // The plain refusals: a client error on the association list, which never falls back.
+    for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
+        let mut f = Fixture::new();
+        f.named_merge(SUBJECT, 5, status);
+        let list = association_list(&f.merge);
+        let error = f.verify().expect_err("a client error admitted");
+        assert_each_read_once(status.as_str(), &error, &[(&list, status)]);
+    }
+
+    // Another read site: the branch authority answering 503 after the retries.
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    f.api.responses.remove(AUTHORITY);
+    f.api
+        .failures
+        .insert(AUTHORITY.into(), StatusCode::SERVICE_UNAVAILABLE);
+    let error = f.verify().expect_err("a failing authority admitted");
+    assert_each_read_once(
+        "the authority",
+        &error,
+        &[(AUTHORITY, StatusCode::SERVICE_UNAVAILABLE)],
+    );
+
+    // The fallback refusing: the merge names no pull request.
+    let mut f = Fixture::new();
+    f.named_merge("merge", 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let list = association_list(&f.merge);
+    let error = f.verify().expect_err("no named pull request admitted");
+    assert_each_read_once(
+        "no named pull request",
+        &error,
+        &[(&list, StatusCode::INTERNAL_SERVER_ERROR)],
+    );
+
+    // The fallback refusing: the named pull request's own read fails too, so two reads.
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let list = association_list(&f.merge);
+    let pull = format!("{ROOT}/pulls/5");
+    f.api.responses.remove(&pull);
+    f.api.failures.insert(pull.clone(), StatusCode::BAD_GATEWAY);
+    let error = f.verify().expect_err("both reads failing admitted");
+    assert_each_read_once(
+        "both reads failing",
+        &error,
+        &[
+            (&list, StatusCode::INTERNAL_SERVER_ERROR),
+            (&pull, StatusCode::BAD_GATEWAY),
+        ],
+    );
+
+    // A later page of the association list failing, which refuses outright.
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let first_page = association_list(&f.merge);
+    let mut entries = vec![f.pull(5).clone()];
+    entries.extend((6..105).map(|number| json!({"number":number,"merge_commit_sha":null})));
+    f.api.failures.remove(&first_page);
+    f.api.responses.insert(first_page, json!(entries));
+    let second_page = format!("{ROOT}/commits/{}/pulls?per_page=100&page=2", f.merge);
+    f.api
+        .failures
+        .insert(second_page.clone(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error = f.verify().expect_err("a failing later page admitted");
+    assert_each_read_once(
+        "a later page",
+        &error,
+        &[(&second_page, StatusCode::INTERNAL_SERVER_ERROR)],
+    );
+}
+
+/// `Evidence`, except that `path` fails with an error carrying a cause below its own message,
+/// as `PushEvidence` does when its credential is missing.
+struct DeeperCause<'a> {
+    evidence: &'a Evidence,
+    path: &'a str,
+}
+
+impl AuthenticatedRead for DeeperCause<'_> {
+    fn get(&self, path: &str) -> Result<Value> {
+        if path == self.path {
+            return Err(anyhow::anyhow!("environment variable not found")
+                .context("authenticated push evidence unavailable"));
+        }
+        self.evidence.get(path)
+    }
+}
+
+#[test]
+fn review_a_refused_read_keeps_every_cause_below_its_own_once() {
+    let mut f = Fixture::new();
+    f.named_merge(SUBJECT, 5, StatusCode::INTERNAL_SERVER_ERROR);
+    let git = Git::new(f.dir.path()).unwrap();
+    let api = DeeperCause {
+        evidence: &f.api,
+        path: AUTHORITY,
+    };
+    let error =
+        b10x_gates::delivery::verify_publication(&git, &f.policy, REPOSITORY, &f.candidate, &api)
+            .expect_err("an unavailable credential admitted");
+    let read = format!("GET {AUTHORITY}: ");
+    let line = format!("{error}");
+    assert_eq!(
+        line,
+        format!("{read}authenticated push evidence unavailable")
+    );
+    for text in [format!("{error:#}"), format!("{error:?}")] {
+        for part in [
+            read.as_str(),
+            "authenticated push evidence unavailable",
+            "environment variable not found",
+        ] {
+            assert_eq!(text.matches(part).count(), 1, "{part}: {text}");
+        }
+    }
+}
