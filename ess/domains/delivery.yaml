@@ -7,9 +7,10 @@ summary: >-
   the options it refuses, the revisions named, the merge drivers the repository's own
   configuration declares (read as data) and any operation already in progress; Git's
   result is observed after the no-commit run. `delete-branch` is the one verb that
-  is not Git: it deletes a merged remote branch through the REST API as the App,
-  after reading the branch, its protection, the rulesets that apply to it and its
-  ancestry with the default branch. `api` and `gh -- api` refuse a write to a ruleset
+  is not a Git command the caller passes: it reads the branch, its protection, the
+  rulesets that apply to it and its ancestry with the default branch through the
+  REST API as the App, then deletes the merged remote branch with a Git push of its
+  own that carries the checked tip. `api` and `gh -- api` refuse a write to a ruleset
   or to branch protection before a token is minted.
 
 entities:
