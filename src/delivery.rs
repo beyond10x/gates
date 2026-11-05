@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::{Method, StatusCode, blocking::Client};
+use reqwest::{Method, StatusCode, Url, blocking::Client};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -23,6 +23,9 @@ use std::{
 pub struct Github {
     client: Client,
     token: String,
+    /// Every request goes to this origin and only to it: `https://api.github.com`, or a
+    /// test's loopback server (`for_loopback_test`).
+    base: Url,
 }
 
 impl AuthenticatedRead for Github {
@@ -559,6 +562,62 @@ pub fn api_path_admitted(path: &str) -> bool {
     path.starts_with('/') && !path.contains("..") && !path.contains('#')
 }
 
+/// The statuses whose `Location` a read follows. GitHub answers a read of a renamed or
+/// transferred repository with a redirect to `/repositories/<id>`.
+const FOLLOWED_REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
+/// The most redirects one read follows, reqwest's own default.
+const REDIRECT_LIMIT: usize = 10;
+
+/// GET and HEAD. Every other method is a write, which a redirect never sends again.
+fn is_read(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD
+}
+
+/// The URL a read is sent to next when the answer to `current` redirects to `location`:
+/// on `base`'s origin, to a path `api_path_admitted` admits, and only when `location` is
+/// that URL or that path exactly as written. Whatever the URL parser would rewrite (dot
+/// segments, a fragment, credentials, another scheme, host or port) is not followed.
+fn redirect_target(base: &Url, current: &Url, location: &str) -> Option<String> {
+    let target = current.join(location).ok()?;
+    let mut path = target.path().to_owned();
+    if let Some(query) = target.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let url = format!("{}{path}", base.origin().ascii_serialization());
+    (api_path_admitted(&path) && (location == url || location == path)).then_some(url)
+}
+
+/// A redirect the client did not follow. Its text names the method and the status, never
+/// the `Location`: GitHub fills it, and it may carry what the caller never wrote.
+#[derive(Debug)]
+struct RedirectRefused {
+    method: Method,
+    status: StatusCode,
+}
+
+impl std::fmt::Display for RedirectRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { method, status } = self;
+        if is_read(method) {
+            write!(
+                f,
+                "GitHub answered the {method} with {status}; the redirect was not followed: a \
+                 read follows at most {REDIRECT_LIMIT} redirects, each to an admitted path on \
+                 the API host, written as it is requested; Location withheld"
+            )
+        } else {
+            write!(
+                f,
+                "GitHub answered the {method} with {status}; the redirect was not followed and \
+                 the write was not repeated: it was sent once; Location withheld"
+            )
+        }
+    }
+}
+
+impl std::error::Error for RedirectRefused {}
+
 impl Github {
     pub fn gh(&self, root: &Path, args: &[String]) -> Result<()> {
         const SUPPORTED: [&str; 6] = ["release", "pr", "run", "workflow", "api", "repo"];
@@ -584,14 +643,35 @@ impl Github {
         Ok(())
     }
     pub fn from_token(token: String) -> Result<Self> {
+        Self::client(
+            token,
+            Url::parse("https://api.github.com")?,
+            Client::builder().https_only(true),
+        )
+    }
+
+    /// `from_token` against a plain-HTTP server on `127.0.0.1:<port>`, for a test that
+    /// answers as GitHub. Only a test reaches it: no command-line flag or environment
+    /// variable names a base URL.
+    #[doc(hidden)]
+    pub fn for_loopback_test(token: String, port: u16) -> Result<Self> {
+        Self::client(
+            token,
+            Url::parse(&format!("http://127.0.0.1:{port}"))?,
+            Client::builder().no_proxy(),
+        )
+    }
+
+    fn client(token: String, base: Url, builder: reqwest::blocking::ClientBuilder) -> Result<Self> {
         ensure!(!token.is_empty(), "GitHub token unavailable");
         Ok(Self {
-            client: Client::builder()
-                .https_only(true)
+            client: builder
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(60))
                 .user_agent("b10x-gates")
                 .build()?,
             token,
+            base,
         })
     }
 
@@ -660,7 +740,8 @@ impl Github {
     }
 
     /// `api` with the success status. A non-2xx answer is an `ApiFailure`, whose
-    /// text is the status alone until `ApiFailure::render` has the matchers. A GET that
+    /// text is the status alone until `ApiFailure::render` has the matchers, except a
+    /// redirect `send` does not follow, which is refused naming its status. A GET that
     /// GitHub answers with a server error is sent again, see `send_once_or_retried`.
     pub fn api_response(
         &self,
@@ -674,24 +755,52 @@ impl Github {
         })
     }
 
+    /// Send `method` to `path` on the API host. reqwest follows no redirect itself
+    /// (`Policy::none()` in `client`): a write answered with a 3xx is refused after its one
+    /// send, and a read follows at most `REDIRECT_LIMIT` redirects, each only as far as
+    /// `redirect_target` admits. Every URL is built from `self.base`, so the credential is
+    /// sent to that origin alone.
     fn send(
         &self,
         method: Method,
         path: &str,
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
-        let mut request = self
-            .client
-            .request(method, format!("https://api.github.com{path}"))
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request
-            .send()
-            .map_err(|_| anyhow::anyhow!("GitHub request failed; sensitive response withheld"))?;
+        let mut url = format!("{}{path}", self.base.origin().ascii_serialization());
+        let mut followed = 0;
+        let response = loop {
+            let mut request = self
+                .client
+                .request(method.clone(), &url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28");
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().map_err(|_| {
+                anyhow::anyhow!("GitHub request failed; sensitive response withheld")
+            })?;
+            let status = response.status();
+            if status.is_redirection() && !is_read(&method) {
+                return Err(RedirectRefused { method, status }.into());
+            }
+            if !FOLLOWED_REDIRECTS.contains(&status.as_u16()) {
+                break response;
+            }
+            let next = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| redirect_target(&self.base, response.url(), location));
+            match next {
+                Some(next) if followed < REDIRECT_LIMIT => {
+                    followed += 1;
+                    url = next;
+                }
+                _ => return Err(RedirectRefused { method, status }.into()),
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             // A body that is not small JSON is never kept: it is rendered as status only.
