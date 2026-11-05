@@ -2,13 +2,21 @@
 format: aep.planning-md/3
 id: story:bot-git-ssl-env
 kind: story
-status: draft
+status: active
 title: Keep the caller's TLS-weakening Git variables out of the bot's Git
 tags:
 - from-finding
 relations:
 - informed_by: review-result:delete-branch-lease-adversary-1
-revision: 1
+scope:
+- confidence: inferred
+  path: src/delivery.rs
+- confidence: inferred
+  path: tests/bot_git_ssl_env.rs
+revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-05T02:57:28Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-11-05T02:57:28Z", actor: "human:timo", revision: 3}
 ---
 ## Problem
 

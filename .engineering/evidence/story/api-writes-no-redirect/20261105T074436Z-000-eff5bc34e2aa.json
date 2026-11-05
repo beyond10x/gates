@@ -1,0 +1,14 @@
+{
+  "at": "2026-11-05T07:44:36Z",
+  "actor": "human:timo",
+  "artifact": "story:api-writes-no-redirect",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:api-writes-no-redirect-adversary-1",
+    "review": "review-result:api-writes-no-redirect-adversary-1",
+    "outcome": "no-op"
+  }
+}

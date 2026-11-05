@@ -1,0 +1,15 @@
+{
+  "at": "2026-11-05T08:12:46Z",
+  "actor": "human:timo",
+  "artifact": "story:token-env-error-value",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:token-env-error-value-security-1",
+    "reference": "ae7c5a8",
+    "review": "review-result:token-env-error-value-security-1",
+    "outcome": "fixed"
+  }
+}
