@@ -38,7 +38,7 @@ A change is answerable for the lines it introduces, not for the file it lands in
 
 An adoption baseline is an exact trusted commit, not a candidate-controlled file. `audit --output <protected-report>` reports findings in that baseline tree separately. Historical exceptions require the exact repository, rule, location, line and content SHA-256 in the protected policy. Single-line privacy rules bind that line's bytes; secret and workflow exceptions bind the entire unit because they can span lines. Changed lines, moved locations and new occurrences require new review. Unchanged files inherited from the baseline are not new violations. No history is rewritten.
 
-The first version reads full changed blobs per new commit, with a 64 MiB per-blob and 256 MiB candidate limit. It deliberately fails instead of silently skipping unsupported content. It does not reuse repository-specific tests or declare a deployment or release complete.
+It reads full changed blobs per new commit, refuses a blob over 128 MiB, and scans a candidate in batches of at most 256 MiB, each changed file counted with its predecessor, so a candidate's total size is no limit. It deliberately fails instead of silently skipping unsupported content. It does not reuse repository-specific tests or declare a deployment or release complete.
 
 ## GitHub enforcement
 
