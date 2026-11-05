@@ -106,13 +106,22 @@ enum Content {
         bytes: Vec<u8>,
         inherited: Option<Vec<u8>>,
     },
-    /// A blob, commit or tag object; for a changed file, also the blob it replaced and that
-    /// blob's size.
+    /// A blob, commit or tag object; for a changed file, also the blob it replaced.
     Object {
         oid: String,
         kind: &'static str,
-        predecessor: Option<(String, usize)>,
+        predecessor: Option<Predecessor>,
     },
+}
+
+/// The blob a changed file replaced, bound by what the build read of it. Git does not rehash
+/// a loose object it reads, so the id alone does not bind the bytes the batch reads later.
+#[derive(Clone)]
+struct Predecessor {
+    oid: String,
+    length: usize,
+    /// The SHA-256 of the bytes the build read.
+    digest: String,
 }
 
 impl UnitRef {
@@ -122,7 +131,7 @@ impl UnitRef {
         workflow: bool,
         bytes: &[u8],
         (oid, kind): (&str, &'static str),
-        predecessor: Option<(String, usize)>,
+        predecessor: Option<Predecessor>,
     ) -> Self {
         Self {
             location,
@@ -144,13 +153,14 @@ impl UnitRef {
                 bytes.len() + inherited.as_ref().map_or(0, Vec::len)
             }
             Content::Object { predecessor, .. } => {
-                self.length + predecessor.as_ref().map_or(0, |(_, size)| *size)
+                self.length + predecessor.as_ref().map_or(0, |p| p.length)
             }
         }
     }
 
-    /// The unit with its bytes. An object is read through `objects`, opened on first use,
-    /// and must be exactly what was bound; any read that fails refuses.
+    /// The unit with its bytes. An object and its predecessor are read through `objects`,
+    /// opened on first use, and each must be exactly the bytes the build bound; any read
+    /// that fails refuses.
     fn read(&self, objects: &mut Option<Objects>, git: &Git) -> Result<Unit> {
         let (bytes, inherited) = match &self.content {
             Content::Held { bytes, inherited } => (bytes.clone(), inherited.clone()),
@@ -163,22 +173,11 @@ impl UnitRef {
                     *objects = Some(Objects::open(git)?);
                 }
                 let objects = objects.as_mut().context("Git cat-file unavailable")?;
-                let bytes = objects.object(oid, kind, self.length)?;
-                ensure!(
-                    bytes.len() == self.length && digest(&bytes) == self.digest,
-                    "Git object {oid} differs from the candidate it was bound in"
-                );
-                let inherited = match predecessor {
-                    Some((old, size)) => {
-                        let inherited = objects.blob(old, *size)?;
-                        ensure!(
-                            inherited.len() == *size,
-                            "Git object {old} differs from the candidate it was bound in"
-                        );
-                        Some(inherited)
-                    }
-                    None => None,
-                };
+                let bytes = objects.bound(oid, kind, self.length, &self.digest)?;
+                let inherited = predecessor
+                    .as_ref()
+                    .map(|p| objects.bound(&p.oid, "blob", p.length, &p.digest))
+                    .transpose()?;
                 (bytes, inherited)
             }
         };
@@ -369,24 +368,31 @@ impl Objects {
         self.object(oid, "blob", limit)
     }
 
-    /// The size a predecessor contributes when it can be inherited from: a blob within the
-    /// per-blob limit. An absent, oversized or other object is inherited from by nothing,
-    /// so the whole file is answerable, which fails closed; a broken stream refuses.
-    fn predecessor(&mut self, oid: &str) -> Result<Option<usize>> {
-        match self.info(oid) {
-            Ok((kind, size)) => Ok((kind == "blob" && size <= MAX_BLOB).then_some(size)),
+    /// The predecessor `oid` when it can be inherited from: a blob within the per-blob
+    /// limit, read once and bound by its length and digest, its bytes not kept. An absent,
+    /// oversized or other object is inherited from by nothing, so the whole file is
+    /// answerable, which fails closed; a broken stream refuses.
+    fn predecessor(&mut self, oid: &str) -> Result<Option<Predecessor>> {
+        match self.blob(oid, MAX_BLOB) {
+            Ok(bytes) => Ok(Some(Predecessor {
+                oid: oid.to_owned(),
+                length: bytes.len(),
+                digest: digest(&bytes),
+            })),
             Err(error) if self.broken => Err(error),
             Err(_) => Ok(None),
         }
     }
 
-    fn info(&mut self, oid: &str) -> Result<(String, usize)> {
-        ensure!(is_oid(oid), "invalid object id");
+    /// Read the object `(oid, kind)` again, refusing unless its bytes are the `length` bytes
+    /// whose SHA-256 is `bound`, as the build read them. Every lazy read goes through here.
+    fn bound(&mut self, oid: &str, kind: &str, length: usize, bound: &str) -> Result<Vec<u8>> {
+        let bytes = self.object(oid, kind, length)?;
         ensure!(
-            !self.broken,
-            "Git cat-file stream refused after an earlier failure"
+            bytes.len() == length && digest(&bytes) == bound,
+            "Git object {oid} differs from the candidate it was bound in"
         );
-        self.ask("info", oid)
+        Ok(bytes)
     }
 
     /// Read an object of type `expected` and at most `limit` bytes, with the same refusals
@@ -728,8 +734,9 @@ impl Git {
         Ok(entries)
     }
 
-    /// The units of every path whose entry differs from `old`. Each blob is read once here,
-    /// for its digest, and again when its batch is scanned; none is held in between.
+    /// The units of every path whose entry differs from `old`. Each blob, predecessors
+    /// included, is read once here, for its digest, and again when its batch is scanned;
+    /// none is held in between.
     fn units(
         objects: &mut Objects,
         tree: &BTreeMap<String, (String, String)>,
@@ -747,13 +754,14 @@ impl Git {
                 workflow: false,
                 inherited: previous.map(|_| path.as_bytes().to_vec()),
             }));
-            let bytes = objects.blob(oid, MAX_BLOB)?;
             // An oversized predecessor cannot be read, so nothing is inherited from
-            // it and the whole file is answerable. That fails closed.
+            // it and the whole file is answerable. That fails closed. It is read before
+            // the file's own bytes, so the build holds one blob at a time.
             let predecessor = match previous {
-                Some((_, old)) => objects.predecessor(old)?.map(|size| (old.clone(), size)),
+                Some((_, old)) => objects.predecessor(old)?,
                 None => None,
             };
+            let bytes = objects.blob(oid, MAX_BLOB)?;
             units.push(UnitRef::object(
                 format!("file:{path}"),
                 path.starts_with(".github/workflows/")
@@ -1047,5 +1055,44 @@ mod tests {
         assert!(objects.blob("not an object id", 63).is_err());
         assert_eq!(objects.blob(&small, 6).unwrap(), b"small\n");
         assert!(objects.blob(&small, 5).is_err());
+    }
+
+    /// Git does not rehash a loose object it reads, so a predecessor's id does not bind its
+    /// bytes. `units` binds every predecessor a candidate or the index inherits from, and a
+    /// same-length swap before the batch reads it must refuse.
+    #[test]
+    fn a_predecessor_swapped_after_it_was_bound_refuses() {
+        let (_dir, git) = store();
+        let old = write(&git, b"old line\n");
+        let new = write(&git, b"new line\nold line\n");
+        let fake = write(&git, b"new line\n");
+        let entry = |oid: &str| {
+            BTreeMap::from([("notes.md".to_owned(), ("100644".to_owned(), oid.to_owned()))])
+        };
+        let mut objects = Objects::open(&git).unwrap();
+        let units = Units {
+            git: git.clone(),
+            entries: Git::units(&mut objects, &entry(&new), &entry(&old)).unwrap(),
+        };
+        drop(objects);
+        let read = units.read_all().unwrap();
+        assert_eq!(read[1].inherited.as_deref(), Some(b"old line\n".as_slice()));
+        let loose = |oid: &str| {
+            git.root
+                .join(".git/objects")
+                .join(&oid[..2])
+                .join(&oid[2..])
+        };
+        std::fs::remove_file(loose(&old)).unwrap();
+        std::fs::copy(loose(&fake), loose(&old)).unwrap();
+        let refused = units
+            .read_all()
+            .err()
+            .expect("a predecessor swapped after it was bound must refuse")
+            .to_string();
+        assert!(
+            refused.contains(&old) && refused.contains("differs from the candidate"),
+            "{refused}"
+        );
     }
 }
