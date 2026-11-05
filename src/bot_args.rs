@@ -520,6 +520,7 @@ pub fn installed_configuration(
 fn common_directory(root: &Path, verb: &str, remedy: &str) -> Result<Option<PathBuf>> {
     let git = crate::git::Git {
         root: root.to_path_buf(),
+        batch: crate::git::BATCH_LIMIT,
     };
     let output = git
         .command()

@@ -11,7 +11,12 @@ use std::{
 };
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
-const MAX_TOTAL: usize = 512 * 1024 * 1024;
+/// The most one Git command may print into memory: a tree listing, a commit or a tag object.
+/// It bounds one read, not a candidate.
+const MAX_OUTPUT: usize = 512 * 1024 * 1024;
+/// The most bytes one scan batch holds, each unit counted with its predecessor. A changed
+/// file always fits: it and its predecessor are each at most `MAX_BLOB`.
+pub const BATCH_LIMIT: usize = 2 * MAX_BLOB;
 
 /// Compare raw Git identity bytes, without mailmap or display-name normalization.
 pub fn exact_identity(value: &[u8], name: &str, email: &str) -> bool {
@@ -80,9 +85,221 @@ pub struct Unit {
     pub inherited: Option<Vec<u8>>,
 }
 
+/// One unit held by what identifies its bytes rather than by the bytes: they are read, and
+/// checked against `digest`, when the unit's batch is scanned.
+#[derive(Clone)]
+pub struct UnitRef {
+    pub location: String,
+    pub workflow: bool,
+    /// The SHA-256 of the unit's bytes, as `objects_digest` binds it.
+    pub digest: String,
+    /// The length of the unit's bytes.
+    pub length: usize,
+    content: Content,
+}
+
+#[derive(Clone)]
+enum Content {
+    /// Bytes no single Git object holds: a filename, a tag ref name, or a unit the caller
+    /// built, such as a commit message or an identity.
+    Held {
+        bytes: Vec<u8>,
+        inherited: Option<Vec<u8>>,
+    },
+    /// A blob, commit or tag object; for a changed file, also the blob it replaced and that
+    /// blob's size.
+    Object {
+        oid: String,
+        kind: &'static str,
+        predecessor: Option<(String, usize)>,
+    },
+}
+
+impl UnitRef {
+    /// A unit for the object `(oid, kind)`, whose bytes are `bytes`.
+    fn object(
+        location: String,
+        workflow: bool,
+        bytes: &[u8],
+        (oid, kind): (&str, &'static str),
+        predecessor: Option<(String, usize)>,
+    ) -> Self {
+        Self {
+            location,
+            workflow,
+            digest: digest(bytes),
+            length: bytes.len(),
+            content: Content::Object {
+                oid: oid.to_owned(),
+                kind,
+                predecessor,
+            },
+        }
+    }
+
+    /// The bytes this unit adds to a batch: its own and its predecessor's.
+    pub fn weight(&self) -> usize {
+        match &self.content {
+            Content::Held { bytes, inherited } => {
+                bytes.len() + inherited.as_ref().map_or(0, Vec::len)
+            }
+            Content::Object { predecessor, .. } => {
+                self.length + predecessor.as_ref().map_or(0, |(_, size)| *size)
+            }
+        }
+    }
+
+    /// The unit with its bytes. An object is read through `objects`, opened on first use,
+    /// and must be exactly what was bound; any read that fails refuses.
+    fn read(&self, objects: &mut Option<Objects>, git: &Git) -> Result<Unit> {
+        let (bytes, inherited) = match &self.content {
+            Content::Held { bytes, inherited } => (bytes.clone(), inherited.clone()),
+            Content::Object {
+                oid,
+                kind,
+                predecessor,
+            } => {
+                if objects.is_none() {
+                    *objects = Some(Objects::open(git)?);
+                }
+                let objects = objects.as_mut().context("Git cat-file unavailable")?;
+                let bytes = objects.object(oid, kind, self.length)?;
+                ensure!(
+                    bytes.len() == self.length && digest(&bytes) == self.digest,
+                    "Git object {oid} differs from the candidate it was bound in"
+                );
+                let inherited = match predecessor {
+                    Some((old, size)) => {
+                        let inherited = objects.blob(old, *size)?;
+                        ensure!(
+                            inherited.len() == *size,
+                            "Git object {old} differs from the candidate it was bound in"
+                        );
+                        Some(inherited)
+                    }
+                    None => None,
+                };
+                (bytes, inherited)
+            }
+        };
+        Ok(Unit {
+            location: self.location.clone(),
+            bytes,
+            workflow: self.workflow,
+            inherited,
+        })
+    }
+}
+
+impl From<Unit> for UnitRef {
+    fn from(unit: Unit) -> Self {
+        Self {
+            location: unit.location,
+            workflow: unit.workflow,
+            digest: digest(&unit.bytes),
+            length: unit.bytes.len(),
+            content: Content::Held {
+                bytes: unit.bytes,
+                inherited: unit.inherited,
+            },
+        }
+    }
+}
+
+/// Units of one object store, read into memory a batch at a time when they are scanned, so
+/// the size of the whole is no limit.
+#[derive(Clone)]
+pub struct Units {
+    git: Git,
+    entries: Vec<UnitRef>,
+}
+
+impl Units {
+    /// No units yet, to be read from `git`'s object store.
+    pub fn new(git: &Git) -> Self {
+        Self {
+            git: git.clone(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Add a unit whose bytes the caller already holds.
+    pub fn push(&mut self, unit: Unit) {
+        self.entries.push(unit.into());
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, UnitRef> {
+        self.entries.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The units cut, in order, into consecutive batches each weighing at most the batch
+    /// limit. There is always at least one batch, empty when there are no units, so a scan
+    /// invokes its scanner as an unbatched one did. A unit heavier than the limit fits no
+    /// batch and is refused.
+    fn batches(&self) -> Result<Vec<Range<usize>>> {
+        let mut batches = Vec::new();
+        let (mut start, mut size) = (0, 0);
+        for (i, unit) in self.entries.iter().enumerate() {
+            let weight = unit.weight();
+            ensure!(
+                weight <= self.git.batch,
+                "unit exceeds the scan batch limit; no receipt can be issued"
+            );
+            if size + weight > self.git.batch {
+                batches.push(start..i);
+                (start, size) = (i, 0);
+            }
+            size += weight;
+        }
+        batches.push(start..self.entries.len());
+        Ok(batches)
+    }
+
+    /// Call `scan` with every batch read into memory, in unit order. The batches are cut
+    /// before anything is read, and one Git object stream reads them all.
+    pub(crate) fn each_batch(&self, mut scan: impl FnMut(&[Unit]) -> Result<()>) -> Result<()> {
+        let mut objects = None;
+        for batch in self.batches()? {
+            let units = self.entries[batch]
+                .iter()
+                .map(|unit| unit.read(&mut objects, &self.git))
+                .collect::<Result<Vec<_>>>()?;
+            scan(&units)?;
+        }
+        Ok(())
+    }
+
+    /// Every unit read into memory at once, in order, with no batch limit. For a set known
+    /// to be small, and for tests; a scan reads through `each_batch`.
+    pub fn read_all(&self) -> Result<Vec<Unit>> {
+        let mut objects = None;
+        self.entries
+            .iter()
+            .map(|unit| unit.read(&mut objects, &self.git))
+            .collect()
+    }
+}
+
+impl<'a> IntoIterator for &'a Units {
+    type Item = &'a UnitRef;
+    type IntoIter = std::slice::Iter<'a, UnitRef>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 pub struct Candidate {
     pub binding: Binding,
-    pub units: Vec<Unit>,
+    pub units: Units,
     /// The units of `binding.commits[i]` are `units[spans[i]]`; every unit after the last
     /// span belongs to the candidate's tags.
     pub(crate) spans: Vec<Range<usize>>,
@@ -92,17 +309,19 @@ impl Candidate {
     /// The units of every commit not in `covered`, then every tag unit, in candidate order,
     /// and how many commits they belong to. Each commit's units were computed against its own
     /// parent, so they are exactly the units a full scan would hand the scanner for it.
-    pub(crate) fn units_outside(&self, covered: &BTreeSet<&str>) -> (Vec<Unit>, usize) {
-        let mut units = Vec::new();
+    pub(crate) fn units_outside(&self, covered: &BTreeSet<&str>) -> (Units, usize) {
+        let mut units = Units::new(&self.units.git);
         let mut commits = 0;
         for (commit, span) in self.binding.commits.iter().zip(&self.spans) {
             if !covered.contains(commit.as_str()) {
-                units.extend_from_slice(&self.units[span.clone()]);
+                units
+                    .entries
+                    .extend_from_slice(&self.units.entries[span.clone()]);
                 commits += 1;
             }
         }
         let tags = self.spans.last().map_or(0, |span| span.end);
-        units.extend_from_slice(&self.units[tags..]);
+        units.entries.extend_from_slice(&self.units.entries[tags..]);
         (units, commits)
     }
 }
@@ -147,16 +366,42 @@ impl Objects {
     /// Read a blob of at most `limit` bytes. A refusal for size, type or absence leaves the
     /// stream in place; any other failure breaks it for good.
     fn blob(&mut self, oid: &str, limit: usize) -> Result<Vec<u8>> {
-        ensure!(is_oid(oid), "invalid blob id");
+        self.object(oid, "blob", limit)
+    }
+
+    /// The size a predecessor contributes when it can be inherited from: a blob within the
+    /// per-blob limit. An absent, oversized or other object is inherited from by nothing,
+    /// so the whole file is answerable, which fails closed; a broken stream refuses.
+    fn predecessor(&mut self, oid: &str) -> Result<Option<usize>> {
+        match self.info(oid) {
+            Ok((kind, size)) => Ok((kind == "blob" && size <= MAX_BLOB).then_some(size)),
+            Err(error) if self.broken => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn info(&mut self, oid: &str) -> Result<(String, usize)> {
+        ensure!(is_oid(oid), "invalid object id");
+        ensure!(
+            !self.broken,
+            "Git cat-file stream refused after an earlier failure"
+        );
+        self.ask("info", oid)
+    }
+
+    /// Read an object of type `expected` and at most `limit` bytes, with the same refusals
+    /// as `blob`.
+    fn object(&mut self, oid: &str, expected: &str, limit: usize) -> Result<Vec<u8>> {
+        ensure!(is_oid(oid), "invalid {expected} id");
         ensure!(
             !self.broken,
             "Git cat-file stream refused after an earlier failure"
         );
         let (kind, size) = self.ask("info", oid)?;
-        ensure!(kind == "blob", "Git object {oid} is not a blob");
+        ensure!(kind == expected, "Git object {oid} is not a {expected}");
         ensure!(
             size <= limit,
-            "blob exceeds scan limit; no receipt can be issued"
+            "{expected} exceeds scan limit; no receipt can be issued"
         );
         let answer = self.ask("contents", oid)?;
         // `ask` marks the stream in place once it has parsed a header; the body is still
@@ -223,8 +468,11 @@ impl Drop for Objects {
     }
 }
 
+#[derive(Clone)]
 pub struct Git {
     pub root: PathBuf,
+    /// The most bytes one scan batch of this store's units holds.
+    pub(crate) batch: usize,
 }
 
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -247,6 +495,7 @@ impl Git {
     pub fn new(root: &Path) -> Result<Self> {
         let git = Self {
             root: root.to_path_buf(),
+            batch: BATCH_LIMIT,
         };
         ensure!(
             git.text(&["rev-parse", "--is-shallow-repository"])? == "false",
@@ -266,6 +515,20 @@ impl Git {
             "virtual history refused"
         );
         Ok(git)
+    }
+
+    /// `new`, with scan batches of at most `limit` bytes instead of `BATCH_LIMIT`, so a test
+    /// can cut a small candidate into several batches. It only lowers the limit, and no
+    /// command-line flag or environment variable reaches it.
+    pub fn with_batch_limit(root: &Path, limit: usize) -> Result<Self> {
+        ensure!(
+            limit > 0 && limit <= BATCH_LIMIT,
+            "a batch limit must be positive and at most the default"
+        );
+        Ok(Self {
+            batch: limit,
+            ..Self::new(root)?
+        })
     }
 
     pub fn command(&self) -> Command {
@@ -295,7 +558,7 @@ impl Git {
             return Err(self.refusal(args, output.status));
         }
         ensure!(
-            output.stdout.len() <= MAX_TOTAL,
+            output.stdout.len() <= MAX_OUTPUT,
             "Git object output exceeds limit"
         );
         Ok(output.stdout)
@@ -388,7 +651,7 @@ impl Git {
             _ => return Err(self.refusal(&args, output.status)),
         };
         ensure!(
-            output.stdout.len() <= MAX_TOTAL,
+            output.stdout.len() <= MAX_OUTPUT,
             "Git object output exceeds limit"
         );
         let tree = output
@@ -465,39 +728,41 @@ impl Git {
         Ok(entries)
     }
 
+    /// The units of every path whose entry differs from `old`. Each blob is read once here,
+    /// for its digest, and again when its batch is scanned; none is held in between.
     fn units(
         objects: &mut Objects,
         tree: &BTreeMap<String, (String, String)>,
         old: &BTreeMap<String, (String, String)>,
-    ) -> Result<Vec<Unit>> {
+    ) -> Result<Vec<UnitRef>> {
         let mut units = Vec::new();
         for (path, (mode, oid)) in tree {
             if old.get(path) == Some(&(mode.clone(), oid.clone())) {
                 continue;
             }
             let previous = old.get(path);
-            units.push(Unit {
+            units.push(UnitRef::from(Unit {
                 location: format!("filename:{path}"),
                 bytes: path.as_bytes().to_vec(),
                 workflow: false,
                 inherited: previous.map(|_| path.as_bytes().to_vec()),
-            });
+            }));
             let bytes = objects.blob(oid, MAX_BLOB)?;
             // An oversized predecessor cannot be read, so nothing is inherited from
             // it and the whole file is answerable. That fails closed.
-            let inherited = previous.and_then(|(_, old)| objects.blob(old, MAX_BLOB).ok());
-            units.push(Unit {
-                location: format!("file:{path}"),
-                bytes,
-                workflow: path.starts_with(".github/workflows/")
+            let predecessor = match previous {
+                Some((_, old)) => objects.predecessor(old)?.map(|size| (old.clone(), size)),
+                None => None,
+            };
+            units.push(UnitRef::object(
+                format!("file:{path}"),
+                path.starts_with(".github/workflows/")
                     && (path.ends_with(".yml") || path.ends_with(".yaml")),
-                inherited,
-            });
+                &bytes,
+                (oid, "blob"),
+                predecessor,
+            ));
         }
-        ensure!(
-            units.iter().map(|u| u.bytes.len()).sum::<usize>() <= MAX_TOTAL,
-            "candidate exceeds scan limit"
-        );
         Ok(units)
     }
 
@@ -561,14 +826,14 @@ impl Git {
         let mut units = Vec::new();
         let mut spans = Vec::with_capacity(commits.len());
         let mut objects = Objects::open(self)?;
-        let held: BTreeMap<&str, &[Unit]> = known
+        let held: BTreeMap<&str, &[UnitRef]> = known
             .into_iter()
             .flat_map(|k| {
                 k.binding
                     .commits
                     .iter()
                     .zip(&k.spans)
-                    .map(|(commit, span)| (commit.as_str(), &k.units[span.clone()]))
+                    .map(|(commit, span)| (commit.as_str(), &k.units.entries[span.clone()]))
             })
             .collect();
         for commit in &commits {
@@ -595,12 +860,13 @@ impl Git {
                 None => BTreeMap::new(),
             };
             units.extend(Self::units(&mut objects, &self.tree(commit)?, &old)?);
-            units.push(Unit {
-                location: format!("commit:{commit}"),
-                bytes: raw,
-                workflow: false,
-                inherited: None,
-            });
+            units.push(UnitRef::object(
+                format!("commit:{commit}"),
+                false,
+                &raw,
+                (commit, "commit"),
+                None,
+            ));
             spans.push(start..units.len());
         }
         drop(objects);
@@ -622,12 +888,12 @@ impl Git {
                 self.resolve(&format!("{oid}^{{commit}}"))? == head,
                 "tag does not point at candidate"
             );
-            units.push(Unit {
+            units.push(UnitRef::from(Unit {
                 location: "tag-ref".into(),
                 bytes: tag.as_bytes().to_vec(),
                 workflow: false,
                 inherited: None,
-            });
+            }));
             while self.text(&["cat-file", "-t", &oid])? == "tag" {
                 ensure!(tags.insert(oid.clone()), "duplicate or cyclic tag");
                 let raw = self.read(&["cat-file", "tag", &oid])?;
@@ -637,23 +903,21 @@ impl Git {
                     .and_then(|v| v.strip_prefix(b"object "))
                     .context("malformed annotated tag")?;
                 let next = std::str::from_utf8(next)?.to_owned();
-                units.push(Unit {
-                    location: format!("tag:{oid}"),
-                    bytes: raw,
-                    workflow: false,
-                    inherited: None,
-                });
+                units.push(UnitRef::object(
+                    format!("tag:{oid}"),
+                    false,
+                    &raw,
+                    (&oid, "tag"),
+                    None,
+                ));
                 ensure!(is_oid(&next), "invalid nested tag");
                 oid = next;
             }
         }
-        ensure!(
-            units.iter().map(|u| u.bytes.len()).sum::<usize>() <= MAX_TOTAL,
-            "candidate exceeds scan limit"
-        );
+        // No total: the units are scanned in batches, so a candidate's size is no limit.
         let manifest: Vec<_> = units
             .iter()
-            .map(|u| (&u.location, digest(&u.bytes), u.workflow))
+            .map(|u| (&u.location, &u.digest, u.workflow))
             .collect();
         Ok(Candidate {
             binding: Binding {
@@ -665,12 +929,15 @@ impl Git {
                 tags: tags.into_iter().collect(),
                 objects_digest: digest(&serde_json::to_vec(&manifest)?),
             },
-            units,
+            units: Units {
+                git: self.clone(),
+                entries: units,
+            },
             spans,
         })
     }
 
-    pub fn staged(&self) -> Result<Vec<Unit>> {
+    pub fn staged(&self) -> Result<Units> {
         let old = self
             .resolve("HEAD")
             .ok()
@@ -698,15 +965,21 @@ impl Git {
                 .context("non-UTF-8 index path refused")?;
             tree.insert(path, (header[0].into(), header[1].into()));
         }
-        Self::units(&mut Objects::open(self)?, &tree, &old)
+        Ok(Units {
+            git: self.clone(),
+            entries: Self::units(&mut Objects::open(self)?, &tree, &old)?,
+        })
     }
 
-    pub fn historical(&self, baseline: &str) -> Result<Vec<Unit>> {
-        Self::units(
-            &mut Objects::open(self)?,
-            &self.tree(baseline)?,
-            &BTreeMap::new(),
-        )
+    pub fn historical(&self, baseline: &str) -> Result<Units> {
+        Ok(Units {
+            git: self.clone(),
+            entries: Self::units(
+                &mut Objects::open(self)?,
+                &self.tree(baseline)?,
+                &BTreeMap::new(),
+            )?,
+        })
     }
 
     pub fn verify_bot(&self, commits: &[String]) -> Result<()> {

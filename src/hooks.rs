@@ -1,7 +1,7 @@
 //! Coordinated hooks preserve existing worktree hooks and replace only an explicitly identified guard.
 use crate::{
     digest, evidence,
-    git::{Git, Unit},
+    git::{Git, Unit, Units},
     policy::{self, Policy},
     scan::{self, Gitleaks},
 };
@@ -214,7 +214,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
     };
     if matches!(name, "pre-commit" | "commit-msg" | "pre-push") {
         let policy = Policy::load(&config.policy)?;
-        let mut units = Vec::new();
+        let mut units = Units::new(&git);
         if name == "pre-commit" {
             units = git.staged()?;
             for ident in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
@@ -315,7 +315,7 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
                 });
             }
         }
-        let report = scan::run(&policy, &config.repository, &units, &mut scanner)?;
+        let report = scan::run_batches(&policy, &config.repository, &units, &mut scanner)?;
         if !report.findings.is_empty() {
             policy::private_write(
                 &directory.join("last-findings.json"),

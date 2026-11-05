@@ -1,5 +1,9 @@
 //! Scanners return only rule coordinates, never matched text.
-use crate::{GITLEAKS_VERSION, RULES, digest, git::Unit, policy::Policy};
+use crate::{
+    GITLEAKS_VERSION, RULES, digest,
+    git::{Unit, UnitRef, Units},
+    policy::Policy,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -151,7 +155,39 @@ impl SecretScanner for Gitleaks {
     }
 }
 
-pub fn expected_results(units: &[Unit]) -> BTreeMap<String, RuleResult> {
+/// What the result roster counts of a unit, held in memory or by reference.
+pub trait Inspected {
+    fn location(&self) -> &str;
+    fn workflow(&self) -> bool;
+}
+
+impl Inspected for Unit {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn workflow(&self) -> bool {
+        self.workflow
+    }
+}
+
+impl Inspected for UnitRef {
+    fn location(&self) -> &str {
+        &self.location
+    }
+    fn workflow(&self) -> bool {
+        self.workflow
+    }
+}
+
+pub fn expected_results<'a, U: Inspected + 'a>(
+    units: impl IntoIterator<Item = &'a U>,
+) -> BTreeMap<String, RuleResult> {
+    let (mut all, mut commits, mut workflows) = (0, 0, 0);
+    for unit in units {
+        all += 1;
+        commits += usize::from(unit.location().starts_with("commit:"));
+        workflows += usize::from(unit.workflow());
+    }
     RULES
         .into_iter()
         .map(|rule| {
@@ -159,14 +195,11 @@ pub fn expected_results(units: &[Unit]) -> BTreeMap<String, RuleResult> {
                 rule.to_owned(),
                 RuleResult {
                     inspected: if rule == "commit-authorship" {
-                        units
-                            .iter()
-                            .filter(|u| u.location.starts_with("commit:"))
-                            .count()
+                        commits
                     } else if rule.starts_with("workflow-") {
-                        units.iter().filter(|u| u.workflow).count()
+                        workflows
                     } else {
-                        units.len()
+                        all
                     },
                     findings: 0,
                 },
@@ -464,19 +497,77 @@ fn carry(unit: &[u8], skipped: Range<usize>, line: &mut usize, begin: &mut usize
     }
 }
 
+/// Findings so far, in two lists so that batches merge into the order one unbatched run
+/// reports them: every rule finding in unit order, then every secret.
+struct Tally<'a> {
+    policy: &'a Policy,
+    repository: &'a str,
+    results: BTreeMap<String, RuleResult>,
+    rules: Vec<Finding>,
+    secrets: Vec<Finding>,
+}
+
+impl Tally<'_> {
+    fn report(self) -> Report {
+        let mut findings = self.rules;
+        findings.extend(self.secrets);
+        Report {
+            results: self.results,
+            findings,
+        }
+    }
+}
+
+fn prepare<'a>(
+    policy: &'a Policy,
+    repository: &'a str,
+    results: BTreeMap<String, RuleResult>,
+) -> Result<(Matchers, Tally<'a>)> {
+    policy.validate()?;
+    policy.repository(repository)?;
+    let matchers = Matchers::build(policy)?;
+    let tally = Tally {
+        policy,
+        repository,
+        results,
+        rules: Vec::new(),
+        secrets: Vec::new(),
+    };
+    Ok((matchers, tally))
+}
+
+/// Scan units held in memory, in one batch and one scanner invocation.
 pub fn run(
     policy: &Policy,
     repository: &str,
     units: &[Unit],
     scanner: &mut dyn SecretScanner,
 ) -> Result<Report> {
-    policy.validate()?;
-    policy.repository(repository)?;
-    let mut report = Report {
-        results: expected_results(units),
-        findings: Vec::new(),
-    };
-    let matchers = Matchers::build(policy)?;
+    let (matchers, mut tally) = prepare(policy, repository, expected_results(units))?;
+    batch(&matchers, &mut tally, units, scanner)?;
+    Ok(tally.report())
+}
+
+/// `run` over units read from their object store a batch at a time. Each batch, at most the
+/// store's batch limit with predecessors counted, gets the private rules and one scanner
+/// invocation, and the report is the one a single `run` over all of them gives.
+pub fn run_batches(
+    policy: &Policy,
+    repository: &str,
+    units: &Units,
+    scanner: &mut dyn SecretScanner,
+) -> Result<Report> {
+    let (matchers, mut tally) = prepare(policy, repository, expected_results(units))?;
+    units.each_batch(|units| batch(&matchers, &mut tally, units, scanner))?;
+    Ok(tally.report())
+}
+
+fn batch(
+    matchers: &Matchers,
+    tally: &mut Tally,
+    units: &[Unit],
+    scanner: &mut dyn SecretScanner,
+) -> Result<()> {
     for unit in units {
         // A line already present in this location before the change was not
         // introduced by it. This is what makes an adoption baseline mean anything
@@ -501,9 +592,7 @@ pub fn run(
                 if rule == "private-identifiers" {
                     reported.insert(line + 1);
                 }
-                if finding(policy, repository, &mut report, unit, line + 1, rule, bytes)
-                    && rule == "personal-paths"
-                {
+                if finding(tally, unit, line + 1, rule, bytes) && rule == "personal-paths" {
                     paths.insert(line + 1);
                 }
             }
@@ -520,15 +609,7 @@ pub fn run(
                 {
                     continue;
                 }
-                if finding(
-                    policy,
-                    repository,
-                    &mut report,
-                    unit,
-                    first,
-                    "personal-paths",
-                    span,
-                ) {
+                if finding(tally, unit, first, "personal-paths", span) {
                     paths.insert(first);
                 }
             }
@@ -547,39 +628,15 @@ pub fn run(
             }
             let bytes = rest.nth(line - 1 - taken).unwrap_or(&[]);
             taken = line;
-            finding(
-                policy,
-                repository,
-                &mut report,
-                unit,
-                line,
-                "private-identifiers",
-                bytes,
-            );
+            finding(tally, unit, line, "private-identifiers", bytes);
         }
         if unit.workflow {
             let (pins, permissions) = workflow(&unit.bytes);
             if !pins {
-                finding(
-                    policy,
-                    repository,
-                    &mut report,
-                    unit,
-                    1,
-                    "workflow-pins",
-                    &unit.bytes,
-                );
+                finding(tally, unit, 1, "workflow-pins", &unit.bytes);
             }
             if !permissions {
-                finding(
-                    policy,
-                    repository,
-                    &mut report,
-                    unit,
-                    1,
-                    "workflow-permissions",
-                    &unit.bytes,
-                );
+                finding(tally, unit, 1, "workflow-permissions", &unit.bytes);
             }
         }
     }
@@ -593,49 +650,38 @@ pub fn run(
         {
             continue;
         }
-        finding(
-            policy,
-            repository,
-            &mut report,
-            unit,
-            leak.line,
-            "secrets",
-            &unit.bytes,
-        );
+        finding(tally, unit, leak.line, "secrets", &unit.bytes);
     }
-    Ok(report)
+    Ok(())
 }
 
-fn finding(
-    policy: &Policy,
-    repository: &str,
-    report: &mut Report,
-    unit: &Unit,
-    line: usize,
-    rule: &str,
-    content: &[u8],
-) -> bool {
+fn finding(tally: &mut Tally, unit: &Unit, line: usize, rule: &str, content: &[u8]) -> bool {
     // Historical privacy findings are bounded to unchanged exact lines. Secret and
     // workflow exceptions bind the whole unit because those rules can span lines.
     let content_sha256 = digest(content);
-    if policy.exceptions.iter().any(|e| {
-        e.covers(repository, rule, &unit.location)
+    if tally.policy.exceptions.iter().any(|e| {
+        e.covers(tally.repository, rule, &unit.location)
             && (e.content_sha256.is_empty() || e.content_sha256 == content_sha256)
             && (e.line == 0 || e.line == line)
     }) {
         return false;
     }
-    report
+    tally
         .results
         .get_mut(rule)
         .expect("closed rule roster")
         .findings += 1;
-    report.findings.push(Finding {
+    let finding = Finding {
         rule: rule.into(),
         location: unit.location.clone(),
         line,
         content_sha256,
-    });
+    };
+    if rule == "secrets" {
+        tally.secrets.push(finding);
+    } else {
+        tally.rules.push(finding);
+    }
     true
 }
 
