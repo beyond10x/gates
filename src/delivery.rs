@@ -980,6 +980,9 @@ pub fn ci_candidate_from(
     for wanted in std::iter::once(&fetch_ref).chain(fallback.as_ref()) {
         let refspecs = [wanted.as_str(), trusted.baseline.as_str()];
         let mut fetch = git.command();
+        // The fetch carries the workflow token: none of the caller's TLS settings for
+        // Git, and no TLS key log, reaches it.
+        remove_caller_tls(&mut fetch);
         if let Some(basic) = &basic {
             fetch
                 .env("GIT_CONFIG_COUNT", "1")
@@ -1375,7 +1378,9 @@ pub fn api_success_report(
 /// Run one bot Git command in `root` with the bot identity and environment.
 /// `credential` is the installation token `Github::git` supplies for `push` and
 /// `fetch`; without one, the credential variables are not set and nothing that runs
-/// here can reach the network as the bot.
+/// here can reach the network as the bot. With one, what the repository's own
+/// configuration sets for the bot's GitHub requests is overridden first
+/// (`override_repository_transport`).
 pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result<()> {
     if args.first().is_some_and(|verb| verb == "delete-branch") {
         bail!(
@@ -1391,7 +1396,205 @@ pub fn bot_git(root: &Path, args: &[String], credential: Option<&str>) -> Result
         // No credential enters a merge or revert: neither needs the network.
         return integrate(root, &crate::bot_args::integration(args)?);
     }
-    run_bot(root, args, bot_command(root, credential))
+    let mut command = bot_command(root, credential);
+    // Kept until Git ends: it holds the URL rules Git must read first.
+    let _rules = match credential {
+        Some(_) => override_repository_transport(root, &mut command)?,
+        None => None,
+    };
+    run_bot(root, args, command)
+}
+
+/// The `http.*` settings that choose whether the bot's Git checks GitHub's
+/// certificate, which authorities it trusts, which client certificate it offers,
+/// which TLS library, protocol version or ciphers it uses and which address GitHub
+/// resolves to, as `git config --list` spells them, each with the value the bot's Git
+/// gives it in place of the repository's. An empty `sslCAInfo`, `sslCert` or
+/// `sslBackend` makes an HTTPS request fail before anything is sent; with any other
+/// empty value a request runs as with the setting unset, and an empty `curloptResolve`
+/// clears the list. Not overridden: `pinnedPubkey`, which only narrows what is
+/// trusted, `sslTry`, which applies to FTP, and the `schannel*` and
+/// `sslAutoClientCert` settings of the Windows TLS library.
+const REPOSITORY_TLS: [(&str, &str); 16] = [
+    ("sslverify", "true"),
+    ("sslcainfo", ""),
+    ("sslcapath", ""),
+    ("sslcert", ""),
+    ("sslkey", ""),
+    ("sslcerttype", ""),
+    ("sslkeytype", ""),
+    ("sslcertpasswordprotected", "false"),
+    ("sslbackend", ""),
+    ("sslversion", ""),
+    ("sslcipherlist", ""),
+    ("proxysslcainfo", ""),
+    ("proxysslcert", ""),
+    ("proxysslkey", ""),
+    ("proxysslcertpasswordprotected", "false"),
+    ("curloptresolve", ""),
+];
+
+/// The prefix of every URL the bot's credential helper answers for.
+const GITHUB_HTTPS: &str = "https://github.com/";
+
+/// The SSH forms of a GitHub URL that `bot_command` rewrites to `GITHUB_HTTPS` for a
+/// push (`url.https://github.com/.pushInsteadOf`).
+const GITHUB_SSH: [&str; 2] = ["git@github.com:", "ssh://git@github.com/"];
+
+/// Override for `command` what the repository's own configuration (every file Git
+/// reads in `root`, `include.path` and `includeIf` among them; the bot reads no global
+/// or system configuration) sets for the bot's GitHub requests, read as data with the
+/// bot's environment:
+/// - Each `REPOSITORY_TLS` key, for any URL, gets the bot's value under the same key in
+///   `GIT_CONFIG_COUNT`, which Git reads after every configuration file. Git's URL
+///   matching takes the most specific key and, of equally specific ones, the last
+///   read, so the bot's is the one it takes, however specific the repository's is.
+/// - Each `url.<base>.insteadOf` or `pushInsteadOf` that can match a URL under
+///   `GITHUB_HTTPS` gets a rule for the same prefix, or for `GITHUB_HTTPS` when its
+///   prefix is shorter, that leaves the URL as it is; each `pushInsteadOf` of a
+///   `GITHUB_SSH` prefix, or a longer one, gets the bot's rewrite to `GITHUB_HTTPS` for
+///   the same prefix. Git takes the longest prefix and, of equally long ones, the rule
+///   it read first, so these go into a file Git reads as global configuration, before
+///   the repository's. The returned directory holds it; it must outlive the command.
+///
+/// A rule no configuration key can name (its prefix holds a line break) is refused
+/// before Git runs. Each key the bot gives another value is named on standard error
+/// with its URL or base left out, and no value is printed.
+fn override_repository_transport(
+    root: &Path,
+    command: &mut Command,
+) -> Result<Option<tempfile::TempDir>> {
+    use std::os::unix::ffi::OsStrExt;
+    let listed = bot_command(root, None)
+        .args(["config", "--null", "--list", "--show-scope"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("Git could not start")?;
+    ensure!(
+        listed.status.success(),
+        "bot Git cannot read the repository's configuration ({}), so the TLS settings and \
+         URL rewrites it holds for GitHub cannot be overridden; nothing was sent, and Git's \
+         message is above",
+        exit(listed.status)
+    );
+    let mut late: Vec<(&[u8], &str)> = Vec::new();
+    let mut early: Vec<(Vec<u8>, Vec<u8>, String)> = Vec::new();
+    let mut named = std::collections::BTreeSet::new();
+    // `<scope>\0<key>\n<value>\0`, or `<scope>\0<key>\0` for a key without a value.
+    let mut records = listed.stdout.split(|byte| *byte == 0);
+    while let (Some(scope), Some(entry)) = (records.next(), records.next()) {
+        if scope == b"command" {
+            continue;
+        }
+        let (key, value) = match entry.iter().position(|byte| *byte == b'\n') {
+            Some(at) => (&entry[..at], Some(&entry[at + 1..])),
+            None => (entry, None),
+        };
+        let (Some(first), Some(last)) = (
+            key.iter().position(|byte| *byte == b'.'),
+            key.iter().rposition(|byte| *byte == b'.'),
+        ) else {
+            continue;
+        };
+        let (section, name) = (&key[..first], &key[last + 1..]);
+        let scoped = if last > first { "<url>." } else { "" };
+        let name_text = String::from_utf8_lossy(name);
+        if section == b"http" {
+            if let Some((_, bot)) = REPOSITORY_TLS
+                .iter()
+                .find(|(tls, _)| tls.as_bytes() == name)
+            {
+                late.push((key, bot));
+                if value != Some(bot.as_bytes()) {
+                    named.insert(format!("http.{scoped}{name_text}"));
+                }
+            }
+            continue;
+        }
+        let push = name == b"pushinsteadof";
+        let (b"url", Some(prefix)) = (section, value) else {
+            continue;
+        };
+        if last == first || !(push || name == b"insteadof") {
+            continue;
+        }
+        let github = GITHUB_HTTPS.as_bytes();
+        let mut rules: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if prefix.starts_with(github) {
+            rules.push((prefix.to_vec(), prefix.to_vec()));
+        } else if github.starts_with(prefix) {
+            rules.push((github.to_vec(), github.to_vec()));
+        }
+        if push {
+            for ssh in GITHUB_SSH {
+                if let Some(rest) = prefix.strip_prefix(ssh.as_bytes()) {
+                    rules.push(([github, rest].concat(), prefix.to_vec()));
+                }
+            }
+        }
+        let label = format!("url.<base>.{name_text}");
+        for (base, matched) in rules {
+            early.push((
+                [b"url.", &base[..], b".", name].concat(),
+                matched,
+                label.clone(),
+            ));
+            named.insert(label.clone());
+        }
+    }
+    let rules = if early.is_empty() {
+        None
+    } else {
+        let dir = tempfile::Builder::new()
+            .prefix("b10x-gates-bot-config-")
+            .tempdir()
+            .context("no directory for the bot's URL rules")?;
+        let file = dir.path().join("config");
+        for (key, value, label) in &early {
+            let written = bot_command(dir.path(), None)
+                .arg("config")
+                .arg("--file")
+                .arg(&file)
+                .arg("--add")
+                .arg("--")
+                .arg(std::ffi::OsStr::from_bytes(key))
+                .arg(std::ffi::OsStr::from_bytes(value))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .context("Git could not start")?;
+            ensure!(
+                written.success(),
+                "the repository's configuration rewrites a GitHub URL with a {label} rule \
+                 whose prefix no configuration key can name, so the bot's Git cannot \
+                 override it; nothing was sent: remove the rule"
+            );
+        }
+        command.env("GIT_CONFIG_GLOBAL", &file);
+        Some(dir)
+    };
+    if !late.is_empty() {
+        command.env("GIT_CONFIG_COUNT", late.len().to_string());
+        for (index, (key, value)) in late.iter().enumerate() {
+            command
+                .env(
+                    format!("GIT_CONFIG_KEY_{index}"),
+                    std::ffi::OsStr::from_bytes(key),
+                )
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
+    }
+    if !named.is_empty() {
+        eprintln!(
+            "b10x-gates: the bot's Git overrides the repository's {} for its GitHub \
+             requests: certificates are checked against the default authorities, and no \
+             URL under {GITHUB_HTTPS} is rewritten",
+            named.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(rules)
 }
 
 fn run_bot(root: &Path, args: &[String], mut command: Command) -> Result<()> {
@@ -1460,7 +1663,8 @@ const CALLER_TLS_PREFIX: &[u8] = b"GIT_SSL_";
 ///
 /// Kept from the caller: the proxy (`https_proxy`, `GIT_HTTP_PROXY_AUTHMETHOD`,
 /// `GIT_PROXY_SSL_*`), which carries Git's own TLS session with the remote through a
-/// tunnel and never sees inside it; `GIT_CURL_VERBOSE`, which writes what
+/// tunnel and never sees inside it, and to which `BOT_CREDENTIAL_HELPER` gives no
+/// credential; `GIT_CURL_VERBOSE`, which writes what
 /// `GIT_TRACE_CURL` writes, under the redaction `bot_command` forces; and the timing,
 /// retry and user-agent settings (`GIT_HTTP_LOW_SPEED_*`, `GIT_HTTP_MAX_*`,
 /// `GIT_HTTP_RETRY_AFTER`, `GIT_HTTP_USER_AGENT`).
@@ -1482,7 +1686,7 @@ fn remove_caller_tls(command: &mut Command) {
 /// redaction on (`GIT_TRACE_REDACT`, so a caller's `GIT_TRACE_CURL` shows no
 /// `Authorization` header), certificate verification on (`http.sslVerify`, which wins
 /// over the same key in the repository's configuration) and, when a credential is
-/// given, the push rewrite and credential helper that use it.
+/// given, the push rewrite and credential helper that use it (`BOT_CREDENTIAL_HELPER`).
 fn bot_command(root: &Path, credential: Option<&str>) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
@@ -1516,13 +1720,29 @@ fn bot_command(root: &Path, credential: Option<&str>) -> Command {
                 "-c",
                 "url.https://github.com/.pushInsteadOf=ssh://git@github.com/",
                 "-c",
+                "credential.https://github.com.useHttpPath=true",
+                "-c",
                 "credential.https://github.com.helper=",
                 "-c",
-                "credential.https://github.com.helper=!f() { echo username=x-access-token; echo \"password=${B10X_BOT_TOKEN}\"; }; f",
+                &format!("credential.https://github.com.helper={BOT_CREDENTIAL_HELPER}"),
             ]);
     }
     command
 }
+
+/// The bot's credential helper. It answers Git's `get` only for a request for a
+/// repository on GitHub over HTTPS: `protocol=https`, `host=github.com` and a `path`,
+/// which `credential.useHttpPath` puts in every repository request, and no
+/// `username`. Git asks for a proxy's credential only when the proxy URL names a user,
+/// and the request always carries that user, so a caller's
+/// `https_proxy=https://<user>@github.com` never receives the installation token as
+/// its `Proxy-Authorization`. Each other request, and every `store` and `erase`, gets
+/// nothing.
+const BOT_CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get || return 0; p= h= r= u=; \
+     while IFS= read -r l; do case \"$l\" in protocol=https) p=1 ;; protocol=*) p= ;; \
+     host=github.com) h=1 ;; host=*) h= ;; path=?*) r=1 ;; path=*) r= ;; username=*) u=1 ;; \
+     esac; done; if test \"$p$h$r\" = 111 && test -z \"$u\"; then echo username=x-access-token; \
+     echo \"password=${B10X_BOT_TOKEN}\"; fi; return 0; }; f";
 
 /// The bot environment for a merge or revert: no credential, and, like every bot Git
 /// command, no configuration from the caller's environment, so the merge drivers read
