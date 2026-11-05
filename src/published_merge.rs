@@ -168,10 +168,44 @@ fn bot_account(value: &Value, pointer: &str) -> bool {
 /// unavailable. The path holds only the repository, object ids, numbers and the default branch.
 fn read(api: &impl AuthenticatedRead, path: &str) -> Result<Value> {
     api.get(path).map_err(|error| {
-        let named = format!("GET {path}: {error}");
-        error.context(named)
+        ReadFailure {
+            path: path.to_owned(),
+            error,
+        }
+        .into()
     })
 }
+
+/// A refused read. Its text is `GET <path>: ` and the inner error's own text, and it has no
+/// source, so the one-line form `main` prints and the full chain both show the path and the
+/// status once each. The inner error stays reachable only to `server_error`.
+struct ReadFailure {
+    path: String,
+    error: anyhow::Error,
+}
+
+impl ReadFailure {
+    /// Whether the read failed with a 5xx from GitHub.
+    fn server_error(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<Self>()
+            .is_some_and(|read| crate::delivery::is_server_error(&read.error))
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GET {}: {}", self.path, self.error)
+    }
+}
+
+impl std::fmt::Debug for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for ReadFailure {}
 
 fn page(path: &str, page: u32) -> String {
     let separator = if path.contains('?') { '&' } else { '?' };
@@ -429,7 +463,7 @@ impl Authority {
         let path = format!("{}/commits/{oid}/pulls", self.root);
         let pulls = match read(api, &page(&path, 1)) {
             Ok(first) => later_pages(api, &path, first)?,
-            Err(error) if crate::delivery::is_server_error(&error) => {
+            Err(error) if ReadFailure::server_error(&error) => {
                 self.named_pull_request(git, api, oid).map_err(|named| {
                     anyhow::anyhow!(
                         "{error}; the pull request the merge names could not stand in: {named}"

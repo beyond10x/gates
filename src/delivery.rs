@@ -449,7 +449,7 @@ impl Github {
 
     /// `api` with the success status. A non-2xx answer is an `ApiFailure`, whose
     /// text is the status alone until `ApiFailure::render` has the matchers. A GET that
-    /// GitHub answers with a server error is sent again, see `retry_server_errors`.
+    /// GitHub answers with a server error is sent again, see `send_once_or_retried`.
     pub fn api_response(
         &self,
         method: Method,
@@ -457,10 +457,9 @@ impl Github {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         ensure!(api_path_admitted(path), "invalid GitHub API path");
-        if method == Method::GET {
-            return retry_server_errors(std::thread::sleep, || self.send(Method::GET, path, body));
-        }
-        self.send(method, path, body)
+        send_once_or_retried(&method, std::thread::sleep, || {
+            self.send(method.clone(), path, body)
+        })
     }
 
     fn send(
@@ -791,6 +790,19 @@ pub fn fetch_refusal_for_test(
 const GET_ATTEMPTS: u32 = 5;
 /// The wait before the second attempt; it doubles before each later one (0.5 s to 4 s).
 const GET_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Send a request of `method`: a GET through `retry_server_errors`, any other method once.
+/// A write that failed with a 5xx may still have happened, so it is never sent again.
+fn send_once_or_retried<T>(
+    method: &Method,
+    sleep: impl FnMut(Duration),
+    mut send: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    if *method == Method::GET {
+        return retry_server_errors(sleep, send);
+    }
+    send()
+}
 
 /// Send again while the answer is a 5xx `ApiFailure`, at most `GET_ATTEMPTS` times, and return
 /// the last answer. Any other answer or error returns at once. Only GETs come here: a write
@@ -1581,5 +1593,51 @@ mod tests {
             assert!(result.is_err());
             assert_eq!((sends, waits.len()), (1, 0));
         }
+    }
+
+    /// Run `send_once_or_retried` for `method` over answers that are all 5xx; return the
+    /// result, the number of sends and the number of waits.
+    fn run_method(method: &Method) -> (Result<u32>, usize, usize) {
+        let sends = RefCell::new(0);
+        let mut waits = 0;
+        let result = send_once_or_retried(
+            method,
+            |_| waits += 1,
+            || {
+                *sends.borrow_mut() += 1;
+                Err(failure(StatusCode::INTERNAL_SERVER_ERROR))
+            },
+        );
+        (result, sends.into_inner(), waits)
+    }
+
+    #[test]
+    fn a_write_that_answers_a_server_error_is_sent_once() {
+        // A write answered with a 5xx may still have happened, so it is never sent again.
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ] {
+            let (result, sends, waits) = run_method(&method);
+            let error = result.expect_err("a server error must fail");
+            assert!(is_server_error(&error), "{method}");
+            assert_eq!((sends, waits), (1, 0), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_get_that_answers_a_server_error_is_sent_again() {
+        let (result, sends, waits) = run_method(&Method::GET);
+        assert!(is_server_error(
+            &result.expect_err("a persisting server error must fail")
+        ));
+        assert_eq!(
+            (sends, waits),
+            (GET_ATTEMPTS as usize, GET_ATTEMPTS as usize - 1)
+        );
     }
 }
