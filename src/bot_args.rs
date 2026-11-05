@@ -549,7 +549,7 @@ fn common_directory(root: &Path, verb: &str, remedy: &str) -> Result<Option<Path
 
 /// `<owner>/<repo>`: two non-empty segments of ASCII letters, digits, `-`, `_` and `.`,
 /// neither a dot segment, so the repository can never change the request path.
-fn repository_shaped(repository: &str) -> bool {
+pub(crate) fn repository_shaped(repository: &str) -> bool {
     let mut segments = repository.split('/');
     let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
     else {
@@ -565,7 +565,7 @@ fn repository_shaped(repository: &str) -> bool {
 
 /// The branch a name addresses, or the cause it is refused. Only `refs/heads/` is
 /// addressed, so a tag is never deleted; the rest follows `git check-ref-format`.
-fn branch_to_delete(name: &str) -> Result<String> {
+pub(crate) fn branch_to_delete(name: &str) -> Result<String> {
     let refuse = |cause: &str| -> Result<String> {
         bail!(
             "bot delete-branch refuses the branch name `{}`: {cause}",

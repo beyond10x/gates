@@ -269,7 +269,8 @@ fn execute(args: Args) -> Result<()> {
         // Refuse an unsupported operation before any credential is minted.
         b10x_gates::bot_args::check(command, repository.as_deref())?;
         if command.first().is_some_and(|verb| verb == "delete-branch") {
-            // The REST API as the App, never Git; the shape was refused above.
+            // Checked through the REST API as the App, then deleted by a Git push that
+            // carries the checked tip; the shape was refused above.
             let deletion = b10x_gates::bot_args::delete_branch(command, repository.as_deref())?;
             println!(
                 "{}",
