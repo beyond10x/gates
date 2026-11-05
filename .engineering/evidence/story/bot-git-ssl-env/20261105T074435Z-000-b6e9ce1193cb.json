@@ -1,0 +1,15 @@
+{
+  "at": "2026-11-05T07:44:35Z",
+  "actor": "human:timo",
+  "artifact": "story:bot-git-ssl-env",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:bot-git-ssl-env-adversary-1",
+    "reference": "5203e8b",
+    "review": "review-result:bot-git-ssl-env-adversary-1",
+    "outcome": "fixed"
+  }
+}
