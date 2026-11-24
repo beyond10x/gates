@@ -6,9 +6,15 @@
 //! must be Git's own clean merge of its parents, recomputed locally.
 //!
 //! A squash merge has one parent and is admitted on a public repository only. The base its
-//! pull-request record names must be that parent or an ancestor of it, the head the record names
-//! must be a commit in the local object store, and the squash's tree must be Git's own clean
-//! merge of the parent and that head, recomputed locally.
+//! pull-request record names must be a commit that is that parent or an ancestor of it, the head
+//! the record names must be a commit in the local object store that does not contain the squash,
+//! and the squash's tree must be Git's own clean merge of the parent and that head, recomputed
+//! locally.
+//!
+//! The squashed head's own commits are outside the walked ancestry and are not checked one by
+//! one: who wrote them, and what each holds before the last, is not proved here. That rests on
+//! the public repository's branch ruleset, under which only the App writes any branch. A private
+//! repository has no ruleset, so a squash is refused there.
 use crate::{
     BOT_EMAIL, BOT_NAME,
     delivery::ApiFailure,
@@ -138,15 +144,24 @@ fn github_commit(git: &Git, oid: &str) -> Result<GithubCommit> {
     ensure!(is_oid(&tree), "historical merge tree invalid");
     git.read(&["cat-file", "-e", &format!("{tree}^{{tree}}")])?;
     for parent in &parents {
-        ensure!(
-            git.resolve(&format!("{parent}^{{commit}}"))? == *parent,
-            "historical merge parent object unavailable"
-        );
-        let parent_tree = git.resolve(&format!("{parent}^{{tree}}"))?;
-        ensure!(is_oid(&parent_tree), "historical merge parent tree invalid");
-        git.read(&["cat-file", "-e", &format!("{parent_tree}^{{tree}}")])?;
+        ensure_merge_input(git, parent, "historical merge parent")?;
     }
     Ok(GithubCommit { tree, parents })
+}
+
+/// An input of a local merge: `oid` is itself a commit in the local store, not a tag that names
+/// one, and the tree it names is a tree the store holds and Git can parse. `git merge-tree`
+/// reads that tree without checking its hash; peeling it here does check. `role` names the input
+/// in a refusal.
+fn ensure_merge_input(git: &Git, oid: &str, role: &str) -> Result<()> {
+    ensure!(
+        git.resolve(&format!("{oid}^{{commit}}"))? == oid,
+        "{role} object unavailable"
+    );
+    let tree = git.resolve(&format!("{oid}^{{tree}}"))?;
+    ensure!(is_oid(&tree), "{role} tree invalid");
+    git.read(&["cat-file", "-e", &format!("{tree}^{{tree}}")])?;
+    Ok(())
 }
 
 fn string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
@@ -889,9 +904,16 @@ impl Authority {
         let base = oid(&pr, "/base/sha")?;
         git.read(&["merge-base", "--is-ancestor", base, parent])
             .context("squash merge parent does not descend from the pull request base")?;
+        // Git peels a tag to the commit it names before it answers the question above. The
+        // record's base is a commit id, so an id that is a tag object is not that record's base.
+        ensure!(
+            git.resolve(&format!("{base}^{{commit}}"))? == base,
+            "pull request base of squash merge is not a commit"
+        );
         // Only the record names the head, so a clone need not hold it. Nothing is fetched here,
         // and `Git::command` turns lazy fetching off, so a partial clone's remote does not
-        // supply it either: the refusal names the commit and the fetch that does.
+        // supply it either: the refusal names the commit and the fetch that does. The fetch
+        // keeps the head under a ref of its own, so a later fetch or a prune does not drop it.
         let head = oid(&pr, "/head/sha")?;
         match git.text(&["cat-file", "-t", head]) {
             Ok(kind) => ensure!(
@@ -899,10 +921,21 @@ impl Authority {
                 "pull request head {head} of squash merge is not a commit"
             ),
             Err(_) => bail!(
-                "pull request head {head} of squash merge is not in the local object store; \
-                 run `b10x-gates bot -- fetch origin refs/pull/{number}/head` and retry"
+                "pull request head {head} of squash merge is not in the local object store; run \
+                 `b10x-gates bot -- fetch origin refs/pull/{number}/head:refs/pull/{number}/head` \
+                 and retry"
             ),
         }
+        // The head gets the object checks the parent got in `github_commit`.
+        ensure_merge_input(git, head, "squash merge pull request head")?;
+        // A head that is the squash, or has it in its history, merges with the parent into its
+        // own tree. With the squash as head that is the squash's tree, and the comparison below
+        // would hold the squash against itself, whatever it carries. Only Git's plain "not an
+        // ancestor" passes; any other failure of the question refuses.
+        ensure!(
+            !git.is_ancestor(merge, head)?,
+            "pull request head contains its own squash merge"
+        );
         // A conflicted merge was resolved by somebody, so it refuses even when its tree is the
         // very one Git wrote with the conflict in it.
         let local = git.merge_tree(parent, head)?;

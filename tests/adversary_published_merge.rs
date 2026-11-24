@@ -536,3 +536,710 @@ fn adversary_each_update_and_terminal_commit_identity_field_is_required() {
         }
     }
 }
+
+// Squash merges proved by ancestry of the recorded base and a recomputed merge of the squash's
+// parent and the pull request head (story squash-merge-moved-base). Built through this adversary's
+// own fixture, independently of the implementation author's `SquashInputs`.
+
+type Files<'a> = &'a [(&'a str, &'a [u8])];
+
+const GITHUB: &str = "GitHub <noreply@github.com>";
+const KEPT: (&str, &[u8]) = ("kept", b"as recorded\n");
+const SECOND: (&str, &[u8]) = ("second", b"landed while the pull request was open\n");
+const ADDED: (&str, &[u8]) = ("added", b"pull request 7\n");
+const UNREVIEWED: (&str, &[u8]) = ("unreviewed", b"in neither input\n");
+/// Git's merge options as `Git::merge_tree` pins them.
+const PINS: [&str; 8] = [
+    "-c",
+    "merge.directoryRenames=conflict",
+    "-c",
+    "merge.renormalize=false",
+    "-c",
+    "merge.renames=true",
+    "-c",
+    "diff.renames=true",
+];
+
+fn bot() -> String {
+    format!("{BOT_NAME} <{BOT_EMAIL}>")
+}
+
+fn lines(range: std::ops::RangeInclusive<u32>, tail: &str) -> Vec<u8> {
+    let mut text: String = range.map(|n| format!("line {n}\n")).collect();
+    text.push_str(tail);
+    text.into_bytes()
+}
+
+/// A tree of regular files; a path `dir/name` becomes a subtree.
+fn tree(root: &Path, files: Files) -> String {
+    let mut entries = Vec::new();
+    let mut dirs: BTreeMap<&str, Vec<(&str, &[u8])>> = BTreeMap::new();
+    for (path, bytes) in files {
+        match path.split_once('/') {
+            Some((dir, rest)) => dirs.entry(dir).or_default().push((rest, bytes)),
+            None => {
+                let blob = git(root, &["hash-object", "-w", "--stdin"], bytes);
+                entries.push(format!("100644 blob {blob}\t{path}\n"));
+            }
+        }
+    }
+    for (dir, inner) in dirs {
+        entries.push(format!("040000 tree {}\t{dir}\n", tree(root, &inner)));
+    }
+    git(root, &["mktree"], entries.concat().as_bytes())
+}
+
+/// A tree from raw `git mktree` lines.
+fn raw_tree(root: &Path, entries: &[String]) -> String {
+    git(root, &["mktree"], entries.concat().as_bytes())
+}
+
+/// Git's merge of two commits with the pins `Git::merge_tree` uses and the repository's own config.
+fn merge_tree(root: &Path, first: &str, second: &str) -> (String, bool) {
+    let output = Command::new("git")
+        .args(["--no-replace-objects"])
+        .args(PINS)
+        .args(["merge-tree", "--write-tree", "--no-messages", first, second])
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    let clean = match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!("merge-tree failed: {other:?}"),
+    };
+    let tree = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    (tree, clean)
+}
+
+/// After the fixture's published merge: a bot commit `recorded` holding `base`, which pull request
+/// 7 records as its base; the default branch then moves by a bot commit to `parent` holding
+/// `moved`; the pull request head, cut from `recorded`, holds `head`.
+struct Squash {
+    f: Fixture,
+    recorded: String,
+    parent: String,
+    head: String,
+    squash: String,
+}
+
+impl Squash {
+    fn new(base: Files, moved: Files, head: Files) -> Self {
+        let f = Fixture::new();
+        let root = f.directory.path().to_path_buf();
+        let recorded = commit(&root, &tree(&root, base), &[&f.merge], &bot(), "recorded");
+        let parent = commit(&root, &tree(&root, moved), &[&recorded], &bot(), "moved");
+        let head = commit(&root, &tree(&root, head), &[&recorded], &bot(), "pull 7");
+        Self {
+            f,
+            recorded,
+            parent,
+            head,
+            squash: String::new(),
+        }
+    }
+
+    /// The default branch took `SECOND` after the pull request, which adds `ADDED`, recorded it.
+    fn moved() -> Self {
+        Self::new(&[KEPT], &[KEPT, SECOND], &[KEPT, ADDED])
+    }
+
+    fn root(&self) -> &Path {
+        self.f.directory.path()
+    }
+
+    fn files(&self, files: Files) -> String {
+        tree(self.root(), files)
+    }
+
+    /// GitHub squashes pull request 7 onto `parent` and records `tree`. The record names
+    /// `self.recorded` as its base and `self.head` as its head.
+    fn land(&mut self, parent: &str, tree: &str) {
+        let root = self.root().to_path_buf();
+        let squash = commit(&root, tree, &[parent], GITHUB, "Add the topic (#7)");
+        self.f.candidate = commit(&root, tree, &[&squash], &bot(), "candidate");
+        let evidence = &mut self.f.evidence.0;
+        evidence.get_mut(REF).unwrap()["object"]["sha"] = json!(squash);
+        evidence.insert(
+            format!("{ROOT}/commits/{squash}"),
+            json!({
+                "sha":squash,"author":{"login":BOT_NAME},"committer":{"login":"web-flow"},
+                "commit":{"author":{"name":BOT_NAME,"email":BOT_EMAIL},
+                    "committer":{"name":"GitHub","email":"noreply@github.com"},
+                    "tree":{"sha":tree},"verification":{"verified":true,"reason":"valid"}},
+                "parents":[{"sha":parent}]
+            }),
+        );
+        let pr = json!({"number":7,"merged":true,"state":"closed","merge_commit_sha":squash,
+            "merged_by":{"login":BOT_NAME},
+            "head":{"sha":self.head,"repo":{"id":123,"full_name":REPOSITORY}},
+            "base":{"ref":"main","sha":self.recorded,"repo":{"id":123,"full_name":REPOSITORY}}});
+        evidence.insert(
+            format!("{ROOT}/commits/{squash}/pulls?per_page=100&page=1"),
+            json!([pr.clone()]),
+        );
+        evidence.insert(format!("{ROOT}/pulls/7"), pr);
+        self.squash = squash;
+    }
+
+    /// Set `pointer` in the pull request record, in its detail and in its association entry.
+    fn record(&mut self, pointer: &str, value: Value) {
+        let list = format!("{ROOT}/commits/{}/pulls?per_page=100&page=1", self.squash);
+        *self
+            .f
+            .evidence
+            .0
+            .get_mut(&format!("{ROOT}/pulls/7"))
+            .unwrap()
+            .pointer_mut(pointer)
+            .unwrap() = value.clone();
+        *self.f.evidence.0.get_mut(&list).unwrap()[0]
+            .pointer_mut(pointer)
+            .unwrap() = value;
+    }
+
+    /// The tree of `kept` and `second` as regular files, `name` as `kind` holding `bytes`, and
+    /// one more raw entry.
+    fn merge_with(&self, kind: &str, bytes: &[u8], name: &str, extra: Option<String>) -> String {
+        let blob = |bytes: &[u8]| git(self.root(), &["hash-object", "-w", "--stdin"], bytes);
+        let mut entries = vec![
+            format!("{kind} {}\t{name}\n", blob(bytes)),
+            format!("100644 blob {}\tkept\n", blob(KEPT.1)),
+            format!("100644 blob {}\tsecond\n", blob(SECOND.1)),
+        ];
+        entries.extend(extra);
+        raw_tree(self.root(), &entries)
+    }
+
+    /// The local merge of the parent and the head, asserted clean, landed as the squash.
+    fn land_merge(&mut self) -> String {
+        let (merged, clean) = merge_tree(self.root(), &self.parent, &self.head);
+        assert!(clean, "fixture merge must be clean");
+        let parent = self.parent.clone();
+        self.land(&parent, &merged);
+        merged
+    }
+
+    fn admitted(&self) -> bool {
+        let results = self.f.verify();
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            admitted == 0 || admitted == 2,
+            "the entrypoints disagree: {results:?}"
+        );
+        admitted == 2
+    }
+
+    /// Both entrypoints refuse; the first refusal's full chain.
+    fn refusal(&self, what: &str) -> String {
+        let results = self.f.verify();
+        for result in &results {
+            assert!(result.is_err(), "{what}: admitted");
+        }
+        let [first, _] = results;
+        format!("{:#}", first.unwrap_err())
+    }
+}
+
+#[test]
+fn adversary_squash_rename_limit_config_cannot_make_a_conflicting_squash_clean() {
+    // Both sides rename the same two files to different names, with an edit each: an inexact
+    // rename/rename conflict under Git's defaults. `merge.renameLimit` (or `diff.renameLimit`) in
+    // the repository's own config turns inexact rename detection off, and the merge answers clean
+    // with all four names. `Git::merge_tree` pins `merge.renames`/`diff.renames`, refuses
+    // `merge.default` and `*.driver`, and leaves both rename limits to the repository.
+    let a = lines(1..=40, "");
+    let b = lines(101..=140, "");
+    let (a1, b1) = (lines(1..=40, "head\n"), lines(101..=140, "head\n"));
+    let (a2, b2) = (lines(1..=40, "base\n"), lines(101..=140, "base\n"));
+    for key in ["merge.renameLimit", "diff.renameLimit"] {
+        let mut s = Squash::new(
+            &[("a", a.as_slice()), ("b", b.as_slice())],
+            &[("a2", a2.as_slice()), ("b2", b2.as_slice())],
+            &[("a1", a1.as_slice()), ("b1", b1.as_slice())],
+        );
+        let (_, clean) = merge_tree(s.root(), &s.parent, &s.head);
+        assert!(!clean, "fixture must conflict under Git's defaults");
+        git(s.root(), &["config", key, "1"], b"");
+        let (steered, clean) = merge_tree(s.root(), &s.parent, &s.head);
+        assert!(clean, "{key}=1 must make the fixture merge clean");
+        let parent = s.parent.clone();
+        s.land(&parent, &steered);
+        let error = s.refusal(&format!("{key}=1 made a conflicting squash clean"));
+        assert!(error.contains("conflicts"), "{key}: {error}");
+    }
+}
+
+#[test]
+fn adversary_rename_limit_config_cannot_make_a_conflicting_two_parent_merge_clean() {
+    // The same steering against the two-parent proof, which shares `Git::merge_tree`: it shows
+    // whether the gap predates the squash change.
+    let a = lines(1..=40, "");
+    let b = lines(101..=140, "");
+    let (a1, b1) = (lines(1..=40, "head\n"), lines(101..=140, "head\n"));
+    let (a2, b2) = (lines(1..=40, "base\n"), lines(101..=140, "base\n"));
+    let mut s = Squash::new(
+        &[("a", a.as_slice()), ("b", b.as_slice())],
+        &[("a2", a2.as_slice()), ("b2", b2.as_slice())],
+        &[("a1", a1.as_slice()), ("b1", b1.as_slice())],
+    );
+    let root = s.root().to_path_buf();
+    git(&root, &["config", "merge.renameLimit", "1"], b"");
+    let (steered, clean) = merge_tree(&root, &s.parent, &s.head);
+    assert!(
+        clean,
+        "merge.renameLimit=1 must make the fixture merge clean"
+    );
+    let merge = commit(
+        &root,
+        &steered,
+        &[&s.parent, &s.head],
+        GITHUB,
+        "Merge pull request #7 from example/topic",
+    );
+    s.f.tree = steered.clone();
+    s.f.prove(merge.clone(), s.parent.clone(), s.head.clone(), 7);
+    s.f.evidence.0.get_mut(REF).unwrap()["object"]["sha"] = json!(merge);
+    s.f.candidate = commit(&root, &steered, &[&merge], &bot(), "candidate");
+    let error = s.refusal("merge.renameLimit=1 made a conflicting merge clean");
+    assert!(error.contains("conflicts"), "{error}");
+}
+
+#[test]
+fn adversary_squash_whose_recorded_head_is_the_squash_or_below_it_refuses() {
+    // The record's head is the input the squash is proved against. A head that is the squash
+    // itself, or a commit that already contains it, makes `merge-tree(parent, head)` answer the
+    // squash's own tree, so guard 3 proves the squash from itself: here a file in neither the
+    // parent nor the pull request's real head is admitted.
+    for below in [false, true] {
+        let mut s = Squash::moved();
+        let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+        let parent = s.parent.clone();
+        s.land(&parent, &tampered);
+        let head = if below {
+            s.f.candidate.clone()
+        } else {
+            s.squash.clone()
+        };
+        s.record("/head/sha", json!(head));
+        assert!(
+            !s.admitted(),
+            "a squash proved against itself was admitted (head below the squash: {below})"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_forged_loose_head_tree_cannot_prove_an_extra_file() {
+    // The local store is attacker-controlled data. `merge-tree` reads the head's tree without
+    // checking its hash (`cat-file -p` and `parse_object` do check it), so a loose object file
+    // holding another tree's bytes under the real head tree's name supplies the content the
+    // squash added. Nothing in the squash proof reads the head tree through a checking path.
+    let mut s = Squash::moved();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let real = git(
+        s.root(),
+        &["rev-parse", &format!("{}^{{tree}}", s.head)],
+        b"",
+    );
+    let forged = s.files(&[KEPT, ADDED, UNREVIEWED]);
+    let object = |oid: &str| {
+        s.root()
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..])
+    };
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(object(&real), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::copy(object(&forged), object(&real)).unwrap();
+    let (merged, clean) = merge_tree(s.root(), &s.parent, &s.head);
+    assert!(
+        clean && merged == tampered,
+        "fixture: the forged head tree must make the local merge the tampered tree"
+    );
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    assert!(
+        !s.admitted(),
+        "a forged loose head tree proved a file in neither real input"
+    );
+}
+
+#[test]
+fn adversary_squash_parent_off_the_proved_line_is_walked_and_refused() {
+    // Attack 1: the squash's parent is a side-line commit with a person as committer, reached
+    // from the published head only through the second parent of a later bot merge. It passes
+    // guard 1 (the recorded base is its ancestor) and its tree merges cleanly with the head. Every
+    // parent of a walked commit is itself walked or below the baseline, so the walk refuses it.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let side = commit(
+        &root,
+        &s.files(&[KEPT, SECOND]),
+        &[&s.recorded],
+        "Person <person@example.invalid>",
+        "side line",
+    );
+    let (merged, clean) = merge_tree(&root, &side, &s.head);
+    assert!(clean);
+    s.land(&side, &merged);
+    let joined = commit(
+        &root,
+        &merged,
+        &[&s.parent, &s.squash],
+        &bot(),
+        "bot merge of the default branch and the squash",
+    );
+    s.f.evidence.0.get_mut(REF).unwrap()["object"]["sha"] = json!(joined);
+    s.f.candidate = commit(&root, &merged, &[&joined], &bot(), "candidate");
+    let error = s.refusal("a squash onto an unproved side-line parent");
+    assert!(error.contains("committer"), "{error}");
+}
+
+#[test]
+fn adversary_squash_tree_holding_more_than_the_pull_request_refuses() {
+    // Attack 2: each tree differs from the clean merge of parent and head (`added`, `kept`,
+    // `second`, all regular files) by one entry or one mode.
+    type Variant = fn(&Squash) -> String;
+    let variants: [(&str, Variant); 7] = [
+        ("an extra file", |s| {
+            s.files(&[KEPT, SECOND, ADDED, UNREVIEWED])
+        }),
+        (
+            "the head's tree, dropping what the default branch took",
+            |s| s.files(&[KEPT, ADDED]),
+        ),
+        ("the parent's tree, dropping the pull request", |s| {
+            s.files(&[KEPT, SECOND])
+        }),
+        ("a changed mode", |s| {
+            s.merge_with("100755 blob", ADDED.1, "added", None)
+        }),
+        ("a symlink in place of a file", |s| {
+            s.merge_with("120000 blob", b"kept", "added", None)
+        }),
+        ("an extra gitlink", |s| {
+            let module = format!("160000 commit {}\tmodule\n", s.head);
+            s.merge_with("100644 blob", ADDED.1, "added", Some(module))
+        }),
+        ("an extra symlink", |s| {
+            let target = git(s.root(), &["hash-object", "-w", "--stdin"], b"/etc/passwd");
+            let link = format!("120000 blob {target}\tlink\n");
+            s.merge_with("100644 blob", ADDED.1, "added", Some(link))
+        }),
+    ];
+    for (what, variant) in variants {
+        let mut s = Squash::moved();
+        s.land_merge();
+        assert!(s.admitted(), "{what}: control refused");
+        let tree = variant(&s);
+        let parent = s.parent.clone();
+        s.land(&parent, &tree);
+        let error = s.refusal(what);
+        assert!(
+            error
+                .contains("squash tree is not the local merge of its parent and pull request head"),
+            "{what}: refused for another reason: {error}"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_content_in_a_path_both_sides_touched_must_be_the_merge() {
+    // Both sides edit the same file in separate hunks; the merge holds both edits. A squash
+    // holding one more changed line in that file refuses; the exact merge is admitted.
+    let base = lines(1..=20, "");
+    let moved = String::from_utf8(lines(1..=20, ""))
+        .unwrap()
+        .replace("line 2\n", "line 2 by the default branch\n");
+    let head = String::from_utf8(lines(1..=20, ""))
+        .unwrap()
+        .replace("line 18\n", "line 18 by pull request 7\n");
+    let mut s = Squash::new(
+        &[("f", base.as_slice())],
+        &[("f", moved.as_bytes())],
+        &[("f", head.as_bytes())],
+    );
+    let merged = s.land_merge();
+    assert!(s.admitted(), "control refused");
+    let both = git(s.root(), &["cat-file", "-p", &format!("{merged}:f")], b"");
+    assert!(both.contains("line 2 by the default branch") && both.contains("line 18 by pull"));
+    let tampered = format!("{both}\n").replace("line 10\n", "line 10 unreviewed\n");
+    let tree = s.files(&[("f", tampered.as_bytes())]);
+    let parent = s.parent.clone();
+    s.land(&parent, &tree);
+    let error = s.refusal("one more line in a file both sides touched");
+    assert!(
+        error.contains("squash tree is not the local merge"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adversary_squash_heads_at_or_below_the_parent_are_admitted_only_as_the_parent_tree() {
+    // A head equal to the parent or an ancestor of it (an empty squash) merges to the parent's
+    // tree. That tree is admitted; one file more refuses.
+    for head_is_parent in [true, false] {
+        let mut s = Squash::moved();
+        s.head = if head_is_parent {
+            s.parent.clone()
+        } else {
+            s.recorded.clone()
+        };
+        let parent_tree = s.files(&[KEPT, SECOND]);
+        let parent = s.parent.clone();
+        s.land(&parent, &parent_tree);
+        assert!(
+            s.admitted(),
+            "an empty squash refused (head is parent: {head_is_parent})"
+        );
+        let extra = s.files(&[KEPT, SECOND, UNREVIEWED]);
+        s.land(&parent, &extra);
+        let error = s.refusal("an empty squash with an extra file");
+        assert!(
+            error.contains("squash tree is not the local merge"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_unrelated_head_refuses() {
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    s.head = commit(&root, &s.files(&[ADDED]), &[], &bot(), "unrelated root");
+    let merged = s.files(&[KEPT, SECOND, ADDED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &merged);
+    let error = s.refusal("a squash of an unrelated head");
+    assert!(error.contains("merge-tree"), "{error}");
+}
+
+#[test]
+fn adversary_squash_criss_cross_head_is_admitted_only_as_the_recursive_merge() {
+    // The parent and the head each merge the same two side commits in opposite order, so they
+    // have two merge bases and Git merges a virtual base first.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let x = commit(
+        &root,
+        &s.files(&[KEPT, ("x", b"x\n")]),
+        &[&s.recorded],
+        &bot(),
+        "x",
+    );
+    let y = commit(
+        &root,
+        &s.files(&[KEPT, ("y", b"y\n")]),
+        &[&s.recorded],
+        &bot(),
+        "y",
+    );
+    let both = s.files(&[KEPT, ("x", b"x\n"), ("y", b"y\n")]);
+    s.parent = commit(&root, &both, &[&x, &y], &bot(), "x and y");
+    s.head = commit(
+        &root,
+        &s.files(&[KEPT, ADDED, ("x", b"x\n"), ("y", b"y\n")]),
+        &[&y, &x],
+        &bot(),
+        "y and x, then pull 7",
+    );
+    let bases = git(&root, &["merge-base", "--all", &s.parent, &s.head], b"");
+    assert_eq!(bases.lines().count(), 2, "fixture must be criss-cross");
+    s.land_merge();
+    assert!(s.admitted(), "the recursive merge refused");
+    let extra = s.files(&[KEPT, ADDED, ("x", b"x\n"), ("y", b"y\n"), UNREVIEWED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &extra);
+    let error = s.refusal("a criss-cross squash with an extra file");
+    assert!(
+        error.contains("squash tree is not the local merge"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adversary_squash_directory_rename_resolved_as_a_move_refuses() {
+    // The default branch renames `a/` to `b/`; the pull request adds `a/y`. With directory renames
+    // pinned to `conflict` the local merge conflicts, so a squash that moved `y` under `b/` refuses
+    // even though it holds only the two inputs' content.
+    let mut s = Squash::new(
+        &[("a/x", b"x\n")],
+        &[("b/x", b"x\n")],
+        &[("a/x", b"x\n"), ("a/y", b"y\n")],
+    );
+    let (_, clean) = merge_tree(s.root(), &s.parent, &s.head);
+    assert!(
+        !clean,
+        "fixture must conflict with directory renames pinned"
+    );
+    let moved = s.files(&[("b/x", b"x\n"), ("b/y", b"y\n")]);
+    let parent = s.parent.clone();
+    s.land(&parent, &moved);
+    let error = s.refusal("a squash whose directory rename was resolved");
+    assert!(error.contains("conflicts"), "{error}");
+}
+
+#[test]
+fn adversary_squash_recorded_base_that_is_no_ancestor_commit_refuses() {
+    // Attack 3: well-formed ids that are not the parent or a commit below it. The squash itself
+    // as the base kills a guard-1 mutant that asks about the squash instead of its parent.
+    type Base = fn(&Squash) -> String;
+    let cases: [(&str, Base); 5] = [
+        ("the recorded base's tree", |s| {
+            git(
+                s.root(),
+                &["rev-parse", &format!("{}^{{tree}}", s.recorded)],
+                b"",
+            )
+        }),
+        ("a blob", |s| {
+            git(s.root(), &["hash-object", "-w", "--stdin"], KEPT.1)
+        }),
+        ("the squash itself", |s| s.squash.clone()),
+        ("the unmerged pull request head", |s| s.head.clone()),
+        ("a commit above the squash", |s| s.f.candidate.clone()),
+    ];
+    for (what, base) in cases {
+        let mut s = Squash::moved();
+        s.land_merge();
+        assert!(s.admitted(), "{what}: control refused");
+        let base = base(&s);
+        s.record("/base/sha", json!(base));
+        let error = s.refusal(what);
+        assert!(
+            error.contains("squash merge parent does not descend from the pull request base"),
+            "{what}: refused for another reason: {error}"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_head_through_a_tag_or_a_replace_ref_refuses() {
+    // Attack 4: the record's head named through an annotated tag object, and a replace ref that
+    // swaps the head for a commit already holding the squash's extra file.
+    let mut s = Squash::moved();
+    s.land_merge();
+    let root = s.root().to_path_buf();
+    let tag = git(
+        &root,
+        &["mktag"],
+        format!(
+            "object {}\ntype commit\ntag head\ntagger {} 1700000000 +0000\n\nhead\n",
+            s.head,
+            bot()
+        )
+        .as_bytes(),
+    );
+    s.record("/head/sha", json!(tag));
+    let error = s.refusal("a head named through a tag object");
+    assert!(error.contains("is not a commit"), "{error}");
+
+    let mut s = Squash::moved();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    let swap = commit(
+        s.root(),
+        &s.files(&[KEPT, ADDED, UNREVIEWED]),
+        &[&s.recorded],
+        &bot(),
+        "replacement head",
+    );
+    git(
+        s.root(),
+        &["update-ref", &format!("refs/replace/{}", s.head), &swap],
+        b"",
+    );
+    let error = s.refusal("a head swapped by a replace ref");
+    assert!(
+        error.contains("squash tree is not the local merge"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adversary_squash_partial_clone_without_blobs_refuses_rather_than_admits() {
+    // Attack 4: the default branch renames `a` with an edit; the pull request edits `a`. Git
+    // needs blob content to find the inexact rename. In a `--filter=blob:none` clone with lazy
+    // fetching off, after the fetch the refusal for an absent head names, the merge cannot read
+    // those blobs. It must refuse, never answer a merge computed without them.
+    let a = lines(1..=40, "");
+    let renamed = lines(1..=40, "moved\n");
+    let edited = String::from_utf8(lines(1..=40, ""))
+        .unwrap()
+        .replace("line 3\n", "line 3 by pull request 7\n");
+    let mut s = Squash::new(
+        &[("a", a.as_slice())],
+        &[("a2", renamed.as_slice())],
+        &[("a", edited.as_bytes())],
+    );
+    s.land_merge();
+    assert!(s.admitted(), "control refused on the full store");
+    let source = s.root().to_path_buf();
+    for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+        git(&source, &["config", key, "true"], b"");
+    }
+    git(
+        &source,
+        &["update-ref", "refs/heads/main", &s.f.candidate],
+        b"",
+    );
+    git(&source, &["update-ref", "refs/pull/7/head", &s.head], b"");
+    let clone = tempfile::tempdir().unwrap();
+    git(
+        clone.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", source.display()),
+            ".",
+        ],
+        b"",
+    );
+    git(
+        clone.path(),
+        &["fetch", "-q", "origin", "refs/pull/7/head"],
+        b"",
+    );
+    let _source = std::mem::replace(&mut s.f.directory, clone);
+    let error = s.refusal("a squash merged without the blobs rename detection needs");
+    assert!(error.contains("merge-tree"), "{error}");
+}
+
+#[test]
+fn adversary_squash_head_commits_are_not_walked_on_a_public_repository() {
+    // Attack 4, who proves the head: a head committed by a person is not walked, so on a public
+    // repository the squash is admitted on the branch authority alone (the comment at the squash
+    // proof says so); on a private repository the shape refuses.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    s.head = commit(
+        &root,
+        &s.files(&[KEPT, ADDED]),
+        &[&s.recorded],
+        "Person <person@example.invalid>",
+        "person's head",
+    );
+    s.land_merge();
+    assert!(s.admitted(), "public squash of a person's head");
+    let root_response = s.f.evidence.0.get_mut(ROOT).unwrap();
+    root_response["private"] = json!(true);
+    root_response["visibility"] = json!("private");
+    let results = s.f.verify();
+    assert!(
+        results.iter().all(|r| r.is_err()),
+        "private squash admitted"
+    );
+}

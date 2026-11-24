@@ -4175,19 +4175,23 @@ impl Fixture {
     /// cuts a head holding `head` from it. GitHub then merges pull request 2, which adds `SECOND`,
     /// and pull request 3, which leaves the default branch holding `base`.
     fn squash_inputs(&mut self, base: Files, head: Files) -> SquashInputs {
+        self.squash_inputs_from(&[KEPT], base, head)
+    }
+
+    /// `squash_inputs`, with the bot commit pull request 7 records as its base holding
+    /// `recorded` in place of `KEPT`.
+    fn squash_inputs_from(&mut self, recorded: Files, base: Files, head: Files) -> SquashInputs {
         let root = self.dir.path().to_path_buf();
+        let second = [recorded, &[SECOND]].concat();
         let recorded = commit(
             &root,
-            &tree_of(&root, &[KEPT]),
+            &tree_of(&root, recorded),
             &[&self.baseline],
             false,
             "recorded base",
         );
         let mut parent = recorded.clone();
-        for (number, tree) in [
-            (2, tree_of(&root, &[KEPT, SECOND])),
-            (3, tree_of(&root, base)),
-        ] {
+        for (number, tree) in [(2, tree_of(&root, &second)), (3, tree_of(&root, base))] {
             let side = commit(
                 &root,
                 &tree,
@@ -4266,6 +4270,79 @@ fn present(root: &Path, oid: &str) -> bool {
         .status()
         .unwrap()
         .success()
+}
+
+/// The command a refusal names between backticks, as its words.
+fn named_command(refusal: &str) -> Vec<String> {
+    refusal
+        .split('`')
+        .nth(1)
+        .expect("the refusal names a command")
+        .split(' ')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Run the Git command a refusal names, as a person would: with lazy fetching left on.
+fn run_named_git(root: &Path, command: &[String]) {
+    let arguments: Vec<&str> = command.iter().map(String::as_str).collect();
+    git(root, &arguments, b"");
+}
+
+/// An annotated tag object naming `commit`.
+fn tag_of(root: &Path, commit: &str) -> String {
+    git(
+        root,
+        &["mktag"],
+        format!(
+            "object {commit}\ntype commit\ntag named\ntagger {BOT_NAME} <{BOT_EMAIL}> 1700000000 \
+             +0000\n\nnamed\n"
+        )
+        .as_bytes(),
+    )
+}
+
+impl Fixture {
+    /// Replace the fixture's repository by a `--filter=blob:none` clone of it. The clone's remote
+    /// is the full repository, which hands over any object on demand and holds `head` as
+    /// `refs/pull/7/head`. The full repository is returned, to be kept for as long as the clone.
+    fn move_to_blobless_clone(&mut self, head: &str) -> TempDir {
+        let source = self.dir.path().to_path_buf();
+        for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+            git(&source, &["config", key, "true"], b"");
+        }
+        for (name, oid) in [
+            ("refs/heads/main", self.candidate.as_str()),
+            ("refs/pull/7/head", head),
+        ] {
+            git(&source, &["update-ref", name, oid], b"");
+        }
+        let clone = tempfile::tempdir().unwrap();
+        git(
+            clone.path(),
+            &[
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                "--no-checkout",
+                &format!("file://{}", source.display()),
+                ".",
+            ],
+            b"",
+        );
+        std::mem::replace(&mut self.dir, clone)
+    }
+}
+
+/// Twenty lines, with line `changed` rewritten by `who`.
+fn twenty_lines(changed: Option<(u32, &str)>) -> Vec<u8> {
+    (1..=20)
+        .map(|n| match changed {
+            Some((line, who)) if line == n => format!("line {n} by {who}\n"),
+            _ => format!("line {n}\n"),
+        })
+        .collect::<String>()
+        .into_bytes()
 }
 
 #[test]
@@ -4354,7 +4431,9 @@ fn a_squash_whose_parent_does_not_descend_from_the_recorded_base_refuses() {
     // The tree is the clean merge of the parent and the head in every case, so only the recorded
     // base decides. It is refused when the parent's history does not contain it.
     type Recorded = fn(&Fixture, &SquashInputs) -> String;
-    let cases: [(&str, Recorded); 4] = [
+    let cases: [(&str, Recorded); 5] = [
+        // The squash descends from itself; its parent does not descend from it.
+        ("the squash itself", |f, _| f.merge.clone()),
         ("a base on another line", |f, inputs| {
             // Cut from the recorded base and never merged.
             let tree = tree_of(f.dir.path(), &[KEPT, ("elsewhere", b"another line\n")]);
@@ -4404,19 +4483,89 @@ fn a_squash_whose_pull_request_head_is_absent_refuses_and_names_the_fetch() {
         )),
         "{error}"
     );
-    // The fetch it names is one the bot runs.
-    let command = error
-        .split('`')
-        .nth(1)
-        .expect("the refusal names a command");
-    let arguments: Vec<String> = command
-        .strip_prefix("b10x-gates bot -- ")
-        .expect("the refusal names the bot's Git")
-        .split(' ')
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(arguments, ["fetch", "origin", "refs/pull/7/head"]);
-    b10x_gates::bot_args::check(&arguments, None).expect("the bot refuses the fetch it was told");
+    // The fetch it names keeps a ref, so the head stays reachable after `FETCH_HEAD` moves on,
+    // and it is one the bot runs. So is the form for every pull request at once.
+    let command = named_command(&error);
+    assert_eq!(command[..3], ["b10x-gates", "bot", "--"], "{error}");
+    let arguments = &command[3..];
+    assert_eq!(
+        arguments,
+        ["fetch", "origin", "refs/pull/7/head:refs/pull/7/head"]
+    );
+    b10x_gates::bot_args::check(arguments, None).expect("the bot refuses the fetch it was told");
+    let every = ["fetch", "origin", "refs/pull/*/head:refs/pull/*/head"].map(str::to_owned);
+    b10x_gates::bot_args::check(&every, None).expect("the bot refuses the fetch of every head");
+}
+
+#[test]
+fn a_squash_whose_recorded_base_is_not_a_commit_refuses() {
+    // An annotated tag object that names the recorded base, or the parent itself, peels to a
+    // commit the parent descends from. The record's base is a commit id, never a tag's.
+    for of_parent in [false, true] {
+        let (mut f, inputs) = Fixture::moved_squash();
+        let named = if of_parent {
+            &inputs.parent
+        } else {
+            &inputs.recorded
+        };
+        let tag = tag_of(f.dir.path(), named);
+        f.pull(7)["base"]["sha"] = json!(tag);
+        let error = f.refusal("a squash whose recorded base is a tag object");
+        assert!(
+            error.contains("pull request base of squash merge is not a commit"),
+            "refused for another reason (tag of the parent: {of_parent}): {error}"
+        );
+    }
+}
+
+#[test]
+fn a_squash_whose_recorded_head_contains_the_squash_refuses() {
+    // The merge of the parent and a head that already holds the squash is the squash's own tree,
+    // so the tree equality would compare the squash with itself and admit a file that is in
+    // neither real input.
+    for above in [false, true] {
+        let (mut f, inputs) = Fixture::moved_squash();
+        let tampered = tree_of(
+            f.dir.path(),
+            &[
+                ADDED,
+                KEPT,
+                SECOND,
+                THIRD,
+                ("unreviewed", b"in neither input\n"),
+            ],
+        );
+        f.squash(&inputs, &tampered);
+        let head = if above {
+            f.candidate.clone()
+        } else {
+            f.merge.clone()
+        };
+        f.pull(7)["head"]["sha"] = json!(head);
+        let error = f.refusal("a squash proved against itself");
+        assert!(
+            error.contains("pull request head contains its own squash merge"),
+            "refused for another reason (head above the squash: {above}): {error}"
+        );
+    }
+}
+
+#[test]
+fn a_squash_whose_head_history_cannot_be_read_refuses_on_the_ancestry_question() {
+    // Git answers "is the squash in the head's history" with an error, not with "no", when the
+    // walk meets a commit the store lacks. Only "no" lets the proof go on to the merge.
+    let (mut f, _) = Fixture::moved_squash();
+    let root = f.dir.path().to_path_buf();
+    let cut = commit(
+        &root,
+        &tree_of(&root, &[ADDED, KEPT]),
+        &[ABSENT],
+        false,
+        "pull request 7",
+    );
+    f.pull(7)["head"]["sha"] = json!(cut);
+    let error = f.refusal("a squash whose head history is cut");
+    assert!(error.contains("Git merge-base failed"), "{error}");
 }
 
 #[test]
@@ -4438,30 +4587,7 @@ fn a_partial_clone_does_not_fetch_an_absent_squash_head_by_itself() {
     // A `--filter=blob:none` clone has a remote that would hand over any object on demand. The
     // gate asks without a lazy fetch, so the absent head refuses, and the named fetch supplies it.
     let (mut f, inputs) = Fixture::moved_squash();
-    let source = f.dir.path().to_path_buf();
-    for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
-        git(&source, &["config", key, "true"], b"");
-    }
-    for (name, oid) in [
-        ("refs/heads/main", &f.candidate),
-        ("refs/pull/7/head", &inputs.head),
-    ] {
-        git(&source, &["update-ref", name, oid], b"");
-    }
-    let clone = tempfile::tempdir().unwrap();
-    git(
-        clone.path(),
-        &[
-            "clone",
-            "-q",
-            "--filter=blob:none",
-            "--no-checkout",
-            &format!("file://{}", source.display()),
-            ".",
-        ],
-        b"",
-    );
-    let _source = std::mem::replace(&mut f.dir, clone);
+    let _source = f.move_to_blobless_clone(&inputs.head);
     assert!(
         !present(f.dir.path(), &inputs.head),
         "fixture clone must lack the pull request head"
@@ -4478,14 +4604,149 @@ fn a_partial_clone_does_not_fetch_an_absent_squash_head_by_itself() {
         !present(f.dir.path(), &inputs.head),
         "the gate fetched the pull request head by itself"
     );
-    git(
-        f.dir.path(),
-        &["fetch", "-q", "origin", "refs/pull/7/head"],
-        b"",
+    // Exactly the fetch the refusal names, through plain Git: the bot adds only its identity.
+    let command = named_command(&error);
+    assert_eq!(command[..3], ["b10x-gates", "bot", "--"], "{error}");
+    run_named_git(f.dir.path(), &command[3..]);
+    assert_eq!(
+        git(f.dir.path(), &["rev-parse", "refs/pull/7/head"], b""),
+        inputs.head,
+        "the named fetch must keep the head under a ref"
     );
     assert!(
         f.verify().is_ok(),
         "the fetched head must prove the squash: {:?}",
+        f.verify()
+    );
+}
+
+#[test]
+fn a_partial_clone_names_the_merge_that_fetches_the_blobs_a_squash_needs() {
+    // The default branch and the pull request each rewrote a line of one file, so Git reads the
+    // file's three blobs to merge them. A `--filter=blob:none` clone lacks all three, and the
+    // gate fetches nothing by itself: it names the one command that lets Git fetch them.
+    let mut f = Fixture::new();
+    let untouched = twenty_lines(None);
+    let by_base = twenty_lines(Some((3, "the default branch")));
+    let by_head = twenty_lines(Some((17, "the pull request")));
+    let inputs = f.squash_inputs_from(
+        &[("lines", untouched.as_slice())],
+        &[("lines", by_base.as_slice()), SECOND],
+        &[("lines", by_head.as_slice())],
+    );
+    let (merged, clean) = written_merge_tree(f.dir.path(), &inputs.parent, &inputs.head);
+    assert!(clean, "fixture: the two rewritten lines must merge cleanly");
+    f.squash(&inputs, &merged);
+    assert!(
+        f.verify().is_ok(),
+        "fixture: a full clone must admit the squash: {:?}",
+        f.verify()
+    );
+
+    let _source = f.move_to_blobless_clone(&inputs.head);
+    git(
+        f.dir.path(),
+        &["fetch", "-q", "origin", "refs/pull/7/head:refs/pull/7/head"],
+        b"",
+    );
+    let lines = git(
+        f.dir.path(),
+        &["rev-parse", &format!("{}:lines", inputs.head)],
+        b"",
+    );
+    assert!(
+        !present(f.dir.path(), &lines),
+        "fixture clone must lack the blobs the merge reads"
+    );
+    let error = f.refusal("a squash whose merge reads blobs a partial clone lacks");
+    assert!(
+        error.contains("in a partial clone"),
+        "the refusal names no remedy: {error}"
+    );
+    let command = named_command(&error);
+    assert_eq!(
+        command,
+        [
+            "git",
+            "merge-tree",
+            "--write-tree",
+            &inputs.parent,
+            &inputs.head
+        ],
+        "{error}"
+    );
+    assert!(
+        !present(f.dir.path(), &lines),
+        "the gate fetched a blob by itself"
+    );
+    // Exactly the named command, once: Git fetches what the merge reads.
+    run_named_git(f.dir.path(), &command[1..]);
+    assert!(
+        f.verify().is_ok(),
+        "after the named merge the squash must be admitted: {:?}",
+        f.verify()
+    );
+}
+
+#[test]
+fn a_partial_clone_names_the_merge_that_fetches_the_blobs_a_two_parent_merge_needs() {
+    // The same remedy on the two-parent shape: pull request 7 merged with a merge commit.
+    let mut f = Fixture::new();
+    let untouched = twenty_lines(None);
+    let by_base = twenty_lines(Some((3, "the default branch")));
+    let by_head = twenty_lines(Some((17, "the pull request")));
+    let inputs = f.squash_inputs_from(
+        &[("lines", untouched.as_slice())],
+        &[("lines", by_base.as_slice()), SECOND],
+        &[("lines", by_head.as_slice())],
+    );
+    let (merged, clean) = written_merge_tree(f.dir.path(), &inputs.parent, &inputs.head);
+    assert!(clean, "fixture: the two rewritten lines must merge cleanly");
+    let root = f.dir.path().to_path_buf();
+    f.merge = commit(
+        &root,
+        &merged,
+        &[&inputs.parent, &inputs.head],
+        true,
+        "Merge pull request #7 from example/topic",
+    );
+    f.candidate = commit(&root, &merged, &[&f.merge], false, "candidate");
+    f.api.responses.get_mut(REF).unwrap()["object"]["sha"] = json!(f.merge);
+    f.tree = merged;
+    f.prove_merge(
+        f.merge.clone(),
+        inputs.parent.clone(),
+        inputs.head.clone(),
+        7,
+    );
+    assert!(
+        f.verify().is_ok(),
+        "fixture: a full clone must admit the merge: {:?}",
+        f.verify()
+    );
+
+    let _source = f.move_to_blobless_clone(&inputs.head);
+    let error = f.refusal("a merge that reads blobs a partial clone lacks");
+    assert!(
+        error.contains("in a partial clone"),
+        "the refusal names no remedy: {error}"
+    );
+    let command = named_command(&error);
+    assert_eq!(
+        command,
+        [
+            "git",
+            "merge-tree",
+            "--write-tree",
+            &inputs.parent,
+            &inputs.head
+        ],
+        "{error}"
+    );
+    run_named_git(f.dir.path(), &command[1..]);
+    assert!(
+        f.verify().is_ok(),
+        "after the named merge the merge must be admitted: {:?}",
         f.verify()
     );
 }

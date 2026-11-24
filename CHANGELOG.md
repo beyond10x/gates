@@ -7,14 +7,30 @@
   every later push of a branch cut from that default branch: GitHub squashes onto the default
   branch head at merge time, and the pull request record keeps the base it saw earlier. A
   squash is proved by three checks, on a public repository only as before: the base its pull
-  request record names is the squash's parent or an ancestor of it; the head the record names
-  is a commit in the local object store; and the squash's tree is Git's clean merge of that
-  parent and that head, recomputed locally.
+  request record names is a commit that is the squash's parent or an ancestor of it; the head
+  the record names is a commit in the local object store that does not contain the squash; and
+  the squash's tree is Git's clean merge of that parent and that head, recomputed locally.
+- The squashed head's own commits are not walked one by one. That rests on the public
+  repository's branch ruleset, under which only the App writes any branch; a private
+  repository has no ruleset and refuses a squash as before.
 - Now refused: a squash onto the recorded base itself whose tree is not that merge, a squash
   whose merge conflicts, and a squash whose pull request head is not in the local object
-  store. The last names the commit and the fetch that supplies it
-  (`b10x-gates bot -- fetch origin refs/pull/<n>/head`). The gate fetches nothing itself, in
-  a partial clone too.
+  store. The last names the commit and the fetch that supplies it,
+  `b10x-gates bot -- fetch origin refs/pull/<n>/head:refs/pull/<n>/head`, which keeps the head
+  under a ref so that a later fetch does not drop it. The gate fetches nothing itself, in a
+  partial clone too.
+- Also refused for a squash: a recorded base that is a tag object instead of a commit ("pull
+  request base of squash merge is not a commit"); a recorded head that is the squash itself or
+  has it in its history ("pull request head contains its own squash merge"), which would
+  otherwise prove the squash from itself; and a recorded head whose tree the local store does
+  not hold as a tree Git can parse, the check the squash's parent already had.
+- The local merge, for two-parent merges and branch updates as well as squashes, now runs with
+  `merge.renameLimit` pinned to Git's default of 7000. Before, `merge.renameLimit=1` or
+  `diff.renameLimit=1` in the repository's configuration skipped rename detection, and a merge
+  in which both sides renamed the same file to different names was computed as clean.
+- When Git cannot compute a local merge at all, the refusal names both commits and the command
+  that helps in a partial clone: `git merge-tree --write-tree <first> <second>`, run once, lets
+  Git fetch the blobs the merge reads. Before, it said only "Git merge-tree failed (exit 128)".
 
 ## 0.1.28 — 2026-11-24
 
