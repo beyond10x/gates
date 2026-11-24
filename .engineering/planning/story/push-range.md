@@ -3,75 +3,100 @@ format: aep.planning-md/3
 id: story:push-range
 kind: story
 status: draft
-title: A push is judged on the commits it adds to the published default branch
-summary: Bound the checked range by the authenticated default-branch head where both bot rulesets hold, keep refusing unacceptable commits on the candidate's line, report history through audit
-revision: 1
+title: A push is judged on the commits it adds above a default-branch commit the trusted check proved
+summary: Trust a default-branch commit only by the provenance of its check run (canonical caller, trusted Gates pin, baseline-range push run); otherwise the baseline range with a one-line reason; receipts version 2
+relations:
+- depends_on: story:ci-committer-pr-bound
+revision: 3
 ---
-# Story: A push is judged on the commits it adds to the published default branch
+# Story: A push is judged on the commits it adds above a default-branch commit the trusted check proved
 
 ## Outcome
 
-A repository whose default branch holds a commit the gate would not accept today can still push new
-work through the bot, without anyone editing the trusted policy. The gate judges the commits a push
-adds on top of the published default branch, read through an authenticated call, and keeps refusing
-any unacceptable commit on the candidate's own line. History already on the default branch is
-reported by `audit --history` instead of stopping every push.
+A repository can push new work through the bot without anyone editing the trusted policy when:
+
+- its default branch holds a GitHub-written commit that the local merge proof cannot prove; and
+- the trusted common check proved that branch clean.
+
+An unacceptable commit on the candidate's own line is still refused by id. A repository that does
+not qualify behaves exactly as in 0.1.28 and prints one line saying why.
+
+Story 2 of `design:push-range` (revision 2). Depends on `story:ci-committer-pr-bound` being released
+in the binary the trusted `common.yml` downloads.
 
 ## Context
 
-Design: `design:push-range`. The owner picked "A: check only new commits" on 2026-11-24.
+In 0.1.28 every push re-judges every commit since the enrolled baseline, and one commit the local
+proof rejects stops the repository until its baseline is moved by hand. Spindle's case: three
+single-parent commits by the bot, committed by GitHub, refused with "a commit on the pull request
+head line is neither the bot's nor a branch update".
 
-In 0.1.28 every push re-judges every commit from the enrolled baseline (`src/git.rs:801-946`,
-`src/published_merge.rs:54-95`), so one commit on the default branch that the gate does not accept
-stops every later push until the policy baseline is moved by hand (36 moves since 2026-10-05). The
-latest case: three API-written single-parent commits on spindle's `main` (bot author, not bot
-committer) made the push of a new branch refuse with "a commit on the pull request head line is
-neither the bot's nor a branch update".
-
-The design limits the new bound to repositories whose default branch is held by both the exact
-`b10x-bot-branch-authority` ruleset and a no-bypass required `common / Security and privacy` check
-from GitHub Actions; every other repository keeps the baseline range (open question Q1 of the
-design).
+Revision 2 trusts a default-branch commit `B` only by the provenance of its check run. The owner
+decided Q1 = A on 2026-11-24.
 
 ## Acceptance
 
-- On a qualifying repository (fake API with both rulesets), a default branch holding the spindle
-  shape (three single-parent commits, bot author, GitHub committer) lets the pre-push hook and
-  `publish` admit a new bot commit on top, with the policy unchanged; the same test fails on 0.1.28.
-- On the same repository, a commit on the candidate's own line that is not on the published default
-  branch and is not the bot's own commit (a person as author; or GitHub as committer with one parent)
-  is refused, and the refusal line names that commit's id. The same holds for such a commit on a side
-  branch merged into the candidate.
-- Setting a local remote-tracking ref of the default branch to the candidate head changes no
-  outcome above: the bound comes only from the authenticated read.
-- Each failed bound condition (no required-check ruleset, a bypass actor, another integration or
-  context, enforcement not active, default branch excluded, a private repository) keeps today's
-  range from the baseline and today's refusal of the spindle shape; one test each.
-- A default ref answering 404 or 409 uses the baseline; any other read failure refuses; a bound
-  object missing locally refuses naming it before any scan; a bound that does not descend from the
-  baseline refuses.
-- A new branch on top of a default branch that holds a secret finding is scanned over exactly the new
-  commit's units (counting scanner).
-- Receipts bind `base`, carry version 2 under domain `b10x.gates.receipt/2`; a 0.1.28 receipt and a
-  receipt for another `base` do not verify; ancestor reuse with an older `base` scans exactly the
-  uncovered commits.
-- `ci` takes its bound from the event: `pull_request.base.sha`, `merge_group.base_sha`, `before` for a
-  push of the default branch (the baseline when it is zero or cannot be fetched), the fetched default
-  ref for any other push, tag or dispatch.
-- `audit --history` reports an inadmissible author and a finding in commits on the default branch
-  after the baseline, writes them to the protected report and exits 0.
-- Every new guard test fails when its guard is removed; mutation evidence recorded.
-- `README.md` (lines 19, 23, 49, 57, 83) and `CHANGELOG.md` say what the range is now.
-- `cargo test --locked`, `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D
-  warnings`.
+- **Spindle case.** On a fake API where the default branch qualifies (rulesets, a check run from
+  the canonical caller at a trusted pin, push of the default branch, success), the default branch
+  holds the spindle shape, and the policy is unchanged:
+  - pre-push and `publish` admit a new bot commit on top;
+  - the same test fails on 0.1.28.
+- **Refused by id.**
+  - A commit on the candidate's line, not under `B` and not the bot's own, is refused. The line names
+    its id. Two cases: a person as author, and a GitHub-committed single parent.
+  - A bot merge of a side branch carrying such a commit is refused naming it.
+- **No local ref decides.** Setting the local remote-tracking ref of the default branch to the
+  candidate head changes no outcome.
+- **Baseline selected, with today's refusal of the spindle shape, one test each:**
+  - no required common check;
+  - `bypass_actors` absent;
+  - a bypass actor present;
+  - another integration or context;
+  - an include or exclude pattern that leaves the default branch out;
+  - two rulesets with the same check where only the one carrying the check has a bypass;
+  - a check run with that name from another workflow path;
+  - a check run from another app;
+  - a pin not on the trusted list;
+  - two referenced workflows;
+  - a caller with a second job, another job id, a `with:` or a `secrets:` value that is not
+    `${{ secrets.<same name> }}`;
+  - only a tag or merge-group run succeeded;
+  - a tag named like the default branch;
+  - a private repository;
+  - a 404, 409, 403 or 5xx on any read;
+  - a trusted list missing or empty;
+  - no App credential for `check`.
+- **The reason line.** On fallback, the session sees exactly one line `b10x-gates: bound=baseline for
+  <owner>/<repo>: <reason>`. For an untrusted pin it names the pin to move and the newest trusted id.
+- **Pending tip.** With the tip's run pending and its parent qualified, `B` is the parent, and the
+  commits between are proved as today.
+- **Fetching `B`.** When `B` is absent locally, it is fetched by id. A failed fetch selects the
+  baseline. Neither writes a ref.
+- **Rewritten branch.** A default branch rewritten past the baseline selects the baseline, and does
+  not refuse every push.
+- **Second read.** A rewind between the first and second read of the tip repeats the walk with the
+  baseline.
+- **Receipts.** Receipts carry version 2, domain `b10x.gates.receipt/2` and `base`.
+  - A receipt whose `base` is an ancestor of the current bound and descends from the baseline is
+    accepted after a full rebuild with its own `base`. `publish` after the default branch moved keeps
+    the `check` receipt.
+  - A 0.1.28 receipt does not verify.
+  - A version 2 payload signed under domain 1 does not verify.
+  - Ancestor reuse scans exactly the uncovered commits.
+- **Read count.** On a qualifying repository, one push makes at most 6 + 3 × (candidates walked) API
+  reads, counted in a test.
+- **Documentation.** `README.md` (lines 19, 23, 49, 57, 83, and the release procedure: adding a
+  Gates commit to the trusted list) and `CHANGELOG.md` say what the range is now.
+- **Gates.** Mutation evidence is recorded for every guard. `cargo test --locked`, `cargo fmt --all
+  --check` and `cargo clippy --all-targets --locked -- -D warnings` pass.
 
 ## Out of Scope
 
-- Editing the trusted policy, moving any baseline, adding or changing rulesets.
-- Re-scanning or rewriting history already on any default branch.
-- Units of a merge commit computed against more than its first parent.
-- Moving consumers' `common.yml` pins; that follows the release.
+- Editing the trusted policy or the trusted list (the owner's), and moving any baseline.
+- `ci` changes (`story:ci-committer-pr-bound`), the scheduled audit
+  (`story:history-audit-schedule`), and consumer pins (`story:consumer-pins-trusted`).
 
 ## Open Questions
 
-- Q1 of `design:push-range`: what repositories without both rulesets get. Default A: today's range.
+- Q2 and Q3 of `design:push-range`: the App's secrets permission, and its installation on the policy
+  repository.
