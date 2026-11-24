@@ -3280,6 +3280,13 @@ impl Fixture {
             self.verify().expect_err(&format!("{what} admitted"))
         )
     }
+
+    /// The refusal as `main` prints it: the outermost message only, without its causes.
+    fn printed_refusal(&self, what: &str) -> String {
+        self.verify()
+            .expect_err(&format!("{what} admitted"))
+            .to_string()
+    }
 }
 
 #[test]
@@ -4658,9 +4665,13 @@ fn a_partial_clone_names_the_merge_that_fetches_the_blobs_a_squash_needs() {
         !present(f.dir.path(), &lines),
         "fixture clone must lack the blobs the merge reads"
     );
-    let error = f.refusal("a squash whose merge reads blobs a partial clone lacks");
+    let error = f.printed_refusal("a squash whose merge reads blobs a partial clone lacks");
     assert!(
-        error.contains("in a partial clone"),
+        error.starts_with("Git merge-tree failed (exit 128); "),
+        "the refusal does not lead with Git's failure: {error}"
+    );
+    assert!(
+        error.contains("; if this clone is a partial clone, run `"),
         "the refusal names no remedy: {error}"
     );
     let command = named_command(&error);
@@ -4726,9 +4737,13 @@ fn a_partial_clone_names_the_merge_that_fetches_the_blobs_a_two_parent_merge_nee
     );
 
     let _source = f.move_to_blobless_clone(&inputs.head);
-    let error = f.refusal("a merge that reads blobs a partial clone lacks");
+    let error = f.printed_refusal("a merge that reads blobs a partial clone lacks");
     assert!(
-        error.contains("in a partial clone"),
+        error.starts_with("Git merge-tree failed (exit 128); "),
+        "the refusal does not lead with Git's failure: {error}"
+    );
+    assert!(
+        error.contains("; if this clone is a partial clone, run `"),
         "the refusal names no remedy: {error}"
     );
     let command = named_command(&error);
@@ -4757,4 +4772,187 @@ fn a_private_squash_onto_a_default_branch_that_moved_still_refuses() {
     privatize(&mut f.api.responses);
     let error = f.refusal("a private squash onto a moved base");
     assert!(error.contains("only two-parent"), "{error}");
+}
+
+// Files of the local store that Git reads in place of commit objects. Each case hides a
+// person's commit from the ancestry walk with one such file and expects the refusal the honest
+// store gets.
+
+/// Where chunk `id` starts in a commit-graph or multi-pack-index file whose chunk table starts
+/// at `table`.
+fn chunk(file: &[u8], table: usize, id: &[u8; 4]) -> usize {
+    (0..usize::from(file[6]))
+        .map(|i| table + 12 * i)
+        .find(|at| &file[*at..*at + 4] == id)
+        .map(|at| u64::from_be_bytes(file[at + 4..at + 12].try_into().unwrap()) as usize)
+        .expect("fixture: chunk")
+}
+
+/// The position of `oid` in the sorted object list both file formats hold.
+fn listed(file: &[u8], table: usize, oid: &str) -> usize {
+    let (fanout, list) = (chunk(file, table, b"OIDF"), chunk(file, table, b"OIDL"));
+    let count =
+        u32::from_be_bytes(file[fanout + 255 * 4..fanout + 256 * 4].try_into().unwrap()) as usize;
+    let raw = hex::decode(oid).unwrap();
+    (0..count)
+        .find(|i| file[list + 20 * i..list + 20 * i + 20] == raw[..])
+        .expect("fixture: object listed")
+}
+
+/// Rewrite a store file in place; its trailing checksum stays as Git wrote it.
+fn rewrite(path: &Path, change: impl FnOnce(&mut Vec<u8>)) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut bytes = std::fs::read(path).unwrap();
+    change(&mut bytes);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// In the commit-graph file at `path`, name `parent` as the first parent of `commit`.
+fn forge_first_parent(path: &Path, commit: &str, parent: &str) {
+    rewrite(path, |graph| {
+        assert_eq!(&graph[..4], b"CGPH", "fixture: commit-graph header");
+        let entry = chunk(graph, 8, b"CDAT") + 36 * listed(graph, 8, commit);
+        let parent = u32::try_from(listed(graph, 8, parent)).unwrap();
+        graph[entry + 20..entry + 24].copy_from_slice(&parent.to_be_bytes());
+    });
+}
+
+/// A person's commit on the fixture's merge, a bot commit on that, and the candidate on top.
+struct PersonBelow {
+    f: Fixture,
+    person: String,
+    between: String,
+    /// The refusal the honest store gets.
+    honest: String,
+}
+
+impl PersonBelow {
+    fn new() -> Self {
+        let mut f = Fixture::new();
+        let root = f.dir.path().to_path_buf();
+        let person = git(
+            &root,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            format!(
+                "tree {}\nparent {}\nauthor Person <person@example.invalid> 1700000000 +0000\n\
+                 committer Person <person@example.invalid> 1700000000 +0000\n\nperson\n",
+                f.tree, f.merge
+            )
+            .as_bytes(),
+        );
+        let between = commit(&root, &f.tree, &[&person], false, "between");
+        f.candidate = commit(&root, &f.tree, &[&between], false, "candidate");
+        git(&root, &["update-ref", "refs/heads/main", &f.candidate], b"");
+        let honest = f.refusal("control: a person's commit");
+        Self {
+            f,
+            person,
+            between,
+            honest,
+        }
+    }
+
+    /// The store must hide the person's commit from Git's own walk, and the gate must refuse
+    /// as it refused the honest store.
+    fn assert_still_refused(&self, by: &str) {
+        let walked = git(
+            self.f.dir.path(),
+            &[
+                "rev-list",
+                &format!("{}..{}", self.f.baseline, self.f.candidate),
+            ],
+            b"",
+        );
+        assert!(
+            !walked.contains(&self.person),
+            "fixture: {by} must hide the person's commit from rev-list"
+        );
+        assert_eq!(
+            self.f.refusal(&format!("a person's commit hidden by {by}")),
+            self.honest
+        );
+    }
+}
+
+#[test]
+fn a_forged_split_commit_graph_cannot_hide_a_person_commit_from_the_walk() {
+    // `objects/info/commit-graphs/` holds a chain of layer files in the single file's format.
+    // Git checks neither a layer's checksum nor that its name is its checksum when it reads one.
+    let p = PersonBelow::new();
+    let root = p.f.dir.path();
+    git(
+        root,
+        &[
+            "commit-graph",
+            "write",
+            "--split",
+            "--stdin-commits",
+            "--no-progress",
+        ],
+        format!("{}\n", p.f.candidate).as_bytes(),
+    );
+    let layer = std::fs::read_dir(root.join(".git/objects/info/commit-graphs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "graph"))
+        .expect("fixture: one layer of the chain");
+    forge_first_parent(&layer, &p.between, &p.f.merge);
+    p.assert_still_refused("a forged split commit-graph");
+}
+
+#[test]
+fn a_forged_commit_graph_in_an_alternate_store_cannot_hide_a_person_commit_from_the_walk() {
+    // Git reads the commit-graph of every object directory `objects/info/alternates` names.
+    let mut p = PersonBelow::new();
+    let source = p.f.dir.path().to_path_buf();
+    git(
+        &source,
+        &["commit-graph", "write", "--stdin-commits", "--no-progress"],
+        format!("{}\n", p.f.candidate).as_bytes(),
+    );
+    forge_first_parent(
+        &source.join(".git/objects/info/commit-graph"),
+        &p.between,
+        &p.f.merge,
+    );
+    let borrower = tempfile::tempdir().unwrap();
+    git(
+        borrower.path(),
+        &["init", "-q", "--initial-branch=main", "--template="],
+        b"",
+    );
+    let info = borrower.path().join(".git/objects/info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(
+        info.join("alternates"),
+        format!("{}\n", source.join(".git/objects").display()),
+    )
+    .unwrap();
+    let _source = std::mem::replace(&mut p.f.dir, borrower);
+    p.assert_still_refused("a forged commit-graph in an alternate store");
+}
+
+#[test]
+fn a_forged_multi_pack_index_cannot_hide_a_person_commit_from_the_walk() {
+    // The multi-pack-index says where in which pack an object's bytes lie. With the offsets of
+    // two commits swapped, Git reads `between` as a bot commit whose parent is the merge.
+    let p = PersonBelow::new();
+    let root = p.f.dir.path();
+    let donor = commit(root, &p.f.tree, &[&p.f.merge], false, "donor");
+    git(root, &["update-ref", "refs/heads/donor", &donor], b"");
+    git(root, &["repack", "-adq"], b"");
+    git(root, &["multi-pack-index", "write", "--no-progress"], b"");
+    rewrite(&root.join(".git/objects/pack/multi-pack-index"), |index| {
+        assert_eq!(&index[..4], b"MIDX", "fixture: multi-pack-index header");
+        let offsets = chunk(index, 12, b"OOFF");
+        let (one, two) = (
+            offsets + 8 * listed(index, 12, &p.between),
+            offsets + 8 * listed(index, 12, &donor),
+        );
+        for i in 0..8 {
+            index.swap(one + i, two + i);
+        }
+    });
+    p.assert_still_refused("a forged multi-pack-index");
 }

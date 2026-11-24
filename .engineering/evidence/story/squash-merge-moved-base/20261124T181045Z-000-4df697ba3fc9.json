@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-24T18:10:45Z",
+  "actor": "human:timo",
+  "artifact": "story:squash-merge-moved-base",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked: published_merge 171 passed, adversary_published_merge 30 passed, lib 16 passed; fmt and clippy exit 0"
+  }
+}

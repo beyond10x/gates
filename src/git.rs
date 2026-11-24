@@ -537,11 +537,34 @@ impl Git {
         })
     }
 
+    /// Git on this repository, answering from the objects themselves.
+    ///
+    /// Some files of the local store stand in for commit objects: Git takes a commit's parents
+    /// from them and does not open the commit. `new` refuses two of them, grafts and shallow
+    /// files. The others are switched off here, for every call:
+    ///
+    /// - replace refs (`--no-replace-objects`);
+    /// - the commit-graph, as the single file `objects/info/commit-graph`, as a chain under
+    ///   `objects/info/commit-graphs/`, and as either of them in a store that
+    ///   `objects/info/alternates` names (`core.commitGraph=false`). Git reads parents from it
+    ///   in `rev-list`, `merge-base` and `merge-tree`, and does not check the file's checksum
+    ///   when it reads it. An entry that names another first parent takes a commit out of the
+    ///   ancestry walk and turns "is an ancestor" into "no".
+    ///
+    /// The multi-pack-index is switched off too (`core.multiPackIndex=false`). It holds no
+    /// history: it says where in which pack an object's bytes lie, and with two offsets swapped
+    /// Git reads one commit as another. Each pack's own index answers the same question, so
+    /// nothing is lost. This closes that one file and not the class: an object whose bytes are
+    /// not its own, in a pack index or as a loose file, is not found by the walk.
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.root)
             .arg("--no-replace-objects")
             .args([
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
@@ -698,18 +721,20 @@ impl Git {
             Some(1) => false,
             _ => {
                 let refusal = self.refusal(&args, output.status);
-                // An input commit the store lacks has its own remedy in `refusal`. Otherwise the
-                // usual cause is a partial clone: a content merge reads blobs the clone left
-                // out, and nothing is fetched here. Git's own merge, run once by hand, fetches
-                // exactly those.
+                // An input commit the store lacks has its own remedy in `refusal`. Otherwise one
+                // cause is a partial clone: a content merge reads blobs the clone left out, and
+                // nothing is fetched here. Git's own merge, run once by hand, fetches exactly
+                // those. It is one message, Git's failure first: only the outermost message of
+                // an error is printed, and a clone that is not partial must still read what
+                // failed.
                 return Err(if self.missing(&args).is_some() {
                     refusal
                 } else {
-                    refusal.context(format!(
-                        "local merge of {first} and {second} failed; in a partial clone, run \
-                         `git merge-tree --write-tree {first} {second}` once, which lets Git \
-                         fetch the blobs the merge reads, and retry"
-                    ))
+                    anyhow::anyhow!(
+                        "{refusal}; if this clone is a partial clone, run `git merge-tree \
+                         --write-tree {first} {second}` once, which lets Git fetch the blobs the \
+                         merge reads, and retry"
+                    )
                 });
             }
         };

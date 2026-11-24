@@ -548,7 +548,9 @@ const KEPT: (&str, &[u8]) = ("kept", b"as recorded\n");
 const SECOND: (&str, &[u8]) = ("second", b"landed while the pull request was open\n");
 const ADDED: (&str, &[u8]) = ("added", b"pull request 7\n");
 const UNREVIEWED: (&str, &[u8]) = ("unreviewed", b"in neither input\n");
-/// Git's merge options as `Git::merge_tree` pins them.
+/// Four of the five merge options `Git::merge_tree` pins: all but `merge.renameLimit`, which the
+/// fixtures leave to the repository's config so that they can compute the tree a steered rename
+/// limit produces.
 const PINS: [&str; 8] = [
     "-c",
     "merge.directoryRenames=conflict",
@@ -594,7 +596,8 @@ fn raw_tree(root: &Path, entries: &[String]) -> String {
     git(root, &["mktree"], entries.concat().as_bytes())
 }
 
-/// Git's merge of two commits with the pins `Git::merge_tree` uses and the repository's own config.
+/// Git's merge of two commits with `PINS` and the repository's own config, so a rename limit the
+/// repository sets is read here, unlike in `Git::merge_tree`.
 fn merge_tree(root: &Path, first: &str, second: &str) -> (String, bool) {
     let output = Command::new("git")
         .args(["--no-replace-objects"])
@@ -1241,5 +1244,264 @@ fn adversary_squash_head_commits_are_not_walked_on_a_public_repository() {
     assert!(
         results.iter().all(|r| r.is_err()),
         "private squash admitted"
+    );
+}
+
+// Round 2: the guards added after the first pass (`Git::is_ancestor`, `ensure_merge_input` for
+// the head, the base commit check, the `merge.renameLimit` pin, the partial-clone remedy and the
+// named fetch).
+
+/// Writes a commit-graph file for the history of `tips`, as `git gc` or `git commit-graph write`
+/// leaves one in a clone, and then rewrites the entry of `commit`: its root tree to `tree`, its
+/// first parent to `parent`. The file's trailing checksum is left as Git wrote it.
+fn forge_commit_graph(
+    root: &Path,
+    tips: &[&str],
+    commit: &str,
+    tree: Option<&str>,
+    parent: Option<&str>,
+) {
+    let tips = format!("{}\n", tips.join("\n"));
+    git(
+        root,
+        &["commit-graph", "write", "--stdin-commits", "--no-progress"],
+        tips.as_bytes(),
+    );
+    let path = root.join(".git/objects/info/commit-graph");
+    let mut graph = std::fs::read(&path).unwrap();
+    assert_eq!(&graph[..4], b"CGPH", "fixture: commit-graph header");
+    let chunk = |id: &[u8; 4]| -> usize {
+        (0..usize::from(graph[6]))
+            .map(|i| 8 + 12 * i)
+            .find(|at| &graph[*at..*at + 4] == id)
+            .map(|at| u64::from_be_bytes(graph[at + 4..at + 12].try_into().unwrap()) as usize)
+            .expect("fixture: commit-graph chunk")
+    };
+    let (fanout, list, data) = (chunk(b"OIDF"), chunk(b"OIDL"), chunk(b"CDAT"));
+    let count = u32::from_be_bytes(
+        graph[fanout + 255 * 4..fanout + 256 * 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let position = |oid: &str| -> usize {
+        let raw = hex::decode(oid).unwrap();
+        (0..count)
+            .find(|i| graph[list + 20 * i..list + 20 * i + 20] == raw[..])
+            .expect("fixture: commit in the commit-graph")
+    };
+    let entry = data + 36 * position(commit);
+    let parent = parent.map(position);
+    if let Some(tree) = tree {
+        graph[entry..entry + 20].copy_from_slice(&hex::decode(tree).unwrap());
+    }
+    if let Some(parent) = parent {
+        graph[entry + 20..entry + 24]
+            .copy_from_slice(&u32::try_from(parent).unwrap().to_be_bytes());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&path, graph).unwrap();
+}
+
+#[test]
+fn adversary_squash_commit_graph_cannot_hide_that_the_head_contains_the_squash() {
+    // B1: the recorded head is two commits above the squash and holds the squash's extra file.
+    // A commit-graph entry that names the recorded base as the first parent of the commit between
+    // them makes `merge-base --is-ancestor <squash> <head>` answer 1 ("no"), and the merge base of
+    // parent and head becomes the recorded base, so the local merge is the tampered tree. The
+    // commit-graph is a file in the local store, like the grafts and shallow files `Git::new`
+    // refuses; Git reads parents from it instead of from the commit objects.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    let between = commit(&root, &tampered, &[&s.squash], &bot(), "between");
+    let head = commit(&root, &tampered, &[&between], &bot(), "above the squash");
+    s.record("/head/sha", json!(head));
+    assert!(!s.admitted(), "control: a head above the squash refused");
+    forge_commit_graph(
+        &root,
+        &[&s.f.candidate, &head],
+        &between,
+        None,
+        Some(&s.recorded),
+    );
+    let (merged, clean) = merge_tree(&root, &s.parent, &head);
+    assert!(
+        clean && merged == tampered,
+        "fixture: the commit-graph must make the local merge the tampered tree"
+    );
+    assert!(
+        !s.admitted(),
+        "a forged commit-graph hid that the head contains its own squash"
+    );
+}
+
+#[test]
+fn adversary_commit_graph_cannot_hide_a_person_commit_from_the_ancestry_walk() {
+    // Same file, the walk itself: `rev-list baseline..head` reads parents from the commit-graph,
+    // so an entry that skips a person's commit removes it from the walk, and nothing else in
+    // `published_merge::verify` reads that commit. No squash is involved.
+    let mut fixture = Fixture::new();
+    let root = fixture.directory.path().to_path_buf();
+    let person = commit(
+        &root,
+        &fixture.tree,
+        &[&fixture.merge],
+        "Person <person@example.invalid>",
+        "person",
+    );
+    let between = commit(&root, &fixture.tree, &[&person], &bot(), "between");
+    fixture.candidate = commit(&root, &fixture.tree, &[&between], &bot(), "candidate");
+    for result in fixture.verify() {
+        assert!(result.is_err(), "control: a person's commit admitted");
+    }
+    forge_commit_graph(
+        &root,
+        &[&fixture.candidate],
+        &between,
+        None,
+        Some(&fixture.merge),
+    );
+    let listed = git(
+        &root,
+        &[
+            "rev-list",
+            &format!("{}..{}", fixture.baseline, fixture.candidate),
+        ],
+        b"",
+    );
+    assert!(
+        !listed.contains(&person),
+        "fixture: the commit-graph must hide the person's commit from rev-list"
+    );
+    for result in fixture.verify() {
+        assert!(
+            result.is_err(),
+            "a forged commit-graph hid a person's commit from the walk"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_commit_graph_tree_of_the_head_is_not_what_merge_tree_reads() {
+    // B2, held: the commit-graph also stores each commit's root tree. With the head's entry naming
+    // a tree that holds the extra file, `merge-tree` still reads the head's tree from the head's
+    // own (hash-checked) object, because it resolves its two arguments with `parse_object`; the
+    // squash refuses.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let extra = s.files(&[KEPT, ADDED, UNREVIEWED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    let head = s.head.clone();
+    forge_commit_graph(&root, &[&s.f.candidate, &head], &head, Some(&extra), None);
+    let error = s.refusal("a head whose commit-graph entry names another tree");
+    assert!(
+        error.contains("squash tree is not the local merge"),
+        "{error}"
+    );
+}
+
+#[test]
+fn adversary_squash_forged_head_commit_object_refuses() {
+    // B2: the head's loose commit object holds another commit's bytes (one whose tree is the
+    // tampered squash tree). `cat-file -t` reads only its header and answers "commit";
+    // `ensure_merge_input` peels the head with a hash check and refuses.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    let donor = commit(&root, &tampered, &[&s.recorded], &bot(), "donor");
+    let object = |oid: &str| root.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(object(&s.head), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::copy(object(&donor), object(&s.head)).unwrap();
+    assert_eq!(
+        git(&root, &["cat-file", "-t", &s.head], b""),
+        "commit",
+        "fixture: the forged object must still read as a commit"
+    );
+    let error = s.refusal("a forged head commit object");
+    assert!(error.contains("Git rev-parse failed"), "{error}");
+}
+
+#[test]
+fn adversary_squash_rename_limit_from_included_config_cannot_lift_the_pin() {
+    // B4, held: `merge.renameLimit=1` reached through `include.path` and through `includeIf`
+    // in the repository's config. The `-c` pin wins over both.
+    let a = lines(1..=40, "");
+    let b = lines(101..=140, "");
+    let (a1, b1) = (lines(1..=40, "head\n"), lines(101..=140, "head\n"));
+    let (a2, b2) = (lines(1..=40, "base\n"), lines(101..=140, "base\n"));
+    for conditional in [false, true] {
+        let mut s = Squash::new(
+            &[("a", a.as_slice()), ("b", b.as_slice())],
+            &[("a2", a2.as_slice()), ("b2", b2.as_slice())],
+            &[("a1", a1.as_slice()), ("b1", b1.as_slice())],
+        );
+        let root = s.root().to_path_buf();
+        std::fs::write(
+            root.join(".git/extra.config"),
+            "[merge]\n\trenameLimit = 1\n",
+        )
+        .unwrap();
+        let key = if conditional {
+            format!("includeIf.gitdir:{}/.git.path", root.display())
+        } else {
+            "include.path".to_owned()
+        };
+        git(&root, &["config", &key, "extra.config"], b"");
+        let (steered, clean) = merge_tree(&root, &s.parent, &s.head);
+        assert!(
+            clean,
+            "fixture: the included limit must make the merge clean"
+        );
+        let parent = s.parent.clone();
+        s.land(&parent, &steered);
+        let error = s.refusal("an included rename limit");
+        assert!(
+            error.contains("conflicts"),
+            "conditional: {conditional}: {error}"
+        );
+    }
+}
+
+#[test]
+fn adversary_squash_hand_made_pull_ref_does_not_change_the_verdict() {
+    // B6, held: a local `refs/pull/7/head` created by hand and pointing at a commit that holds the
+    // squash's extra file. The gate reads the head from the record, so the ref changes nothing:
+    // an absent head still refuses and names the fetch, a real squash is still admitted, and a
+    // tampered squash still refuses.
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let decoy = commit(&root, &tampered, &[&s.recorded], &bot(), "decoy");
+    git(&root, &["update-ref", "refs/pull/7/head", &decoy], b"");
+    s.land_merge();
+    assert!(s.admitted(), "a real squash refused beside a decoy ref");
+    s.record(
+        "/head/sha",
+        json!("0123456789abcdef0123456789abcdef01234567"),
+    );
+    let error = s.refusal("an absent head beside a decoy ref");
+    assert!(
+        error.contains("is not in the local object store"),
+        "{error}"
+    );
+    let mut s = Squash::moved();
+    let root = s.root().to_path_buf();
+    let tampered = s.files(&[KEPT, SECOND, ADDED, UNREVIEWED]);
+    let decoy = commit(&root, &tampered, &[&s.recorded], &bot(), "decoy");
+    git(&root, &["update-ref", "refs/pull/7/head", &decoy], b"");
+    let parent = s.parent.clone();
+    s.land(&parent, &tampered);
+    let error = s.refusal("a tampered squash beside a decoy ref");
+    assert!(
+        error.contains("squash tree is not the local merge"),
+        "{error}"
     );
 }

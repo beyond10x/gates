@@ -28,9 +28,23 @@
   `merge.renameLimit` pinned to Git's default of 7000. Before, `merge.renameLimit=1` or
   `diff.renameLimit=1` in the repository's configuration skipped rename detection, and a merge
   in which both sides renamed the same file to different names was computed as clean.
-- When Git cannot compute a local merge at all, the refusal names both commits and the command
-  that helps in a partial clone: `git merge-tree --write-tree <first> <second>`, run once, lets
-  Git fetch the blobs the merge reads. Before, it said only "Git merge-tree failed (exit 128)".
+- When Git cannot compute a local merge at all, the refusal is one message: Git's failure with
+  its exit status, then the command that helps if the clone is a partial clone,
+  `git merge-tree --write-tree <first> <second>` with both commits, which run once lets Git
+  fetch the blobs the merge reads. Before, it said only "Git merge-tree failed (exit 128)".
+- Every Git call the checks read a repository through now runs with `core.commitGraph=false`.
+  This covers the ancestry walk of every delivery, not only squashes. The bot's own Git
+  (`b10x-gates bot --`) and `policy publish` are unchanged. Git reads a commit's parents from
+  a commit-graph file in the local store (`objects/info/commit-graph`, a chain under
+  `objects/info/commit-graphs/`, or either in a store named by `objects/info/alternates`) in
+  place of the commit, and does not check the file's checksum. Before, a forged one hid a
+  commit from the walk, so a person's commit below a bot commit was admitted, and made "is the
+  squash in the head's history" answer no. The file joins grafts, shallow files and replace
+  refs, which were already refused or switched off.
+- The same calls also run with `core.multiPackIndex=false`. With two offsets swapped in a
+  `multi-pack-index` file Git read one commit as another, with the same effect on the walk.
+  The packs' own indexes are used instead. An object whose bytes are not its own in a pack
+  index or as a loose file is still not found by the walk.
 
 ## 0.1.28 — 2026-11-24
 
