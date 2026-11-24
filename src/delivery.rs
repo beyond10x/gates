@@ -21,12 +21,27 @@ use std::{
 };
 
 pub struct Github {
-    client: Client,
+    /// Sends GET and HEAD. A connection not made within `CONNECT_TIMEOUT` fails, and a GET
+    /// that failed so is sent again (`send_once_or_retried`).
+    reads: Client,
+    /// Sends every write, with no connect timeout of its own, as before reads had one.
+    writes: Client,
     token: String,
     /// Every request goes to this origin and only to it: `https://api.github.com`, or a
     /// test's loopback server (`for_loopback_test`).
     base: Url,
+    /// How a GET waits before it is sent again: `std::thread::sleep`, or not at all for a
+    /// loopback test, which counts the sends instead.
+    pause: fn(Duration),
 }
+
+/// How long a read waits for its connection to GitHub.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one send may take, connection and body included. It bounds each redirect hop on
+/// its own, so one GET through `api_response` can take up to
+/// `GET_ATTEMPTS * (REDIRECT_LIMIT + 1) * REQUEST_TIMEOUT` plus the backoff waits between
+/// attempts (`GET_BACKOFF`, doubling). No caller sets a deadline for the whole.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl AuthenticatedRead for Github {
     fn get(&self, path: &str) -> Result<Value> {
@@ -649,32 +664,44 @@ impl Github {
         Self::client(
             token,
             Url::parse("https://api.github.com")?,
-            Client::builder().https_only(true),
+            || Client::builder().https_only(true),
+            std::thread::sleep,
         )
     }
 
     /// `from_token` against a plain-HTTP server on `127.0.0.1:<port>`, for a test that
     /// answers as GitHub. Only a test reaches it: no command-line flag or environment
-    /// variable names a base URL.
+    /// variable names a base URL. A GET it sends again does not wait first.
     #[doc(hidden)]
     pub fn for_loopback_test(token: String, port: u16) -> Result<Self> {
         Self::client(
             token,
             Url::parse(&format!("http://127.0.0.1:{port}"))?,
-            Client::builder().no_proxy(),
+            || Client::builder().no_proxy(),
+            |_| {},
         )
     }
 
-    fn client(token: String, base: Url, builder: reqwest::blocking::ClientBuilder) -> Result<Self> {
+    fn client(
+        token: String,
+        base: Url,
+        builder: fn() -> reqwest::blocking::ClientBuilder,
+        pause: fn(Duration),
+    ) -> Result<Self> {
         ensure!(!token.is_empty(), "GitHub token unavailable");
-        Ok(Self {
-            client: builder
+        let build = |builder: reqwest::blocking::ClientBuilder| {
+            builder
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(60))
+                .timeout(REQUEST_TIMEOUT)
                 .user_agent("b10x-gates")
-                .build()?,
+                .build()
+        };
+        Ok(Self {
+            reads: build(builder().connect_timeout(CONNECT_TIMEOUT))?,
+            writes: build(builder())?,
             token,
             base,
+            pause,
         })
     }
 
@@ -745,7 +772,8 @@ impl Github {
     /// `api` with the success status. A non-2xx answer is an `ApiFailure`, whose
     /// text is the status alone until `ApiFailure::render` has the matchers, except a
     /// redirect `send` does not follow, which is refused naming its status. A GET that
-    /// GitHub answers with a server error is sent again, see `send_once_or_retried`.
+    /// GitHub answers with a server error, or that gets no answer at all, is sent again, see
+    /// `send_once_or_retried`.
     pub fn api_response(
         &self,
         method: Method,
@@ -753,7 +781,7 @@ impl Github {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         ensure!(api_path_admitted(path), "invalid GitHub API path");
-        send_once_or_retried(&method, std::thread::sleep, || {
+        send_once_or_retried(&method, self.pause, || {
             self.send(method.clone(), path, body)
         })
     }
@@ -771,9 +799,13 @@ impl Github {
     ) -> Result<(StatusCode, Value)> {
         let mut url = format!("{}{path}", self.base.origin().ascii_serialization());
         let mut followed = 0;
+        let client = if is_read(&method) {
+            &self.reads
+        } else {
+            &self.writes
+        };
         let response = loop {
-            let mut request = self
-                .client
+            let mut request = client
                 .request(method.clone(), &url)
                 .bearer_auth(&self.token)
                 .header("Accept", "application/vnd.github+json")
@@ -781,8 +813,14 @@ impl Github {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().map_err(|_| {
-                anyhow::anyhow!("GitHub request failed; sensitive response withheld")
+            let response = request.send().map_err(|error| {
+                // A request that cannot be built (a token that is no valid header value) was
+                // never sent, and sending it again cannot change that.
+                if error.is_builder() {
+                    anyhow::anyhow!("GitHub request not sent: it could not be built")
+                } else {
+                    TransportFailure::of(&error)
+                }
             })?;
             let status = response.status();
             if status.is_redirection() && !is_read(&method) {
@@ -814,8 +852,15 @@ impl Github {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok());
             return Err(ApiFailure::new(status, body).into());
         }
-        // A body that cannot be read after a 2xx is the same as an empty one.
-        let bytes = response.bytes().unwrap_or_default();
+        let bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            // A GET whose answer is cut off got no whole answer: it fails like one that got
+            // none, and is sent again (`retry_server_errors`).
+            Err(error) if method == Method::GET => return Err(TransportFailure::of(&error)),
+            // A write's answer that cannot be read is the same as an empty one: the write
+            // happened, and is never sent again.
+            Err(_) => Default::default(),
+        };
         success_body(status, &bytes).map(|value| (status, value))
     }
 
@@ -1153,7 +1198,8 @@ const GET_ATTEMPTS: u32 = 5;
 const GET_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Send a request of `method`: a GET through `retry_server_errors`, any other method once.
-/// A write that failed with a 5xx may still have happened, so it is never sent again.
+/// A write that failed with a 5xx or got no answer may still have happened, so it is never
+/// sent again.
 fn send_once_or_retried<T>(
     method: &Method,
     sleep: impl FnMut(Duration),
@@ -1165,9 +1211,10 @@ fn send_once_or_retried<T>(
     send()
 }
 
-/// Send again while the answer is a 5xx `ApiFailure`, at most `GET_ATTEMPTS` times, and return
-/// the last answer. Any other answer or error returns at once. Only GETs come here: a write
-/// that failed with a 5xx may still have happened.
+/// Send again while the answer is a 5xx `ApiFailure` or there is no answer at all (a
+/// `TransportFailure`), at most `GET_ATTEMPTS` times, and return the last answer. Any other
+/// answer or error returns at once. Only GETs come here: a write that failed so may still
+/// have happened.
 fn retry_server_errors<T>(
     mut sleep: impl FnMut(Duration),
     mut send: impl FnMut() -> Result<T>,
@@ -1175,7 +1222,7 @@ fn retry_server_errors<T>(
     let mut delay = GET_BACKOFF;
     for _ in 1..GET_ATTEMPTS {
         match send() {
-            Err(error) if is_server_error(&error) => {
+            Err(error) if is_server_error(&error) || is_transport_failure(&error) => {
                 sleep(delay);
                 delay *= 2;
             }
@@ -1184,6 +1231,91 @@ fn retry_server_errors<T>(
     }
     send()
 }
+
+/// Whether the request got no answer from GitHub at all, under any context or cause.
+fn is_transport_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<TransportFailure>().is_some())
+}
+
+/// Why a request got no answer, as far as it can be told without the client's own message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The connection or the whole request ran out of time.
+    Timeout,
+    /// The API host's name did not resolve.
+    Dns,
+    /// No connection could be made, a failed TLS handshake included: reqwest reports that as
+    /// a connect error.
+    Connect,
+    /// The connection failed after it was made: reset, or closed before the whole answer
+    /// arrived (a GET's 2xx body cut off included).
+    Other,
+}
+
+impl Transport {
+    /// The kind of a client error: its timeout and connect flags, and whether a cause below it
+    /// is the connector's name resolution, whose text is exactly `dns error`.
+    fn of(timeout: bool, connect: bool, mut causes: impl Iterator<Item = String>) -> Self {
+        if timeout {
+            Self::Timeout
+        } else if causes.any(|cause| cause == "dns error") {
+            Self::Dns
+        } else if connect {
+            Self::Connect
+        } else {
+            Self::Other
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Dns => "DNS",
+            Self::Connect => "connect",
+            Self::Other => "other",
+        })
+    }
+}
+
+/// A request that got no answer from GitHub. Its text names the kind of failure and nothing
+/// else: the client's own message carries the URL with its query, and a cause below it may
+/// carry what the server sent.
+#[derive(Debug)]
+pub struct TransportFailure {
+    kind: Transport,
+}
+
+impl TransportFailure {
+    fn of(error: &reqwest::Error) -> anyhow::Error {
+        let causes =
+            std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+                .map(ToString::to_string);
+        Self {
+            kind: Transport::of(error.is_timeout(), error.is_connect(), causes),
+        }
+        .into()
+    }
+
+    pub fn kind(&self) -> Transport {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub request failed ({}); sensitive response withheld",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for TransportFailure {}
 
 /// Whether the error is GitHub answering with a 5xx status, under any context or cause.
 pub fn is_server_error(error: &anyhow::Error) -> bool {
@@ -2293,6 +2425,131 @@ mod tests {
             (sends, waits),
             (GET_ATTEMPTS as usize, GET_ATTEMPTS as usize - 1)
         );
+    }
+
+    fn no_answer(kind: Transport) -> anyhow::Error {
+        anyhow::Error::from(TransportFailure { kind }).context("GET /repos/o/r")
+    }
+
+    #[test]
+    fn a_get_without_an_answer_is_sent_again_on_the_same_schedule() {
+        let (result, sends, waits) = run(vec![
+            Err(no_answer(Transport::Other)),
+            Err(no_answer(Transport::Connect)),
+            Err(failure(StatusCode::BAD_GATEWAY)),
+            Ok(7),
+        ]);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(sends, 4);
+        assert_eq!(
+            waits,
+            [500, 1000, 2000].map(Duration::from_millis),
+            "{waits:?}"
+        );
+
+        let answers = (0..GET_ATTEMPTS + 3)
+            .map(|_| Err(no_answer(Transport::Timeout)))
+            .collect();
+        let (result, sends, waits) = run(answers);
+        let error = result.expect_err("a failure that persists must fail");
+        assert!(is_transport_failure(&error) && !is_server_error(&error));
+        assert_eq!(sends, GET_ATTEMPTS as usize);
+        assert_eq!(waits.iter().sum::<Duration>(), Duration::from_millis(7500));
+    }
+
+    #[test]
+    fn a_write_without_an_answer_is_sent_once() {
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::HEAD,
+        ] {
+            let sends = RefCell::new(0);
+            let mut waits = 0;
+            let result: Result<u32> = send_once_or_retried(
+                &method,
+                |_| waits += 1,
+                || {
+                    *sends.borrow_mut() += 1;
+                    Err(no_answer(Transport::Other))
+                },
+            );
+            assert!(is_transport_failure(&result.expect_err("no answer")));
+            assert_eq!((sends.into_inner(), waits), (1, 0), "{method}");
+        }
+    }
+
+    #[test]
+    fn the_kind_of_a_failure_without_an_answer_is_named() {
+        let of = |timeout, connect, causes: &[&str]| {
+            Transport::of(timeout, connect, causes.iter().map(|c| c.to_string()))
+        };
+        assert_eq!(of(true, true, &["dns error"]), Transport::Timeout);
+        assert_eq!(of(false, true, &["dns error", "lookup"]), Transport::Dns);
+        assert_eq!(of(false, false, &["client", "dns error"]), Transport::Dns);
+        assert_eq!(of(false, true, &["tcp connect error"]), Transport::Connect);
+        assert_eq!(
+            of(false, false, &["a dns error elsewhere"]),
+            Transport::Other
+        );
+        assert_eq!(of(false, false, &[]), Transport::Other);
+        for (kind, text) in [
+            (Transport::Timeout, "timeout"),
+            (Transport::Dns, "DNS"),
+            (Transport::Connect, "connect"),
+            (Transport::Other, "other"),
+        ] {
+            assert_eq!(
+                TransportFailure { kind }.to_string(),
+                format!("GitHub request failed ({text}); sensitive response withheld")
+            );
+        }
+    }
+
+    thread_local! {
+        static PAUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counted_pause(_: Duration) {
+        PAUSES.with(|pauses| pauses.set(pauses.get() + 1));
+    }
+
+    /// A token that is no valid header value fails when the request is built, before anything
+    /// is sent: the GET fails at once, without a wait or a second attempt, says it was not sent
+    /// and names neither the token, its header nor the URL.
+    #[test]
+    fn a_get_that_cannot_be_built_fails_at_once_and_names_nothing_it_carries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let github = Github::client(
+            "synthetic\ntoken".into(),
+            Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            || Client::builder().no_proxy(),
+            counted_pause,
+        )
+        .unwrap();
+        PAUSES.with(|pauses| pauses.set(0));
+        let error = github
+            .api_response(Method::GET, "/repos/example/repository", None)
+            .expect_err("a request that cannot be built must fail");
+        let text = format!("{error:#} {error:?}");
+        assert_eq!(
+            PAUSES.with(std::cell::Cell::get),
+            0,
+            "waited before: {text}"
+        );
+        assert!(listener.accept().is_err(), "something was sent: {text}");
+        assert!(!is_transport_failure(&error), "{text}");
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub request not sent: it could not be built"
+        );
+        for carried in ["synthetic", "Bearer", "uthorization", "127.0.0.1", "/repos"] {
+            assert!(!text.contains(carried), "{carried} in {text}");
+        }
     }
 
     #[test]
