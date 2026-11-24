@@ -408,3 +408,128 @@ fn a_read_follows_at_most_ten_redirects() {
         "the first request and ten redirects"
     );
 }
+
+// A request that gets no answer at all: the connection is closed before the answer, refused,
+// reset or timed out. A GET is sent again on the server-error schedule; a write never is. The
+// refusal names the kind of failure and nothing the request carried.
+
+/// Carried in the query of every request that gets no answer; a refusal that shows it shows the URL.
+const QUERY_MARKER: &str = "query-marker";
+
+fn unanswered_path() -> String {
+    format!("{FIRST}?{QUERY_MARKER}=1")
+}
+
+/// A loopback server that reads each request, closes the first `unanswered` connections without
+/// answering, and answers every later one with `{"answered": true}`.
+fn closing_server(unanswered: usize) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Some(request) = read_request(&mut stream) else {
+                continue;
+            };
+            let index = {
+                let mut log = log.lock().unwrap();
+                log.push(request);
+                log.len() - 1
+            };
+            if index < unanswered {
+                drop(stream);
+                continue;
+            }
+            let body = json!({"answered": true}).to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+    });
+    (port, seen)
+}
+
+/// The refusal names `kind` and nothing the request carried: no token, header, query or host.
+fn assert_names_only_the_kind(error: &anyhow::Error, kind: &str) {
+    for text in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+    ] {
+        assert!(
+            text.contains(&format!("GitHub request failed ({kind})")),
+            "{text}"
+        );
+        for carried in [
+            TOKEN,
+            "Bearer",
+            "uthorization",
+            "X-GitHub-Api-Version",
+            QUERY_MARKER,
+            "127.0.0.1",
+            "/repos/",
+        ] {
+            assert!(!text.contains(carried), "{carried} shown: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_get_whose_connection_closes_unanswered_is_sent_again() {
+    let (port, seen) = closing_server(1);
+    let github = Github::for_loopback_test(TOKEN.into(), port).unwrap();
+    let (status, value) = github
+        .api_response(Method::GET, &unanswered_path(), None)
+        .unwrap_or_else(|error| panic!("one unanswered connection refused the GET: {error:#}"));
+    assert_eq!((status, value), (StatusCode::OK, json!({"answered": true})));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen.iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn a_get_that_never_gets_an_answer_is_sent_five_times_and_names_the_kind() {
+    let (port, seen) = closing_server(usize::MAX);
+    let github = Github::for_loopback_test(TOKEN.into(), port).unwrap();
+    let error = github
+        .api_response(Method::GET, &unanswered_path(), None)
+        .expect_err("a GET that never got an answer succeeded");
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    assert_names_only_the_kind(&error, "other");
+}
+
+#[test]
+fn a_write_whose_connection_closes_unanswered_is_sent_once() {
+    for method in WRITES {
+        let (port, seen) = closing_server(1);
+        let github = Github::for_loopback_test(TOKEN.into(), port).unwrap();
+        let error = github
+            .api_response(method.clone(), &unanswered_path(), Some(&json!({})))
+            .expect_err("an unanswered write succeeded");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{method}: {seen:?}");
+        assert_names_only_the_kind(&error, "other");
+    }
+}
+
+#[test]
+fn a_refused_connection_names_the_connect_kind() {
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let github = Github::for_loopback_test(TOKEN.into(), port).unwrap();
+    for (method, body) in [(Method::GET, None), (Method::POST, Some(json!({})))] {
+        let error = github
+            .api_response(method, &unanswered_path(), body.as_ref())
+            .expect_err("a refused connection succeeded");
+        assert_names_only_the_kind(&error, "connect");
+    }
+}
