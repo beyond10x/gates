@@ -7,7 +7,8 @@ title: Every qualifying consumer calls a trusted Gates workflow in canonical sha
 summary: Move the 43 qualifying consumers' shared-gates.yml to the trusted Gates commit in canonical caller shape and record the first qualifying run
 relations:
 - depends_on: story:ci-committer-pr-bound
-revision: 1
+- depends_on: story:api-policy-repository-writes
+revision: 2
 ---
 # Story: Every qualifying consumer calls a trusted Gates workflow in canonical shape
 
@@ -18,7 +19,9 @@ Each repository whose default branch carries the bot rulesets and the required c
 canonical caller shape. Its default-branch check can therefore prove `B`, and its pushes stop
 re-judging proved history.
 
-Story 4 of `design:push-range` (revision 2), finding G5.
+Story 4 of `design:push-range` (revision 3), finding G5; the last step of its order of work. It
+starts only after the owner has put the first Gates commit on the trusted list, which waits for
+`story:api-policy-repository-writes`, a green history audit and the owner's answers to Q3 and Q4.
 
 ## Context
 
@@ -42,10 +45,12 @@ So 37 of them run binaries from 0.1.3 to 0.1.24. None of these binaries checks c
 - **The pin moves.** For each of the 43 repositories, a bot pull request moves
   `.github/workflows/shared-gates.yml` to the newest trusted Gates commit. The file keeps the
   canonical shape:
-  - one job `common`, with the trusted `uses:` ref;
+  - one job `common`, whose keys are exactly `uses` and `secrets` (the allowlist of the design's
+    test 3, finding N6);
+  - `uses` is exactly the trusted ref;
   - a `secrets:` map whose only keys are `B10X_GATES_POLICY_GZ` and/or `B10X_GATES_POLICY`, each
     mapped by the same name;
-  - no `with:`, `if:` or `name:`.
+  - no other job key: no `with`, `if`, `name`, `needs`, `strategy`, `concurrency` or `permissions`.
 - **The pull request merges** under the repository's own process.
 - **Evidence it qualifies.** After the merge, the repository's next default-branch push run shows
   `referenced_workflows` at the trusted id, and `b10x-gates` stops printing `bound=baseline` for it.

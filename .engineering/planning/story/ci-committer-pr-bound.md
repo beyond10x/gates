@@ -4,8 +4,8 @@ id: story:ci-committer-pr-bound
 kind: story
 status: draft
 title: ci admits committers exactly and bounds pull requests by the fetched default branch
-summary: Committer admitted only as the exact bot or exact GitHub; every event but a default-branch push bounded by the fetched default branch; default-branch push keeps the baseline range
-revision: 1
+summary: Committer admitted exactly, ahead of receipt reuse; pull requests and other events bounded by the fetched default branch; default-branch push by event.ref on the baseline range with no reuse; range annotation; dispatch head must equal GITHUB_SHA
+revision: 3
 ---
 # Story: `ci` admits committers exactly and bounds pull requests by the fetched default branch
 
@@ -13,21 +13,38 @@ revision: 1
 
 The common check is fit to be trusted on the default branch:
 
-- It refuses a commit whose committer is neither exactly the bot nor exactly GitHub.
-- It judges a pull request, a merge group, a tag and any branch other than the default against the
-  default branch it fetches itself, never against a base the event names.
-- On a push of the default branch it keeps checking everything since the baseline.
+- It refuses a commit whose committer is neither exactly the bot nor exactly GitHub, in admission,
+  before any receipt is reused.
+- It judges a pull request, a merge group, a tag, a dispatch and any branch other than the default
+  against the default branch it fetches itself, never against a base the event names.
+- On a push of the default branch, recognised by `event.ref`, it checks everything since the
+  baseline and never reuses a receipt.
+- Every run writes one range annotation saying what it checked, which `story:push-range` reads.
+- A `workflow_dispatch` cannot give a commit a check it did not earn.
 
-Story 1 of `design:push-range` (revision 2); `story:push-range` builds on it.
+Story 1 of `design:push-range` (revision 3); `story:push-range` builds on it. Releasable alone:
+consumers pin Gates commits, so a release changes nothing until a pin moves.
 
 ## Context
 
-The adversary review of revision 1 (findings G2, G3, G4) showed:
+The first adversary review (G2, G3, G4) showed:
 
 - `ci` has never checked the committer (`src/git.rs:48-62`).
 - A pull-request range bounded by `pull_request.base.sha` lets a commit land under a green check that
   never covered it (stacked pull requests, base changed after the check).
 - Narrowing the default-branch run would stop its green check from covering that branch's history.
+
+The second review (N1, N2, N5, N8, N9) showed:
+
+- a tag named like the default branch yields a run the provenance rule cannot tell from a branch
+  push by the run's own fields;
+- `ci` reuses a receipt whose binding equals the candidate's (`src/main.rs:571-591`), so a receipt
+  signed with the session-readable key could replace the scan on the default-branch push, and with
+  it the committer check;
+- `ci` takes `event.inputs.head` for `workflow_dispatch` (`src/delivery.rs:989`), while the check run
+  attaches to the run's own commit;
+- the design did not say how `ci` recognises a default-branch push;
+- the local gate cannot tell a CI policy that differs from its own.
 
 A read-only count on 2026-11-24 over 2,179 commits since the baselines of six repositories found no
 committer other than exactly the bot or exactly GitHub (design, "G4 on existing history").
@@ -41,6 +58,9 @@ committer other than exactly the bot or exactly GitHub (design, "G4 on existing 
   - A test with the bot email and a person's name is refused.
   - A test with the bot name and a person's email is refused.
   - A spindle-shaped commit (bot author, GitHub committer, one parent) is admitted.
+- **Admission before reuse (N2).** Authorship and committer checks run in admission, ahead of receipt
+  reuse. A test with a valid receipt for a range holding a commit with a person as committer is
+  refused, and the scan count shows the receipt did not skip the check.
 - **Exception.** An exact policy exception for that repository, rule, location and digest admits the
   commit. The same exception with another digest does not.
 - **Pull request bound.** `ci` on `pull_request(_target)` checks `rev-list <head> --not <D>`, where
@@ -51,16 +71,31 @@ committer other than exactly the bot or exactly GitHub (design, "G4 on existing 
   - A stacked pull request F→E scans E's commits that are not on `D`.
   - The same holds for `merge_group`, tag, other-branch and `workflow_dispatch` events.
   - When there is no `D` or its fetch fails, the baseline is used.
-- **Default-branch push.** `ci` on a push of the default branch checks `<baseline>..<head>`, as
-  0.1.28 does. A test proves `before` is not used.
+- **Default-branch push (G3, N2, N8).** `ci` treats a run as a default-branch push only when
+  `event.ref == refs/heads/<event.repository.default_branch>`.
+  - It checks `<baseline>..<head>`, as 0.1.28 does. A test proves `before` is not used.
+  - It reuses no receipt: with a valid receipt for exactly that range present, the scan still runs.
+  - A test event for tag `refs/tags/<default>` is treated as a tag (range `head --not D`), whatever
+    `head_branch` the run reports.
+- **Range annotation (N1, N2, N9).** Every run prints exactly one line
+  `::notice title=b10x-gates range::event=<event> ref=<event.ref> base=<bound id> head=<head id> reused=<true|false> policy=<private policy digest>`.
+  - On a default-branch push: `ref=refs/heads/<default>`, `base=` the baseline, `reused=false`.
+  - On a tag named like the default branch: `ref=refs/tags/<default>`.
+  - On a pull request that reused a receipt: `reused=true`.
+  - The policy field equals the private policy digest receipts carry; a test asserts the line holds
+    no policy content, path or matched text.
+- **Dispatch (N5).** A `workflow_dispatch` whose `inputs.head` is set and differs from `GITHUB_SHA`
+  is refused, naming both ids. One equal to `GITHUB_SHA`, or absent, is checked as other-branch.
 - **Count before release.** A read-only count over all qualifying consumers lists every commit since
-  its baseline that the committer rule refuses. Each hit has an exception prepared for the owner, or
-  the list is empty.
+  its baseline that the committer rule refuses (commits written by Actions with
+  `github-actions[bot]` as committer among them). Each hit has an exception prepared for the owner,
+  or the list is empty.
 - **Gates.** Every new guard test fails when its guard is removed, with mutation evidence recorded.
   `cargo test --locked`, `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D
   warnings` pass.
 
 ## Out of Scope
 
-- Local push paths, receipts, the trusted bound (`story:push-range`).
+- Local push paths, receipts version 2, the trusted bound (`story:push-range`).
+- Writes to the policy repository (`story:api-policy-repository-writes`).
 - Moving consumer pins (`story:consumer-pins-trusted`).
