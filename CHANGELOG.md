@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+- A squash merge that GitHub made after the default branch had moved is admitted. Before, the
+  bot's push refused it with "squash merge parent is not the pull request base", and with it
+  every later push of a branch cut from that default branch: GitHub squashes onto the default
+  branch head at merge time, and the pull request record keeps the base it saw earlier. A
+  squash is proved by three checks, on a public repository only as before: the base its pull
+  request record names is a commit that is the squash's parent or an ancestor of it; the head
+  the record names is a commit in the local object store that does not contain the squash; and
+  the squash's tree is Git's clean merge of that parent and that head, recomputed locally.
+- The squashed head's own commits are not walked one by one. That rests on the public
+  repository's branch ruleset, under which only the App writes any branch; a private
+  repository has no ruleset and refuses a squash as before.
+- Now refused: a squash onto the recorded base itself whose tree is not that merge, a squash
+  whose merge conflicts, and a squash whose pull request head is not in the local object
+  store. The last names the commit and the fetch that supplies it,
+  `b10x-gates bot -- fetch origin refs/pull/<n>/head:refs/pull/<n>/head`, which keeps the head
+  under a ref so that a later fetch does not drop it. The gate fetches nothing itself, in a
+  partial clone too.
+- Also refused for a squash: a recorded base that is a tag object instead of a commit ("pull
+  request base of squash merge is not a commit"); a recorded head that is the squash itself or
+  has it in its history ("pull request head contains its own squash merge"), which would
+  otherwise prove the squash from itself; and a recorded head whose tree the local store does
+  not hold as a tree Git can parse, the check the squash's parent already had.
+- The local merge, for two-parent merges and branch updates as well as squashes, now runs with
+  `merge.renameLimit` pinned to Git's default of 7000. Before, `merge.renameLimit=1` or
+  `diff.renameLimit=1` in the repository's configuration skipped rename detection, and a merge
+  in which both sides renamed the same file to different names was computed as clean.
+- When Git cannot compute a local merge at all, the refusal is one message: Git's failure with
+  its exit status, then the command that helps if the clone is a partial clone,
+  `git merge-tree --write-tree <first> <second>` with both commits, which run once lets Git
+  fetch the blobs the merge reads. Before, it said only "Git merge-tree failed (exit 128)".
+- Every Git call the checks read a repository through now runs with `core.commitGraph=false`.
+  This covers the ancestry walk of every delivery, not only squashes. The bot's own Git
+  (`b10x-gates bot --`) and `policy publish` are unchanged. Git reads a commit's parents from
+  a commit-graph file in the local store (`objects/info/commit-graph`, a chain under
+  `objects/info/commit-graphs/`, or either in a store named by `objects/info/alternates`) in
+  place of the commit, and does not check the file's checksum. Before, a forged one hid a
+  commit from the walk, so a person's commit below a bot commit was admitted, and made "is the
+  squash in the head's history" answer no. The file joins grafts, shallow files and replace
+  refs, which were already refused or switched off.
+- The same calls also run with `core.multiPackIndex=false`. With two offsets swapped in a
+  `multi-pack-index` file Git read one commit as another, with the same effect on the walk.
+  The packs' own indexes are used instead. An object whose bytes are not its own in a pack
+  index or as a loose file is still not found by the walk.
+
 ## 0.1.28 — 2026-11-24
 
 - A pull-request merge whose `GET /repos/<owner>/<repo>/commits/<merge>/pulls` answer names no

@@ -537,11 +537,34 @@ impl Git {
         })
     }
 
+    /// Git on this repository, answering from the objects themselves.
+    ///
+    /// Some files of the local store stand in for commit objects: Git takes a commit's parents
+    /// from them and does not open the commit. `new` refuses two of them, grafts and shallow
+    /// files. The others are switched off here, for every call:
+    ///
+    /// - replace refs (`--no-replace-objects`);
+    /// - the commit-graph, as the single file `objects/info/commit-graph`, as a chain under
+    ///   `objects/info/commit-graphs/`, and as either of them in a store that
+    ///   `objects/info/alternates` names (`core.commitGraph=false`). Git reads parents from it
+    ///   in `rev-list`, `merge-base` and `merge-tree`, and does not check the file's checksum
+    ///   when it reads it. An entry that names another first parent takes a commit out of the
+    ///   ancestry walk and turns "is an ancestor" into "no".
+    ///
+    /// The multi-pack-index is switched off too (`core.multiPackIndex=false`). It holds no
+    /// history: it says where in which pack an object's bytes lie, and with two offsets swapped
+    /// Git reads one commit as another. Each pack's own index answers the same question, so
+    /// nothing is lost. This closes that one file and not the class: an object whose bytes are
+    /// not its own, in a pack index or as a loose file, is not found by the walk.
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.root)
             .arg("--no-replace-objects")
             .args([
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
@@ -584,8 +607,22 @@ impl Git {
         } else {
             "command"
         };
-        let missing = args
-            .iter()
+        let exit = status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
+        match self.missing(args) {
+            Some(oid) => anyhow::anyhow!(
+                "Git {operation} failed ({exit}): object {oid} is not in the local object store; \
+                 run `git fetch origin` and retry"
+            ),
+            None => anyhow::anyhow!("Git {operation} failed ({exit})"),
+        }
+    }
+
+    /// The first object id among `args` that the local store lacks.
+    fn missing<'a>(&self, args: &[&'a str]) -> Option<&'a str> {
+        args.iter()
+            .copied()
             .flat_map(|arg| arg.split(|c: char| !c.is_ascii_hexdigit()))
             .filter(|oid| is_oid(oid))
             .find(|oid| {
@@ -596,16 +633,25 @@ impl Git {
                     .stderr(Stdio::null())
                     .status()
                     .is_ok_and(|probe| probe.success())
-            });
-        let exit = status
-            .code()
-            .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
-        match missing {
-            Some(oid) => anyhow::anyhow!(
-                "Git {operation} failed ({exit}): object {oid} is not in the local object store; \
-                 run `git fetch origin` and retry"
-            ),
-            None => anyhow::anyhow!("Git {operation} failed ({exit})"),
+            })
+    }
+
+    /// Whether `ancestor` is `descendant` or one of its ancestors. Git answers "no" with exit 1
+    /// and signals an error with any other non-zero status (`git help merge-base`); only the
+    /// first is `false`, so an object Git cannot read is never taken for "not an ancestor".
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+        let status = self
+            .command()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("Git plumbing failed")?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(self.refusal(&args, status)),
         }
     }
 
@@ -632,8 +678,25 @@ impl Git {
         ensure!(is_oid(first) && is_oid(second), "invalid merge input");
         self.ensure_no_merge_steering()?;
         let args = ["merge-tree", "--write-tree", "--no-messages", first, second];
-        // Repository config can also change what a clean merge means (directory renames,
-        // renormalization, rename detection); pin each to Git's default.
+        // Repository config can also change what a clean merge means; pin each such key to
+        // Git's default. A `-c` on the command line wins over every configuration file and over
+        // configuration passed through the environment.
+        //
+        // - `merge.directoryRenames`, `merge.renormalize`: off, a file moves or is rewritten
+        //   only where a side did it.
+        // - `merge.renames`, and `diff.renames` which it falls back to: on. With rename
+        //   detection off, two sides that rename one file to two names merge cleanly, as one
+        //   deletion and two additions.
+        // - `merge.renameLimit`: a file count above the limit skips the exhaustive part of
+        //   rename detection, with the same effect, so `merge.renameLimit=1` makes that conflict
+        //   clean. Unset it falls back to `diff.renameLimit`, and with neither set Git merges
+        //   with 7000 (`git help config`, Git 2.56.0); set here, `diff.renameLimit` is not read.
+        //
+        // Not pinned, because no value changes a clean answer or a clean tree:
+        // `merge.conflictStyle` changes only the markers inside a conflicted file, and a
+        // conflicted merge refuses before its tree is compared. `diff.algorithm` is not read by a
+        // merge (`git help merge`: "ort defaults to diff-algorithm=histogram, while regular diffs
+        // currently default to the diff.algorithm config setting").
         let output = self
             .command()
             .args([
@@ -645,6 +708,8 @@ impl Git {
                 "merge.renames=true",
                 "-c",
                 "diff.renames=true",
+                "-c",
+                "merge.renameLimit=7000",
             ])
             .arg(format!("--attr-source={EMPTY_TREE}"))
             .args(args)
@@ -654,7 +719,24 @@ impl Git {
         let clean = match output.status.code() {
             Some(0) => true,
             Some(1) => false,
-            _ => return Err(self.refusal(&args, output.status)),
+            _ => {
+                let refusal = self.refusal(&args, output.status);
+                // An input commit the store lacks has its own remedy in `refusal`. Otherwise one
+                // cause is a partial clone: a content merge reads blobs the clone left out, and
+                // nothing is fetched here. Git's own merge, run once by hand, fetches exactly
+                // those. It is one message, Git's failure first: only the outermost message of
+                // an error is printed, and a clone that is not partial must still read what
+                // failed.
+                return Err(if self.missing(&args).is_some() {
+                    refusal
+                } else {
+                    anyhow::anyhow!(
+                        "{refusal}; if this clone is a partial clone, run `git merge-tree \
+                         --write-tree {first} {second}` once, which lets Git fetch the blobs the \
+                         merge reads, and retry"
+                    )
+                });
+            }
         };
         ensure!(
             output.stdout.len() <= MAX_OUTPUT,
