@@ -3547,6 +3547,156 @@ fn a_failing_association_list_of_a_branch_update_refuses() {
     }
 }
 
+// GitHub also answers `commits/<sha>/pulls` with 200 and an empty list for some ordinary
+// two-parent merges, although `pulls/<n>` records that commit as its merge (a public repository,
+// 2026-11: pull request 72, merge a9b2bc48). The merge's subject then names the pull request to
+// read instead, as on a 5xx, and that record is proved as a listed one is.
+
+impl Fixture {
+    /// The merge again with `subject`, proved by pull request `number`, and GitHub answering
+    /// `listed` for the merge's association list.
+    fn unlisted_merge(&mut self, subject: &str, number: u64, listed: Value) {
+        self.named_merge(subject, number, StatusCode::INTERNAL_SERVER_ERROR);
+        let list = association_list(&self.merge);
+        self.api.failures.remove(&list);
+        self.api.responses.insert(list, listed);
+    }
+}
+
+#[test]
+fn an_empty_association_list_is_replaced_by_the_pull_request_the_merge_names() {
+    for private in [false, true] {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([]));
+        if private {
+            privatize(&mut f.api.responses);
+        }
+        assert!(f.verify().is_ok(), "private: {private}: {:?}", f.verify());
+    }
+}
+
+#[test]
+fn a_list_naming_only_other_pull_requests_is_joined_by_the_one_the_merge_names() {
+    let mut f = Fixture::new();
+    f.unlisted_merge(SUBJECT, 5, json!([{"number":9,"merge_commit_sha":null}]));
+    assert!(f.verify().is_ok(), "{:?}", f.verify());
+}
+
+#[test]
+fn an_empty_association_list_with_a_named_pull_request_of_another_merge_refuses() {
+    let mut f = Fixture::new();
+    f.unlisted_merge(SUBJECT, 5, json!([]));
+    let topic = f.topic.clone();
+    f.pull(5)["merge_commit_sha"] = json!(topic);
+    let error = f.refusal("a named pull request of another merge");
+    assert!(
+        error.contains("#5 does not name this commit")
+            && error.contains("could not stand in")
+            && error.contains(&f.merge),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_empty_association_list_without_a_named_pull_request_refuses_and_names_the_commit() {
+    for subject in [
+        "merge",
+        "Merge branch 'main' into topic",
+        "Merge pull request #5",
+        "Add the topic #5",
+    ] {
+        let mut f = Fixture::new();
+        f.unlisted_merge(subject, 5, json!([]));
+        let error = f.refusal(subject);
+        assert!(
+            error.contains("updated pull request missing or ambiguous") && error.contains(&f.merge),
+            "{subject:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_association_list_with_an_unmerged_named_pull_request_refuses() {
+    let mutations: [Mutation; 3] = [
+        ("unmerged", |f| f.pull(5)["merged"] = json!(false)),
+        ("open", |f| f.pull(5)["state"] = json!("open")),
+        ("open and unmerged, naming its test merge", |f| {
+            f.pull(5)["merged"] = json!(false);
+            f.pull(5)["state"] = json!("open");
+            f.pull(5)["merged_by"] = Value::Null;
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([]));
+        assert!(f.verify().is_ok(), "{what}: control refused");
+        mutate(&mut f);
+        let error = f.refusal(what);
+        assert!(
+            error.contains("not this completed merge"),
+            "{what}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_association_list_keeps_every_proof_of_a_listed_merge() {
+    let mutations: [Mutation; 5] = [
+        ("merged by a person", |f| {
+            f.pull(5)["merged_by"]["login"] = json!("someone")
+        }),
+        ("another head", |f| {
+            let baseline = f.baseline.clone();
+            f.pull(5)["head"]["sha"] = json!(baseline)
+        }),
+        ("another base branch", |f| {
+            f.pull(5)["base"]["ref"] = json!("release")
+        }),
+        ("a fork head", |f| {
+            f.pull(5)["head"]["repo"]["full_name"] = json!("fork/repository")
+        }),
+        ("an unverified merge", |f| {
+            f.remote_commit()["commit"]["verification"]["verified"] = json!(false)
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([]));
+        mutate(&mut f);
+        f.refusal(what);
+    }
+    let mut f = Fixture::new();
+    f.tree = tree_of(f.dir.path(), &[("extra", b"not in either parent\n")]);
+    f.unlisted_merge(SUBJECT, 5, json!([]));
+    let error = f.refusal("a merge carrying a change of its own");
+    assert!(error.contains("local merge"), "{error}");
+}
+
+#[test]
+fn an_update_branch_s_final_merge_with_an_empty_list_uses_the_pull_request_it_names() {
+    let mut f = UpdateFixture::with_merge_subject("Merge pull request #404 from example/topic");
+    f.merge_pulls().as_array_mut().unwrap().clear();
+    for (entrypoint, result) in ["verify_publication", "verify_pre_push"]
+        .into_iter()
+        .zip(f.verify())
+    {
+        assert!(result.is_ok(), "{entrypoint} refused: {result:?}");
+    }
+}
+
+#[test]
+fn a_branch_update_with_an_empty_list_refuses_and_names_the_commit() {
+    let mut f = UpdateFixture::with_merge_subject("Merge pull request #404 from example/topic");
+    f.update_pulls().as_array_mut().unwrap().clear();
+    let update = f.update.clone();
+    for error in refusals(f.verify()) {
+        assert!(
+            error.contains("updated pull request missing or ambiguous") && error.contains(&update),
+            "{error}"
+        );
+    }
+}
+
 // Security review of the 5xx fallback, 2026-10-22: strictness parity with the list path.
 
 impl Fixture {
@@ -3874,5 +4024,118 @@ fn review_the_fallback_keeps_the_list_s_deeper_causes_once() {
         ] {
             assert_eq!(text.matches(&part).count(), 1, "{part}: {text}");
         }
+    }
+}
+
+// Review of the answered-list stand-in: the shapes, repository kinds and subjects the fix's own
+// cases left to the 5xx section, run against an answered list instead.
+
+/// `named_squash`, with GitHub answering `listed` for the squash's association list.
+fn unlisted_squash(subject: &str, listed: Value) -> Fixture {
+    let mut f = named_squash(subject);
+    let list = association_list(&f.merge);
+    f.api.failures.remove(&list);
+    f.api.responses.insert(list, listed);
+    f
+}
+
+#[test]
+fn an_unlisted_squash_merge_is_admitted_only_where_a_listed_one_is() {
+    let f = unlisted_squash("Add the topic (#5)", json!([]));
+    assert!(f.verify().is_ok(), "public squash: {:?}", f.verify());
+
+    let mut f = unlisted_squash("Add the topic (#5)", json!([]));
+    f.pull(5)["base"]["sha"] = json!(f.topic);
+    let error = f.refusal("an unlisted squash onto another base");
+    assert!(error.contains("not the pull request base"), "{error}");
+
+    let mut f = unlisted_squash("Add the topic (#5)", json!([]));
+    privatize(&mut f.api.responses);
+    let error = f.refusal("an unlisted private squash");
+    assert!(error.contains("only two-parent"), "{error}");
+}
+
+#[test]
+fn a_private_unlisted_merge_still_needs_the_exact_bot_accounts() {
+    let mutations: [Mutation; 3] = [
+        ("opened by another account", |f| {
+            f.pull(5)["user"]["id"] = json!(BOT_USER_ID + 1)
+        }),
+        ("merged by a user of the bot's login", |f| {
+            f.pull(5)["merged_by"]["type"] = json!("User")
+        }),
+        ("merged by another account id", |f| {
+            f.pull(5)["merged_by"]["id"] = json!(BOT_USER_ID + 1)
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([]));
+        privatize(&mut f.api.responses);
+        assert!(
+            f.verify().is_ok(),
+            "{what}: control refused: {:?}",
+            f.verify()
+        );
+        mutate(&mut f);
+        let error = f.refusal(what);
+        assert!(
+            error.contains("by the exact bot account"),
+            "{what}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_list_of_other_pull_requests_joined_by_the_named_one_keeps_every_proof() {
+    let mutations: [Mutation; 6] = [
+        ("unmerged", |f| f.pull(5)["merged"] = json!(false)),
+        ("open", |f| f.pull(5)["state"] = json!("open")),
+        ("merged by a person", |f| {
+            f.pull(5)["merged_by"]["login"] = json!("someone")
+        }),
+        ("another head", |f| {
+            let baseline = f.baseline.clone();
+            f.pull(5)["head"]["sha"] = json!(baseline)
+        }),
+        ("another base branch", |f| {
+            f.pull(5)["base"]["ref"] = json!("release")
+        }),
+        ("a fork head", |f| {
+            f.pull(5)["head"]["repo"]["full_name"] = json!("fork/repository")
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([{"number":9,"merge_commit_sha":null}]));
+        assert!(
+            f.verify().is_ok(),
+            "{what}: control refused: {:?}",
+            f.verify()
+        );
+        mutate(&mut f);
+        f.refusal(what);
+    }
+}
+
+#[test]
+fn an_unlisted_merge_whose_subject_names_no_readable_pull_request_refuses() {
+    for (subject, number) in [
+        ("Merge pull request #7 from example/topic", 7u64),
+        (
+            "Merge pull request #18446744073709551615 from example/topic",
+            u64::MAX,
+        ),
+    ] {
+        let mut f = Fixture::new();
+        f.unlisted_merge(subject, 5, json!([]));
+        f.api
+            .failures
+            .insert(format!("{ROOT}/pulls/{number}"), StatusCode::NOT_FOUND);
+        let error = f.refusal(subject);
+        assert!(
+            error.contains("could not stand in") && error.contains("404"),
+            "{subject}: {error}"
+        );
     }
 }

@@ -475,7 +475,10 @@ impl Authority {
         // entries stay evidence, and a later page failing refuses.
         let path = format!("{}/commits/{oid}/pulls", self.root);
         let pulls = match read(api, &page(&path, 1)) {
-            Ok(first) => later_pages(api, &path, first)?,
+            Ok(first) => {
+                let pulls = later_pages(api, &path, first)?;
+                self.join_named_pull_request(git, api, oid, &path, pulls)?
+            }
             Err(error) if crate::delivery::is_server_error(&error) => {
                 // The list's refusal in full, then the named read's own chain below it, so each
                 // read's path, status and deeper causes print once.
@@ -504,6 +507,47 @@ impl Authority {
             );
         }
         Ok(pulls)
+    }
+
+    /// The association list GitHub answered, joined by the pull request the merge's subject
+    /// names when no listed pull request names this commit as its merge. GitHub has answered
+    /// an empty list for an ordinary two-parent merge whose pull request records it as its merge
+    /// (2026-11: a public repository's pull request 72, merge a9b2bc48). The stand-in is read
+    /// and checked exactly as on a 5xx (`named_pull_request`), and the caller proves it as it
+    /// proves a listed one. Every listed entry stays evidence, so an ambiguity the list shows
+    /// still refuses. A commit whose subject names no pull request keeps the list as it is.
+    /// When the stand-in cannot be read or does not name this commit: an empty list refuses
+    /// with that cause, as it would have refused anyway; a list with entries is kept as it is
+    /// and proved as before.
+    fn join_named_pull_request(
+        &self,
+        git: &Git,
+        api: &impl AuthenticatedRead,
+        oid: &str,
+        path: &str,
+        mut pulls: Vec<Value>,
+    ) -> Result<Vec<Value>> {
+        if pulls
+            .iter()
+            .any(|pr| pr.get("merge_commit_sha").and_then(Value::as_str) == Some(oid))
+            || pull_request_number(&git.read(&["cat-file", "commit", oid])?).is_none()
+        {
+            return Ok(pulls);
+        }
+        match self.named_pull_request(git, api, oid) {
+            Ok(named) => {
+                pulls.extend(named);
+                Ok(pulls)
+            }
+            Err(named) if pulls.is_empty() => Err(ReadFailure::wrap(
+                format!(
+                    "GET {path}: no pull request names commit {oid} as its merge; the pull \
+                     request the merge names could not stand in"
+                ),
+                named,
+            )),
+            Err(_) => Ok(pulls),
+        }
     }
 
     /// The association list when `commits/<sha>/pulls` keeps answering 5xx: GitHub has done so
@@ -550,7 +594,7 @@ impl Authority {
             .collect();
         ensure!(
             completed.len() == 1,
-            "updated pull request missing or ambiguous"
+            "updated pull request missing or ambiguous for commit {update}"
         );
         let summary = completed[0];
         let number = summary
