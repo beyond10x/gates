@@ -35,9 +35,13 @@ pub struct Github {
     pause: fn(Duration),
 }
 
-/// How long a read waits for its connection to GitHub. The whole request, connection
-/// included, still ends after 60 s.
+/// How long a read waits for its connection to GitHub.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one send may take, connection and body included. It bounds each redirect hop on
+/// its own, so one GET through `api_response` can take up to
+/// `GET_ATTEMPTS * (REDIRECT_LIMIT + 1) * REQUEST_TIMEOUT` plus the backoff waits between
+/// attempts (`GET_BACKOFF`, doubling). No caller sets a deadline for the whole.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl AuthenticatedRead for Github {
     fn get(&self, path: &str) -> Result<Value> {
@@ -688,7 +692,7 @@ impl Github {
         let build = |builder: reqwest::blocking::ClientBuilder| {
             builder
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(60))
+                .timeout(REQUEST_TIMEOUT)
                 .user_agent("b10x-gates")
                 .build()
         };
@@ -809,9 +813,15 @@ impl Github {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request
-                .send()
-                .map_err(|error| TransportFailure::of(&error))?;
+            let response = request.send().map_err(|error| {
+                // A request that cannot be built (a token that is no valid header value) was
+                // never sent, and sending it again cannot change that.
+                if error.is_builder() {
+                    anyhow::anyhow!("GitHub request not sent: it could not be built")
+                } else {
+                    TransportFailure::of(&error)
+                }
+            })?;
             let status = response.status();
             if status.is_redirection() && !is_read(&method) {
                 return Err(RedirectRefused { method, status }.into());
@@ -842,8 +852,15 @@ impl Github {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok());
             return Err(ApiFailure::new(status, body).into());
         }
-        // A body that cannot be read after a 2xx is the same as an empty one.
-        let bytes = response.bytes().unwrap_or_default();
+        let bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            // A GET whose answer is cut off got no whole answer: it fails like one that got
+            // none, and is sent again (`retry_server_errors`).
+            Err(error) if method == Method::GET => return Err(TransportFailure::of(&error)),
+            // A write's answer that cannot be read is the same as an empty one: the write
+            // happened, and is never sent again.
+            Err(_) => Default::default(),
+        };
         success_body(status, &bytes).map(|value| (status, value))
     }
 
@@ -1229,9 +1246,11 @@ pub enum Transport {
     Timeout,
     /// The API host's name did not resolve.
     Dns,
-    /// No connection could be made.
+    /// No connection could be made, a failed TLS handshake included: reqwest reports that as
+    /// a connect error.
     Connect,
-    /// The connection failed after it was made: reset, closed before an answer, or TLS.
+    /// The connection failed after it was made: reset, or closed before the whole answer
+    /// arrived (a GET's 2xx body cut off included).
     Other,
 }
 
@@ -2486,6 +2505,50 @@ mod tests {
                 TransportFailure { kind }.to_string(),
                 format!("GitHub request failed ({text}); sensitive response withheld")
             );
+        }
+    }
+
+    thread_local! {
+        static PAUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counted_pause(_: Duration) {
+        PAUSES.with(|pauses| pauses.set(pauses.get() + 1));
+    }
+
+    /// A token that is no valid header value fails when the request is built, before anything
+    /// is sent: the GET fails at once, without a wait or a second attempt, says it was not sent
+    /// and names neither the token, its header nor the URL.
+    #[test]
+    fn a_get_that_cannot_be_built_fails_at_once_and_names_nothing_it_carries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let github = Github::client(
+            "synthetic\ntoken".into(),
+            Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            || Client::builder().no_proxy(),
+            counted_pause,
+        )
+        .unwrap();
+        PAUSES.with(|pauses| pauses.set(0));
+        let error = github
+            .api_response(Method::GET, "/repos/example/repository", None)
+            .expect_err("a request that cannot be built must fail");
+        let text = format!("{error:#} {error:?}");
+        assert_eq!(
+            PAUSES.with(std::cell::Cell::get),
+            0,
+            "waited before: {text}"
+        );
+        assert!(listener.accept().is_err(), "something was sent: {text}");
+        assert!(!is_transport_failure(&error), "{text}");
+        assert_eq!(
+            format!("{error:#}"),
+            "GitHub request not sent: it could not be built"
+        );
+        for carried in ["synthetic", "Bearer", "uthorization", "127.0.0.1", "/repos"] {
+            assert!(!text.contains(carried), "{carried} in {text}");
         }
     }
 
