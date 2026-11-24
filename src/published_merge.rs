@@ -4,6 +4,11 @@
 //! on a plan without rulesets proves each merge through its pull-request record instead: opened
 //! and merged by the exact bot account, two parents only. On either, a two-parent merge's tree
 //! must be Git's own clean merge of its parents, recomputed locally.
+//!
+//! A squash merge has one parent and is admitted on a public repository only. The base its
+//! pull-request record names must be that parent or an ancestor of it, the head the record names
+//! must be a commit in the local object store, and the squash's tree must be Git's own clean
+//! merge of the parent and that head, recomputed locally.
 use crate::{
     BOT_EMAIL, BOT_NAME,
     delivery::ApiFailure,
@@ -861,30 +866,54 @@ impl Authority {
             );
             return Ok(());
         }
-        // A squash merge keeps no reference to the head it accepted, so the tree equality above
-        // cannot be asked of it: GitHub composed this tree from the pull request rather than
-        // adopting the head's. What remains provable is that the single parent is the base this
-        // pull request was merged onto, and that GitHub itself produced the commit from that
-        // pull request — the verified signature, the exact bot author, `merged_by`, and
-        // `merge_commit_sha` already establish the last of those, above.
+        // A squash has one parent, so the pull request head it took is outside the walked
+        // ancestry. Its inputs are that parent, which is walked ancestry, and the head the
+        // authenticated pull request record names. Like a two-parent merge it is admitted only
+        // when it adds nothing of its own: its tree must be Git's clean merge of those two
+        // inputs, recomputed here. Without that, a one-parent commit with the GitHub committer
+        // that a merged pull request names as its merge would be admitted whatever its tree
+        // holds, and content no bot commit carries would enter delivered ancestry.
         //
-        // This is weaker than the two-parent proof by exactly one property: the reviewed tree is
-        // not re-derived locally. Admitted deliberately, because a repository whose default
-        // branch has taken one squash merge can otherwise never deliver again.
-        //
-        // It rests on the branch authority: the squashed head commits are outside the walked
-        // ancestry, and only the ruleset proves the App alone wrote them. A private repository
-        // has no ruleset, so nothing proves who wrote that head, and the shape is refused there.
+        // The head's own commits are not walked one by one. That rests on the branch authority:
+        // only the ruleset proves the App alone wrote them. A private repository has no ruleset,
+        // so nothing proves who wrote that head, and the shape is refused there.
         ensure!(
             self.visibility == Visibility::Public,
             "private repository admits only two-parent pull-request merges"
         );
+        let parent = &commit.parents[0];
+        // GitHub squashes onto the default branch head at merge time, and the record keeps the
+        // base it saw when the pull request was opened or last updated. The parent may be later
+        // than the recorded base; it may not be on a history that does not contain it. A base
+        // that is the parent passes this too, and a base object the store lacks refuses.
+        let base = oid(&pr, "/base/sha")?;
+        git.read(&["merge-base", "--is-ancestor", base, parent])
+            .context("squash merge parent does not descend from the pull request base")?;
+        // Only the record names the head, so a clone need not hold it. Nothing is fetched here,
+        // and `Git::command` turns lazy fetching off, so a partial clone's remote does not
+        // supply it either: the refusal names the commit and the fetch that does.
+        let head = oid(&pr, "/head/sha")?;
+        match git.text(&["cat-file", "-t", head]) {
+            Ok(kind) => ensure!(
+                kind == "commit",
+                "pull request head {head} of squash merge is not a commit"
+            ),
+            Err(_) => bail!(
+                "pull request head {head} of squash merge is not in the local object store; \
+                 run `b10x-gates bot -- fetch origin refs/pull/{number}/head` and retry"
+            ),
+        }
+        // A conflicted merge was resolved by somebody, so it refuses even when its tree is the
+        // very one Git wrote with the conflict in it.
+        let local = git.merge_tree(parent, head)?;
         ensure!(
-            oid(&pr, "/base/sha")? == commit.parents[0],
-            "squash merge parent is not the pull request base"
+            local.clean,
+            "local merge of the squash parent and pull request head conflicts"
         );
-        git.read(&["merge-base", "--is-ancestor", &commit.parents[0], merge])
-            .context("squash merge does not descend from its pull request base")?;
+        ensure!(
+            local.tree == commit.tree,
+            "squash tree is not the local merge of its parent and pull request head"
+        );
         Ok(())
     }
 

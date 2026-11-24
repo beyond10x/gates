@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- A squash merge that GitHub made after the default branch had moved is admitted. Before, the
+  bot's push refused it with "squash merge parent is not the pull request base", and with it
+  every later push of a branch cut from that default branch: GitHub squashes onto the default
+  branch head at merge time, and the pull request record keeps the base it saw earlier. A
+  squash is proved by three checks, on a public repository only as before: the base its pull
+  request record names is the squash's parent or an ancestor of it; the head the record names
+  is a commit in the local object store; and the squash's tree is Git's clean merge of that
+  parent and that head, recomputed locally.
+- Now refused: a squash onto the recorded base itself whose tree is not that merge, a squash
+  whose merge conflicts, and a squash whose pull request head is not in the local object
+  store. The last names the commit and the fetch that supplies it
+  (`b10x-gates bot -- fetch origin refs/pull/<n>/head`). The gate fetches nothing itself, in
+  a partial clone too.
+
 ## 0.1.28 — 2026-11-24
 
 - A pull-request merge whose `GET /repos/<owner>/<repo>/commits/<merge>/pulls` answer names no
