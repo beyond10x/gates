@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.29 — 2026-11-24
 
 - A squash merge that GitHub made after the default branch had moved is admitted. Before, the
   bot's push refused it with "squash merge parent is not the pull request base", and with it
