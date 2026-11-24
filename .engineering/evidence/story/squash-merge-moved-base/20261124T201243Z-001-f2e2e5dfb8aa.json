@@ -1,9 +1,9 @@
 {
-  "at": "2026-11-24T18:10:36Z",
-  "actor": "human:timo",
+  "at": "2026-11-24T20:12:43Z",
+  "actor": "human:operator",
   "artifact": "story:squash-merge-moved-base",
   "kind": "story",
-  "revision": 4,
+  "revision": 3,
   "change": {
     "change": "evidence",
     "kind": "review_outcome",
