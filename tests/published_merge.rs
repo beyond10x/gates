@@ -4026,3 +4026,116 @@ fn review_the_fallback_keeps_the_list_s_deeper_causes_once() {
         }
     }
 }
+
+// Review of the answered-list stand-in: the shapes, repository kinds and subjects the fix's own
+// cases left to the 5xx section, run against an answered list instead.
+
+/// `named_squash`, with GitHub answering `listed` for the squash's association list.
+fn unlisted_squash(subject: &str, listed: Value) -> Fixture {
+    let mut f = named_squash(subject);
+    let list = association_list(&f.merge);
+    f.api.failures.remove(&list);
+    f.api.responses.insert(list, listed);
+    f
+}
+
+#[test]
+fn an_unlisted_squash_merge_is_admitted_only_where_a_listed_one_is() {
+    let f = unlisted_squash("Add the topic (#5)", json!([]));
+    assert!(f.verify().is_ok(), "public squash: {:?}", f.verify());
+
+    let mut f = unlisted_squash("Add the topic (#5)", json!([]));
+    f.pull(5)["base"]["sha"] = json!(f.topic);
+    let error = f.refusal("an unlisted squash onto another base");
+    assert!(error.contains("not the pull request base"), "{error}");
+
+    let mut f = unlisted_squash("Add the topic (#5)", json!([]));
+    privatize(&mut f.api.responses);
+    let error = f.refusal("an unlisted private squash");
+    assert!(error.contains("only two-parent"), "{error}");
+}
+
+#[test]
+fn a_private_unlisted_merge_still_needs_the_exact_bot_accounts() {
+    let mutations: [Mutation; 3] = [
+        ("opened by another account", |f| {
+            f.pull(5)["user"]["id"] = json!(BOT_USER_ID + 1)
+        }),
+        ("merged by a user of the bot's login", |f| {
+            f.pull(5)["merged_by"]["type"] = json!("User")
+        }),
+        ("merged by another account id", |f| {
+            f.pull(5)["merged_by"]["id"] = json!(BOT_USER_ID + 1)
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([]));
+        privatize(&mut f.api.responses);
+        assert!(
+            f.verify().is_ok(),
+            "{what}: control refused: {:?}",
+            f.verify()
+        );
+        mutate(&mut f);
+        let error = f.refusal(what);
+        assert!(
+            error.contains("by the exact bot account"),
+            "{what}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_list_of_other_pull_requests_joined_by_the_named_one_keeps_every_proof() {
+    let mutations: [Mutation; 6] = [
+        ("unmerged", |f| f.pull(5)["merged"] = json!(false)),
+        ("open", |f| f.pull(5)["state"] = json!("open")),
+        ("merged by a person", |f| {
+            f.pull(5)["merged_by"]["login"] = json!("someone")
+        }),
+        ("another head", |f| {
+            let baseline = f.baseline.clone();
+            f.pull(5)["head"]["sha"] = json!(baseline)
+        }),
+        ("another base branch", |f| {
+            f.pull(5)["base"]["ref"] = json!("release")
+        }),
+        ("a fork head", |f| {
+            f.pull(5)["head"]["repo"]["full_name"] = json!("fork/repository")
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut f = Fixture::new();
+        f.unlisted_merge(SUBJECT, 5, json!([{"number":9,"merge_commit_sha":null}]));
+        assert!(
+            f.verify().is_ok(),
+            "{what}: control refused: {:?}",
+            f.verify()
+        );
+        mutate(&mut f);
+        f.refusal(what);
+    }
+}
+
+#[test]
+fn an_unlisted_merge_whose_subject_names_no_readable_pull_request_refuses() {
+    for (subject, number) in [
+        ("Merge pull request #7 from example/topic", 7u64),
+        (
+            "Merge pull request #18446744073709551615 from example/topic",
+            u64::MAX,
+        ),
+    ] {
+        let mut f = Fixture::new();
+        f.unlisted_merge(subject, 5, json!([]));
+        f.api
+            .failures
+            .insert(format!("{ROOT}/pulls/{number}"), StatusCode::NOT_FOUND);
+        let error = f.refusal(subject);
+        assert!(
+            error.contains("could not stand in") && error.contains("404"),
+            "{subject}: {error}"
+        );
+    }
+}
