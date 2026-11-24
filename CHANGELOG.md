@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.28 — 2026-11-24
+
+- A pull-request merge whose `GET /repos/<owner>/<repo>/commits/<merge>/pulls` answer names no
+  pull request with that commit as its merge (an empty list included) is admitted when its
+  subject names `#<n>` and `pulls/<n>` records that commit as its merge and passes the same
+  checks as a listed pull request: merged and closed, merged by the exact bot, same repository
+  on both sides, the default base, head equal to the second parent, and the tree recomputed as
+  the clean local merge. Before, the bot's push refused it as a branch update. An empty list whose
+  named pull request cannot stand in is refused with that cause, and the branch-update refusal
+  names its commit.
+- A GET that gets no answer (DNS, connect, TLS, reset, timeout) is sent again like a 5xx: 5
+  attempts, with 0.5, 1, 2 and 4 s between them. A GET whose 2xx body is cut off is a transport
+  failure and is retried the same way. A request that cannot be built fails at once, unsent.
+  Writes are still sent once. A transport failure names its kind (`timeout`, `DNS`, `connect`,
+  `other`) and nothing of the request. Reads connect within 10 s.
+- Known limit: one GET can take up to 307.5 s without redirects (5 × 60 s plus the waits), and
+  there is no total deadline for a GET or a command.
+
 ## 0.1.27 — 2026-11-05
 
 - The bot's Git (push, fetch, the `delete-branch` push and the `ci` fetch) no longer takes the
