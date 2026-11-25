@@ -5,7 +5,7 @@ kind: story
 status: draft
 title: One trusted exception for a byte-identical file in any version folder
 summary: An exception can bind a content digest to a path pattern with a free version segment, so a copy per bundle version needs no new exception
-revision: 2
+revision: 3
 ---
 ## Problem
 
@@ -43,19 +43,28 @@ else: a path pattern with the version segment free, bound to the content digest.
 - Existing exact-path and trailing-`*` entries keep their meaning.
 - The story names the consumer by a description only.
 
-## Open design question (for the owner)
+## Design decision
 
-Whether the free segment is written as a glob with `*` for one path segment (for example
-`contracts/*/vectors/<file>`), or as a new field next to `location`. This changes the answer to
-the compatibility question below, so it is decided before code.
+Taken by the host operator on the owner's word of 2026-11-25 04:03 CET ("take decissions for
+me"), as D117: the free segment is a glob with `*` for one path segment inside `location` (for
+example `contracts/*/vectors/<file>`), with no new field. The loader refuses a bare `*` and a
+pattern with an empty fixed part.
+
+Check made by the owner's operator on the owner's policy at 04:06 CET, as given to this story
+(not read by the story's author):
+
+- 0 `location` values hold a `*` before the end, so no existing exact name changes meaning.
+- 8 `location` values end with `*` (the trailing-prefix form), which must keep its meaning.
+
+The story stays a draft. No code before the owner is back.
 
 ## Compatibility
 
-- A glob inside `location` adds no field. An older binary parses the policy, reads the pattern as
+- The chosen form: a glob inside `location` adds no field. An older binary parses the policy, reads the pattern as
   an exact name, and does not match the copies: it refuses them, which is a fail-closed result,
   and it does not refuse the policy. This is not a parse-breaking change, but an older caller
   fails the gate on those copies until it moves.
-- A new field in `Exception` is breaking: the wire model is `deny_unknown_fields`
+- Not chosen: a new field in `Exception` is breaking: the wire model is `deny_unknown_fields`
   (`src/policy.rs:26`), and an older binary refuses the whole policy with "policy format
   invalid" (README, "A version 2 policy is unreadable by an earlier binary"). The release must
   then reach every caller before the organization secret changes.
@@ -67,4 +76,7 @@ the compatibility question below, so it is decided before code.
 - A changed byte under a matching path is refused.
 - Existing exact-path entries and trailing-`*` entries keep working: their tests do not change.
 - A pattern that is only `*`, or has an empty fixed part, is refused when the policy is loaded.
-- The story's change names whether the policy schema change is breaking, per the section above.
+- A trailing-`*` location keeps matching as a prefix; a `*` before the end matches exactly one
+  path segment.
+- The story's change names that the policy schema is unchanged and the form is not breaking, per
+  the section above.
