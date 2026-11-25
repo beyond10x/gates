@@ -343,3 +343,163 @@ fn refuses_a_configuration_naming_another_repository_than_the_flag() {
     assert!(stderr.contains("reinstall"), "{stderr}");
     assert_eq!(fs::read(f.configuration_path()).unwrap(), before);
 }
+
+/// A reinstall must not record the installed hooks as the hooks it preserves.
+#[test]
+fn a_reinstall_never_records_its_own_hooks_as_previous() {
+    let f = Fixture::new();
+    let policy = f.policy();
+    let flags = [
+        "--repository",
+        REPOSITORY,
+        "--policy",
+        policy.to_str().unwrap(),
+    ];
+    succeeded(&f.install(&flags, None));
+    assert!(f.configuration().previous.is_empty());
+    succeeded(&f.install(&flags, None));
+    assert!(f.configuration().previous.is_empty());
+    succeeded(&f.install_bare(&[], None));
+    assert!(f.configuration().previous.is_empty());
+}
+
+fn hooks_directory(f: &Fixture) -> PathBuf {
+    fs::canonicalize(f.repo.path())
+        .unwrap()
+        .join(".git/b10x-gates-hooks")
+}
+
+fn with_previous(f: &Fixture, hook: &str, paths: &[&Path]) {
+    let path = f.configuration_path();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["previous"] = json!({ hook: paths });
+    b10x_gates::policy::private_write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+fn flags(f: &Fixture) -> Vec<String> {
+    vec![
+        "--repository".into(),
+        REPOSITORY.into(),
+        "--policy".into(),
+        f.policy().to_str().unwrap().into(),
+    ]
+}
+
+fn install_with(f: &Fixture) -> Output {
+    let flags = flags(f);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    f.install(&flags, None)
+}
+
+/// Run an installed hook under `timeout`, which signals the whole process group, so a hook that
+/// calls itself is stopped after 8 s instead of filling the machine.
+fn run_hook(f: &Fixture, hook: &str) -> Output {
+    Command::new("sh")
+        .arg("-c")
+        .arg("exec timeout -k 1 8 \"$0\" 2>&1")
+        .arg(hooks_directory(f).join(hook))
+        .current_dir(f.repo.path())
+        .env("HOME", f.home.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+/// `core.hooksPath` that names the installed directory in another spelling (here a symlink
+/// to the repository) is the same directory. Install must not take its hooks for hooks it
+/// preserves: each would call the hook that calls it.
+#[test]
+fn a_hooks_path_spelled_another_way_is_still_the_installed_directory() {
+    let f = Fixture::new();
+    succeed_install(&f);
+    let link = f.home.path().join("repo-link");
+    std::os::unix::fs::symlink(f.repo.path(), &link).unwrap();
+    git(
+        f.repo.path(),
+        &[
+            "config",
+            "--local",
+            "core.hooksPath",
+            link.join(".git/b10x-gates-hooks").to_str().unwrap(),
+        ],
+    );
+    succeed_install(&f);
+    assert!(
+        f.configuration().previous.is_empty(),
+        "{:?}",
+        f.configuration().previous
+    );
+}
+
+/// A preserved hook that lies inside the hook directory is the installed hook itself,
+/// whatever links reach it. Install does not record it.
+#[test]
+fn a_hook_that_resolves_into_the_installed_directory_is_not_preserved() {
+    let f = Fixture::new();
+    succeed_install(&f);
+    let target = hooks_directory(&f).join("pre-commit");
+    let old = f.repo.path().join("old-hooks");
+    fs::create_dir_all(&old).unwrap();
+    std::os::unix::fs::symlink(&target, old.join("pre-commit")).unwrap();
+    git(
+        f.repo.path(),
+        &["config", "--local", "core.hooksPath", old.to_str().unwrap()],
+    );
+    succeed_install(&f);
+    assert!(
+        f.configuration().previous.is_empty(),
+        "{:?}",
+        f.configuration().previous
+    );
+}
+
+/// A configuration that already holds such entries is repaired by the next install.
+#[test]
+fn install_removes_installed_hooks_from_an_existing_previous_map() {
+    let f = Fixture::new();
+    succeed_install(&f);
+    let own = hooks_directory(&f).join("pre-commit");
+    let other = f.private.path().join("kept-hook");
+    with_previous(&f, "pre-commit", &[own.as_path(), other.as_path()]);
+    succeed_install(&f);
+    let previous = f.configuration().previous;
+    assert_eq!(previous.get("pre-commit"), Some(&vec![other]));
+}
+
+/// A hook that finds itself in `previous` skips it and says so; it does not start itself.
+#[test]
+fn a_hook_skips_a_preserved_entry_that_is_the_hook_itself() {
+    let f = Fixture::new();
+    succeed_install(&f);
+    let own = hooks_directory(&f).join("pre-commit");
+    with_previous(&f, "pre-commit", &[own.as_path()]);
+    let output = run_hook(&f, "pre-commit");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("is the hook itself"), "{text}");
+    assert!(!text.contains("could not start"), "{text}");
+}
+
+/// A chain through other paths that returns to the hook stops at a depth limit.
+#[test]
+fn a_chain_of_preserved_hooks_stops_at_a_depth_limit() {
+    let f = Fixture::new();
+    succeed_install(&f);
+    let own = hooks_directory(&f).join("pre-commit");
+    let relay = f.private.path().join("relay");
+    fs::write(
+        &relay,
+        format!("#!/bin/sh\nexec {} \"$@\"\n", own.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&relay, fs::Permissions::from_mode(0o755)).unwrap();
+    with_previous(&f, "pre-commit", &[relay.as_path()]);
+    let output = run_hook(&f, "pre-commit");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("hook chain deeper than"), "{text}");
+    assert!(!text.contains("could not start"), "{text}");
+}
+
+fn succeed_install(f: &Fixture) {
+    succeeded(&install_with(f));
+}

@@ -62,6 +62,9 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
     let common = installed
         .parent()
         .context("Git common directory unavailable")?;
+    // The hook directory by its real path: every comparison below uses it, so a symlink, a
+    // `..` or a trailing separator cannot make the installed directory look like another one.
+    let own = real_directory(&installed);
     let mut originals = vec![common.join("hooks")];
     if let Ok(current) = git.text(&["config", "--get", "core.hooksPath"]) {
         let current = if Path::new(&current).is_absolute() {
@@ -69,7 +72,7 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
         } else {
             fs::canonicalize(root)?.join(current)
         };
-        if current == installed {
+        if current == installed || real_directory(&current) == own {
             let held: Config =
                 serde_json::from_slice(&policy::protected_read(&installed.join("config.json"))?)?;
             ensure!(
@@ -83,10 +86,24 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
             originals.push(current);
         }
     }
+    // A configuration written before this check may already name the installed hooks as the
+    // hooks to preserve; each of those starts itself. Drop them.
+    config
+        .previous
+        .values_mut()
+        .for_each(|paths| paths.retain(|path| !is_inside(path, &own)));
+    config.previous.retain(|_, paths| !paths.is_empty());
     for original in originals {
+        if real_directory(&original) == own {
+            continue;
+        }
         for hook in HOOKS {
             let path = original.join(hook);
             if !path.is_file() {
+                continue;
+            }
+            // A link that resolves into the installed directory is the installed hook.
+            if is_inside(&path, &own) {
                 continue;
             }
             #[cfg(unix)]
@@ -156,6 +173,27 @@ pub fn install(root: &Path, mut config: Config, retire: Option<&str>) -> Result<
 /// The hooks' directory name under the Git common directory.
 pub const DIRECTORY: &str = "b10x-gates-hooks";
 
+/// The environment variable that counts how many preserved hooks started this hook, and the
+/// depth at which a chain is refused. A chain of one or two preserved hooks is normal.
+const CHAIN_DEPTH: &str = "B10X_GATES_HOOK_DEPTH";
+const MAX_CHAIN_DEPTH: u32 = 4;
+
+/// `path` by its real path when it exists. When it does not, its parent's real path and its own
+/// name, so a directory that is about to be created still compares by where it will be.
+fn real_directory(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|real| real.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    })
+}
+
+/// Whether `path`, after every link, lies inside the directory `own` (a real path).
+fn is_inside(path: &Path, own: &Path) -> bool {
+    real_directory(path).starts_with(own)
+}
+
 /// The installed hook directory, where the pre-push hook retains its receipts.
 pub fn directory(git: &Git) -> Result<PathBuf> {
     let common =
@@ -186,6 +224,16 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
     let config: Config =
         serde_json::from_slice(&policy::protected_read(&directory.join("config.json"))?)
             .map_err(|_| anyhow::anyhow!("hook configuration invalid"))?;
+    let depth: u32 = std::env::var(CHAIN_DEPTH)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    ensure!(
+        depth < MAX_CHAIN_DEPTH,
+        "hook chain deeper than {MAX_CHAIN_DEPTH} preserved hooks: a preserved hook starts this \
+         hook again"
+    );
+    let own = real_directory(directory);
     let mut input = Vec::new();
     if matches!(name, "pre-push" | "post-rewrite" | "reference-transaction") {
         std::io::stdin().read_to_end(&mut input)?;
@@ -193,8 +241,19 @@ pub fn run(name: &str, args: &[String]) -> Result<()> {
     // Existing hooks can stage files or rewrite a message. Scan their final result.
     if let Some(previous) = config.previous.get(name) {
         for path in previous {
+            // An entry inside this directory is an installed hook, and starting it starts this
+            // one again without end. A configuration that holds one is repaired by `install`.
+            if is_inside(path, &own) {
+                eprintln!(
+                    "b10x-gates: preserved hook {} for {name} is the hook itself; skipped. Run \
+                     `b10x-gates install` to repair the configuration",
+                    path.display()
+                );
+                continue;
+            }
             let mut child = Command::new(path)
                 .args(args)
+                .env(CHAIN_DEPTH, (depth + 1).to_string())
                 .stdin(if input.is_empty() {
                     Stdio::null()
                 } else {
