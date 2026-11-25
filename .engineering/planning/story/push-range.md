@@ -8,7 +8,7 @@ summary: 'Trust a default-branch commit only by its check''s provenance: canonic
 relations:
 - depends_on: story:ci-committer-pr-bound
 - informed_by: story:history-audit-schedule
-revision: 5
+revision: 6
 ---
 # Story: A push is judged on the commits it adds above a default-branch commit the trusted check proved
 
@@ -129,3 +129,30 @@ the allowlist shape (N6), audit freshness (N3) and a corrected read bound with a
 
 - Q2, Q3 and Q4 of `design:push-range`: the App's secrets permission, the App's installation on the
   policy repository, and what the boundary is for keys and the owner's login.
+
+## Observation: the cost of a tag push (2026-11-24)
+
+Reported by the host operator from the substrate repository. `b10x-gates bot -- push origin
+refs/tags/0.27.0` (b10x-gates 0.1.28, repository beyond10x/substrate) took 284 s before Git wrote
+the ref.
+
+- The walk leaves the range between the tags: `0.26.0..0.27.0` holds 110 commits (49 merges),
+  but 4 failed attempts named objects from before 0.26.0 (2 commits that are ancestors of 0.26.0;
+  pull requests 181 and 188, merged 2026-10-28). The tag reaches 1,709 commits (600 merges).
+- Of 14 attempts, 6 failed on one GET each ("GitHub request failed; sensitive response
+  withheld") after about 110 s or more, 8 were killed by the caller's 170 s limit, 1 passed.
+- The request count is not printed.
+
+Two asks for this story:
+
+- check only what the push adds: a tag on a commit already on the default branch adds 0 commits;
+- one retry of a failed GET inside the tool. 0.1.28 already retries a GET that gets no answer, 5
+  attempts; the reported failures name "sensitive response withheld", so the first check is
+  whether that failure class is retried.
+
+Not verified here: the numbers above are the substrate session's, relayed; the counts were not
+reproduced.
+
+Overlap: `story:api-path-repository-binding` (branch `plan/api-path-repository-binding`) records
+that the path of an `api` write is not bound to `--repository`. `story:api-policy-repository-writes`
+of this design covers the policy repository only; the other story covers every other repository.
