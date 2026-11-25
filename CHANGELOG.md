@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.30 — 2026-11-25
+
+- An installed hook no longer starts itself. In one repository `install` left the hook
+  configuration (`<git common dir>/b10x-gates-hooks/config.json`) with every hook listed as its
+  own preserved hook, and the first commit started about 19,300 processes. Three changes:
+  - `install` compares the hook directory by its real path, so `core.hooksPath` spelled through
+    a symlink, a `..` or a trailing separator is the installed directory and not a directory of
+    hooks to preserve. It records no hook whose real path lies inside the installed directory,
+    including a link in another directory that points into it.
+  - Every `install` removes such entries from an existing configuration, so running it again
+    repairs a repository that holds them.
+  - A hook that finds such an entry in its configuration skips it and prints one line naming it
+    and the repair. A chain of preserved hooks is counted in `B10X_GATES_HOOK_DEPTH` and a hook
+    refuses to run at depth 4, naming the cause, so a loop through other paths ends too.
+- The cause in the one repository that held the entries was not reproduced: its `core.hooksPath`
+  equals the installed directory by string. The first and second changes close the cases the
+  code allowed (another spelling of the path; a link into the directory), and the third ends any
+  other way such an entry gets into a configuration.
+
 ## 0.1.29 — 2026-11-24
 
 - A squash merge that GitHub made after the default branch had moved is admitted. Before, the
