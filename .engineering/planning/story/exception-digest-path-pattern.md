@@ -5,7 +5,7 @@ kind: story
 status: draft
 title: One trusted exception for a byte-identical file in any version folder
 summary: An exception can bind a content digest to a path pattern with a free version segment, so a copy per bundle version needs no new exception
-revision: 1
+revision: 2
 ---
 ## Problem
 
@@ -22,8 +22,10 @@ The policy's exception form cannot name "the same file in any version folder":
   in the middle cannot be written.
 - The prefix form with a digest (`content_sha256` of 64 hex) admits every line under the prefix
   with that digest, but the prefix cannot end at a version folder and still name one file.
-- `content_sha256` is the digest of one line, so each file needs one exception per flagged line,
-  and `line` is exact (or 0 for any line).
+- For the secrets rule, `content_sha256` is the digest of the whole file (`src/scan.rs`,
+  `finding()` is called with the unit's bytes), and `line` is the line the scanner reports. So
+  each file needs one exception per reported line and per version. For the privacy rules the
+  digest is of the exact flagged line. `line` is exact (or 0 for any line).
 
 ## Goal
 
@@ -60,7 +62,7 @@ the compatibility question below, so it is decided before code.
 
 ## Acceptance
 
-- A byte-identical copy (same line digest) under a path that matches the pattern passes.
+- A byte-identical copy (same file digest) under a path that matches the pattern passes.
 - The same digest under a path that does not match the pattern is refused.
 - A changed byte under a matching path is refused.
 - Existing exact-path entries and trailing-`*` entries keep working: their tests do not change.
