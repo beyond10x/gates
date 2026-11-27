@@ -58,7 +58,7 @@ The workflow first retrieves bot-published evidence. It verifies Ed25519 signatu
 
 ## Content that never reaches a commit
 
-A pull request body, an issue comment, a release note and a chat message are published without passing through Git, so no hook sees them. The delivery verbs scan before they send: `gh -- <args>` scans its arguments, `api --input <file>` scans the body file, and `scan-text <file>...` refuses any file that breaks a rule, for publishers that are not `gh`. Each refuses with rule coordinates and never echoes the matched text. A missing policy is a refusal, not an unscanned send.
+A pull request body, an issue comment, a release note and a chat message are published without passing through Git, so no hook sees them. The delivery verbs scan before they send: `gh -- <args>` scans its arguments (the download directory of `gh -- run download`, the value of `--dir`, `-D` or `--dir=`, is a local path `gh` sends nowhere: every rule but `personal-paths` holds for it), `api --input <file>` scans the body file, and `scan-text <file>...` refuses any file that breaks a rule, for publishers that are not `gh`. Each refuses with rule coordinates and never echoes the matched text. A missing policy is a refusal, not an unscanned send.
 
 `scan-artifact <file>` validates an executable release artifact without executing it. The supported
 format is an ELF64 little-endian `ET_EXEC` or `ET_DYN` file of at most 128 MiB, with no more than
