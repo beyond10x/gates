@@ -311,6 +311,7 @@ fn execute(args: Args) -> Result<()> {
             bail!("{refusal}");
         }
         let matchers = matchers(args.policy.as_deref())?;
+        let local = local_directories(command);
         let mut previous: Option<&str> = None;
         for (i, argument) in command.iter().enumerate() {
             let named = previous.is_some_and(|p| FILE_OPTIONS.contains(&p));
@@ -330,14 +331,19 @@ fn execute(args: Args) -> Result<()> {
             } else {
                 argument.as_bytes().to_vec()
             };
-            refuse(
-                &matchers,
+            let mut broken = matchers.text(&bytes);
+            if local.contains(&i) {
+                // `gh` writes the artifact to this directory and sends the path nowhere:
+                // a home directory here is not published. Every other rule still holds.
+                broken.retain(|(_, rule)| *rule != "personal-paths");
+            }
+            refuse_broken(
                 &if named {
                     format!("argument {}, the file it names,", i + 1)
                 } else {
                     format!("argument {}", i + 1)
                 },
-                &bytes,
+                &broken,
             )?;
             previous = Some(argument);
         }
@@ -764,6 +770,36 @@ fn execute(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// The positions in `gh run download` arguments that name the local directory the
+/// artifact is written to: the value of `--dir` or `-D`, or a whole `--dir=<path>`.
+/// `gh` writes there and sends the path nowhere. Only when `run download` are the first
+/// two words; the value of another option of it is skipped, so a `--dir` there is not
+/// taken for the option, and nothing after `--` counts.
+fn local_directories(command: &[String]) -> Vec<usize> {
+    const VALUED: [&str; 6] = ["--name", "-n", "--pattern", "-p", "--repo", "-R"];
+    let mut found = Vec::new();
+    if !(command.first().is_some_and(|word| word == "run")
+        && command.get(1).is_some_and(|word| word == "download"))
+    {
+        return found;
+    }
+    let mut i = 2;
+    while let Some(argument) = command.get(i) {
+        match argument.as_str() {
+            "--" => break,
+            "--dir" | "-D" => {
+                found.push(i + 1);
+                i += 1;
+            }
+            other if other.starts_with("--dir=") => found.push(i),
+            other if VALUED.contains(&other) => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    found
+}
+
 /// The private rules alone, for the verbs that publish rather than commit. A missing
 /// policy is a refusal, never an unscanned send.
 fn matchers(path: Option<&std::path::Path>) -> Result<scan::Matchers> {
@@ -785,7 +821,11 @@ fn api_failure(error: anyhow::Error, policy: Option<&std::path::Path>) -> anyhow
 
 /// Refuse without echoing the matched text, as every other scanner here does.
 fn refuse(matchers: &scan::Matchers, what: &str, bytes: &[u8]) -> Result<()> {
-    let broken = matchers.text(bytes);
+    refuse_broken(what, &matchers.text(bytes))
+}
+
+/// Refuse when `broken`, the rules some text breaks with their lines, is not empty.
+fn refuse_broken(what: &str, broken: &[(usize, &str)]) -> Result<()> {
     ensure!(
         broken.is_empty(),
         "{what} breaks {} private rule(s): {}; private details remain local",

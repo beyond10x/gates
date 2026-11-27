@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `gh -- run download` no longer refuses a download directory under the home directory. The
+  value of `--dir` or `-D`, or a whole `--dir=<path>`, is the local directory `gh` writes the
+  artifact to and sends nowhere, so `personal-paths` does not apply to it; every other rule still
+  does, and every other argument is scanned as before. The admission holds only when `run
+  download` are the first two words, skips the value of `--name`, `--pattern` and `--repo` (and
+  their short forms) so a `--dir` there is not taken for the option, and ends at `--`. Before,
+  `gh -- run download <id> --repo <owner>/<repo> --dir <a path under the home directory>` was
+  refused with "argument 7 breaks 1 private rule(s): line 1 personal-paths".
+
 ## 0.1.30 — 2026-11-25
 
 - An installed hook no longer starts itself. In one repository `install` left the hook

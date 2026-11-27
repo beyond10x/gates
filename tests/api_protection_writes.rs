@@ -948,3 +948,126 @@ fn placeholders_in_more_text_than_can_be_judged_are_refused_quickly() {
     judged_quickly(took, &run);
     refused(&run, "placeholder");
 }
+
+// `gh -- run download --dir <path>`: the directory `gh` writes the artifact to is a local
+// path and is sent nowhere, so `personal-paths` does not refuse it. Every other rule still
+// does, every other argument is still scanned, and no other command is admitted.
+
+/// A synthetic home directory the `personal-paths` rule matches.
+fn home() -> String {
+    ["", "home", "fixture-person"].join("/")
+}
+
+fn literal() -> String {
+    ["synthetic", "restricted", "identifier"].join("-")
+}
+
+/// `b10x-gates gh -- <args>` under the synthetic policy.
+fn gh_scanned(args: &[&str]) -> Run {
+    let sandbox = Sandbox::new().with_policy();
+    let mut command = sandbox.command();
+    command
+        .arg("--repo")
+        .arg(sandbox.path())
+        .args(["gh", "--"])
+        .args(args);
+    sandbox.run(command)
+}
+
+/// Passed the argument scan: the run went on to the token step.
+fn scan_passed(run: &Run) {
+    assert!(!run.stderr.contains("private rule"), "{}", run.stderr);
+    reached_token(run);
+}
+
+/// Refused by the argument scan, on `argument` (1-based), for exactly `rules`, before the
+/// token step.
+fn scan_refused(run: &Run, argument: usize, rules: &[&str]) {
+    let named = format!(
+        "argument {argument} breaks {} private rule(s): {};",
+        rules.len(),
+        rules
+            .iter()
+            .map(|rule| format!("line 1 {rule}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(!run.ok, "{}", run.stderr);
+    assert!(run.stderr.contains(&named), "{named}: {}", run.stderr);
+    assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
+}
+
+#[test]
+fn run_download_dir_under_the_home_directory_passes_the_scan() {
+    let dir = format!("{}/downloads", home());
+    let joined = format!("--dir={dir}");
+    for args in [
+        &["run", "download", "1", "--repo", "o/r", "--dir", &dir][..],
+        &["run", "download", "1", "--repo", "o/r", "-D", &dir],
+        &["run", "download", "1", "--repo", "o/r", &joined],
+        &["run", "download", "--dir", &dir, "1", "--name", "a"],
+        &[
+            "run", "download", "-n", "a", "-p", "b-*", "-R", "o/r", "-D", &dir, "1",
+        ],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn dir_under_the_home_directory_is_refused_for_every_other_command() {
+    let dir = format!("{}/downloads", home());
+    for (args, argument) in [
+        (&["pr", "create", "--dir", &dir][..], 4),
+        (&["issue", "create", "--dir", &dir], 4),
+        (&["api", "repos/o/r/issues", "--dir", &dir], 4),
+        (&["release", "create", "v1", "--dir", &dir], 5),
+        (&["run", "view", "1", "--dir", &dir], 5),
+        (&["run", "view", "-D", &dir], 4),
+        (&["workflow", "run", "download", "--dir", &dir], 5),
+        (&["download", "run", "--dir", &dir], 4),
+        (&["run", "--dir", &dir, "download"], 3),
+        (&["-R", "o/r", "run", "download", "--dir", &dir], 6),
+    ] {
+        scan_refused(&gh_scanned(args), argument, &["personal-paths"]);
+    }
+}
+
+#[test]
+fn run_download_other_arguments_are_still_scanned() {
+    let path = format!("{}/x", home());
+    let name = format!("--name={path}");
+    for (args, argument) in [
+        (&["run", "download", &path, "--dir", "out"][..], 3),
+        (&["run", "download", "1", "--name", &path], 5),
+        (&["run", "download", "1", "-n", &path], 5),
+        (&["run", "download", "1", &name], 4),
+        (&["run", "download", "1", "--pattern", &path], 5),
+        (&["run", "download", "1", "-p", &path], 5),
+        (&["run", "download", "1", "--repo", &path], 5),
+        (&["run", "download", "1", "-R", &path], 5),
+        // `--dir` here is the value of `--name`; the path after it is the run id.
+        (&["run", "download", "--name", "--dir", &path], 5),
+        (&["run", "download", "-n", "-D", &path], 5),
+        (&["run", "download", "--name=--dir", &path], 4),
+        // After `--` every word is positional.
+        (&["run", "download", "1", "--", "--dir", &path], 6),
+    ] {
+        scan_refused(&gh_scanned(args), argument, &["personal-paths"]);
+    }
+}
+
+#[test]
+fn run_download_dir_is_still_refused_for_every_other_rule() {
+    let literal = literal();
+    let both = format!("{}/{literal}", home());
+    let joined = format!("--dir={both}");
+    for (args, argument) in [
+        (&["run", "download", "1", "--dir", &literal][..], 5),
+        (&["run", "download", "1", "-D", &both], 5),
+        (&["run", "download", "1", "--dir", &both], 5),
+        (&["run", "download", "1", &joined], 4),
+    ] {
+        scan_refused(&gh_scanned(args), argument, &["private-identifiers"]);
+    }
+}
