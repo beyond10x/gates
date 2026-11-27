@@ -1542,7 +1542,7 @@ fn release_asset_content_breaking_a_rule_is_refused() {
     let text = put(&dir, "notes.txt", format!("clean\n{literal}\n").as_bytes());
     let home_text = put(&dir, "paths.txt", format!("{}/x\n", home()).as_bytes());
     let binary = put(&dir, "tool", &elf64(b"\x90\x90", literal.as_bytes()));
-    let opaque = put(&dir, "archive.gz", b"\x1f\x8b\x08\x00\xff\xfe\x00");
+    let opaque = put(&dir, "blob.bin", b"\x00\xff\xfe\x00");
     for (args, message) in [
         (
             vec!["release", "create", "v1", &text],
@@ -1804,5 +1804,545 @@ fn release_text_asset_carrying_a_secret_is_refused() {
         &gh_scanned(&["release", "upload", "v1", &text]),
         "argument 4, the asset it names",
         &token,
+    );
+}
+
+// A gzip-compressed tar asset, known by its content and not by its name, is admitted when
+// every member passes: each regular file is scanned as an asset is (an ELF executable as
+// `scan-artifact` scans it, any other file as UTF-8 text with the private rules and the pinned
+// secret scanner), a directory carries nothing, and every member name is scanned with every
+// rule. Anything else is refused, naming the argument and the member. The fixtures are written
+// here header by header; nothing is unpacked to disk.
+
+/// One tar header block as GNU tar writes it, changed by `edit`, with its checksum.
+fn tar_block(name: &[u8], kind: u8, size: usize, edit: impl FnOnce(&mut [u8; 512])) -> [u8; 512] {
+    let mut block = [0u8; 512];
+    block[..name.len()].copy_from_slice(name);
+    block[100..108].copy_from_slice(b"0000644\0");
+    block[108..116].copy_from_slice(b"0001750\0");
+    block[116..124].copy_from_slice(b"0001750\0");
+    block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    block[136..148].copy_from_slice(b"15302322065\0");
+    block[156] = kind;
+    block[257..265].copy_from_slice(b"ustar  \0");
+    block[265..272].copy_from_slice(b"builder");
+    block[297..304].copy_from_slice(b"builder");
+    edit(&mut block);
+    block[148..156].copy_from_slice(b"        ");
+    let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+    block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    block
+}
+
+/// A POSIX ustar header of a regular file: `prefix` and `name` are joined with a `/`.
+fn ustar_block(prefix: &[u8], name: &[u8], size: usize) -> [u8; 512] {
+    tar_block(name, b'0', size, |block| {
+        block[257..265].copy_from_slice(b"ustar\x0000");
+        block[265..345].fill(0);
+        block[345..345 + prefix.len()].copy_from_slice(prefix);
+    })
+}
+
+/// A tar stream, built member by member.
+#[derive(Default)]
+struct Tar(Vec<u8>);
+
+impl Tar {
+    /// A header block and `data`, padded to whole blocks.
+    fn block(mut self, header: [u8; 512], data: &[u8]) -> Self {
+        self.0.extend_from_slice(&header);
+        self.0.extend_from_slice(data);
+        self.0.resize(self.0.len().div_ceil(512) * 512, 0);
+        self
+    }
+
+    fn file(self, name: &str, data: &[u8]) -> Self {
+        self.block(tar_block(name.as_bytes(), b'0', data.len(), |_| {}), data)
+    }
+
+    fn dir(self, name: &str) -> Self {
+        self.block(tar_block(name.as_bytes(), b'5', 0, |_| {}), &[])
+    }
+
+    /// An entry of type `kind` without data, naming a target as a link does.
+    fn entry(self, name: &str, kind: u8) -> Self {
+        self.block(
+            tar_block(name.as_bytes(), kind, 0, |block| {
+                block[157..163].copy_from_slice(b"target");
+            }),
+            &[],
+        )
+    }
+
+    /// A GNU long name entry: the next member's name.
+    fn long_name(self, name: &[u8]) -> Self {
+        let mut data = name.to_vec();
+        data.push(0);
+        self.block(tar_block(b"././@LongLink", b'L', data.len(), |_| {}), &data)
+    }
+
+    fn raw(mut self, bytes: &[u8]) -> Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    /// The end marker, two zero blocks, padded to the 10,240-byte record GNU tar writes.
+    fn end(self) -> Vec<u8> {
+        let mut bytes = self.raw(&[0; 1024]).0;
+        bytes.resize(bytes.len().div_ceil(10_240) * 10_240, 0);
+        bytes
+    }
+}
+
+/// The top directory of the release archives here.
+const TOP: &str = "tool-1.0.0-x86_64-unknown-linux-gnu";
+
+/// A release archive as a release process packs it: a directory holding a README, the
+/// executable, an assessor file and a licence.
+fn release_tar() -> Tar {
+    Tar::default()
+        .dir(&format!("{TOP}/"))
+        .file(
+            &format!("{TOP}/README.md"),
+            b"# tool\n\nRun `tool --help`.\n",
+        )
+        .file(
+            &format!("{TOP}/tool"),
+            &elf64(b"\x90\x90", b"safe release metadata\n"),
+        )
+        .file(&format!("{TOP}/tool.assessor.yaml"), b"name: tool\n")
+        .file(&format!("{TOP}/LICENSE"), b"Apache License\nVersion 2.0\n")
+}
+
+/// A gzip-compressed archive of the top directory, then whatever `members` adds.
+fn archive(members: impl FnOnce(Tar) -> Tar) -> Vec<u8> {
+    gzip(&members(Tar::default().dir(&format!("{TOP}/"))).end())
+}
+
+/// `gh -- release upload v1 <archive>` with the archive under the home directory.
+fn upload_archive(bytes: &[u8]) -> Run {
+    let dir = home_dir();
+    let asset = put(&dir, &format!("{TOP}.tar.gz"), bytes);
+    gh_scanned(&["release", "upload", "v1", &asset])
+}
+
+/// The prefix every refusal of the archive asset of `upload_archive` starts with.
+const ARCHIVE: &str = "argument 4, the asset it names,";
+
+#[test]
+fn release_archive_of_files_and_directories_passes_the_scan() {
+    scanner_set();
+    let dir = home_dir();
+    let bytes = gzip(&release_tar().end());
+    let named = put(&dir, &format!("{TOP}.tar.gz"), &bytes);
+    let notes = put(&dir, "notes.md", b"Fixes.\n");
+    scan_passed(&gh_scanned(&[
+        "release",
+        "create",
+        "v1",
+        "--notes-file",
+        &notes,
+        &named,
+    ]));
+    // Known by its content: the same archive under another name.
+    let unnamed = put(&dir, "tool.bin", &bytes);
+    scan_passed(&gh_scanned(&["release", "upload", "v1", &unnamed]));
+}
+
+#[test]
+fn release_archive_with_long_and_prefixed_names_passes_the_scan() {
+    scanner_set();
+    let long = format!("{TOP}/{}/notes.txt", "nested".repeat(20));
+    let readme = b"Read me.\n";
+    let bytes = archive(|tar| {
+        tar.long_name(long.as_bytes())
+            .file("././@LongLink", b"clean\n")
+            .block(
+                ustar_block(TOP.as_bytes(), b"README.md", readme.len()),
+                readme,
+            )
+    });
+    scan_passed(&upload_archive(&bytes));
+}
+
+/// A gzip stream of `tar` whose header carries what `header` sets.
+fn gzip_with(header: flate2::GzBuilder, tar: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = header.write(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(tar).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn release_archive_member_breaking_a_rule_is_refused() {
+    scanner_set();
+    let literal = literal();
+    let text = format!("clean\n{literal}\n");
+    let token = format!("{}{}", "ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let secret = format!("token = '{token}'\n");
+    let tar = release_tar().end();
+    let cases: Vec<(Vec<u8>, String)> = vec![
+        (
+            archive(|tar| tar.file(&format!("{TOP}/README.md"), text.as_bytes())),
+            format!(
+                "{ARCHIVE} member 2 `{TOP}/README.md`, breaks 1 private rule(s): line 2 \
+                 private-identifiers;"
+            ),
+        ),
+        (
+            archive(|tar| {
+                tar.file(
+                    &format!("{TOP}/tool"),
+                    &elf64(b"\x90\x90", literal.as_bytes()),
+                )
+            }),
+            format!("{ARCHIVE} member 2 `{TOP}/tool`: artifact breaks "),
+        ),
+        (
+            archive(|tar| tar.file(&format!("{TOP}/settings.env"), secret.as_bytes())),
+            format!("{ARCHIVE} member 2 `{TOP}/settings.env`, breaks secrets rule"),
+        ),
+        (
+            archive(|tar| tar.file(&format!("{TOP}/{literal}.txt"), b"clean\n")),
+            format!(
+                "{ARCHIVE} the name of member 2, breaks 1 private rule(s): line 1 \
+                 private-identifiers;"
+            ),
+        ),
+        (
+            archive(|tar| tar.dir(&format!("{TOP}/{literal}/"))),
+            format!("{ARCHIVE} the name of member 2, breaks 1 private rule(s)"),
+        ),
+        (
+            archive(|tar| tar.file(&format!("{}/notes.txt", home()), b"clean\n")),
+            format!(
+                "{ARCHIVE} the name of member 2, breaks 1 private rule(s): line 1 personal-paths;"
+            ),
+        ),
+        (
+            archive(|tar| {
+                tar.long_name(format!("{TOP}/{}/{literal}", "nested".repeat(20)).as_bytes())
+                    .file("././@LongLink", b"clean\n")
+            }),
+            format!("{ARCHIVE} the name of member 2, breaks 1 private rule(s)"),
+        ),
+        (
+            archive(|tar| {
+                let readme = b"Read me.\n";
+                tar.block(
+                    ustar_block(literal.as_bytes(), b"README.md", readme.len()),
+                    readme,
+                )
+            }),
+            format!("{ARCHIVE} the name of member 2, breaks 1 private rule(s)"),
+        ),
+        (
+            gzip_with(
+                flate2::GzBuilder::new().filename(format!("{literal}.tar")),
+                &tar,
+            ),
+            format!("{ARCHIVE} the gzip header's file name, breaks 1 private rule(s)"),
+        ),
+        (
+            gzip_with(flate2::GzBuilder::new().comment(literal.as_bytes()), &tar),
+            format!("{ARCHIVE} the gzip header's comment, breaks 1 private rule(s)"),
+        ),
+        (
+            gzip_with(
+                flate2::GzBuilder::new().extra(b"XY\x02\x00ab".to_vec()),
+                &tar,
+            ),
+            format!("{ARCHIVE} carries a gzip extra field, which the scan does not read"),
+        ),
+    ];
+    for (bytes, message) in cases {
+        let run = upload_archive(&bytes);
+        refused_with(&run, &message, &literal);
+        assert!(!run.stderr.contains(&token), "{}", run.stderr);
+    }
+}
+
+#[test]
+fn release_archive_member_neither_elf_nor_text_is_refused() {
+    let nested = gzip(&release_tar().end());
+    for (name, data) in [
+        ("blob.bin", &b"\x00\xff\xfe\x00"[..]),
+        ("nested.tar.gz", &nested[..]),
+    ] {
+        refused_with(
+            &upload_archive(&archive(|tar| tar.file(&format!("{TOP}/{name}"), data))),
+            &format!(
+                "{ARCHIVE} member 2 `{TOP}/{name}`, is neither an ELF executable nor UTF-8 \
+                 text, so it cannot be scanned"
+            ),
+            "",
+        );
+    }
+}
+
+#[test]
+fn release_archive_entry_that_is_not_a_file_or_directory_is_refused() {
+    for (kind, what) in [
+        (b'1', "a hard link"),
+        (b'2', "a symbolic link"),
+        (b'3', "a character device"),
+        (b'4', "a block device"),
+        (b'6', "a FIFO"),
+        (b'7', "an entry of type `7`"),
+        (b'x', "an entry of type `x`"),
+        (b'g', "an entry of type `g`"),
+        (b'K', "an entry of type `K`"),
+        (b'S', "an entry of type `S`"),
+        (b'D', "an entry of type `D`"),
+    ] {
+        refused_with(
+            &upload_archive(&archive(|tar| tar.entry(&format!("{TOP}/entry"), kind))),
+            &format!(
+                "{ARCHIVE} member 2 `{TOP}/entry`, is {what}, not a regular file or a directory"
+            ),
+            "",
+        );
+    }
+    // A directory carries no data; one that does is not read as a directory.
+    refused_with(
+        &upload_archive(&archive(|tar| {
+            tar.block(
+                tar_block(format!("{TOP}/data/").as_bytes(), b'5', 6, |_| {}),
+                b"clean\n",
+            )
+        })),
+        &format!("{ARCHIVE} member 2 `{TOP}/data/`, is a directory that carries data"),
+        "",
+    );
+}
+
+#[test]
+fn release_archive_member_name_leaving_the_archive_is_refused() {
+    let escape = |name: &str| {
+        format!("{ARCHIVE} member 2 `{name}`, is an absolute path or has a `..` component")
+    };
+    for name in [
+        "/etc/tool",
+        "../tool",
+        "a/../../tool",
+        "..",
+        "a/..",
+        "a/../b",
+    ] {
+        refused_with(
+            &upload_archive(&archive(|tar| tar.file(name, b"clean\n"))),
+            &escape(name),
+            "",
+        );
+    }
+    let long = format!("{}../tool", "a/".repeat(60));
+    refused_with(
+        &upload_archive(&archive(|tar| {
+            tar.long_name(long.as_bytes())
+                .file("././@LongLink", b"clean\n")
+        })),
+        &escape(&long),
+        "",
+    );
+    refused_with(
+        &upload_archive(&archive(|tar| {
+            tar.block(ustar_block(b"/abs", b"tool", 6), b"clean\n")
+        })),
+        &escape("/abs/tool"),
+        "",
+    );
+    refused_with(
+        &upload_archive(&archive(|tar| tar.file("", b"clean\n"))),
+        &format!("{ARCHIVE} member 2, has an empty name"),
+        "",
+    );
+    refused_with(
+        &upload_archive(&archive(|tar| {
+            tar.block(tar_block(b"tool\xff", b'0', 6, |_| {}), b"clean\n")
+        })),
+        &format!("{ARCHIVE} member 2, has a name that is not UTF-8 text"),
+        "",
+    );
+}
+
+#[test]
+fn release_archive_that_cannot_be_read_is_refused() {
+    let unreadable =
+        |reason: &str| format!("{ARCHIVE} is a gzip archive the scan cannot read: {reason}");
+    let corrupt = unreadable("the gzip stream is corrupt or cut short");
+    let clean = gzip(&release_tar().end());
+    let cut = clean[..clean.len() - 10].to_vec();
+    let mut crc = clean.clone();
+    let at = crc.len() - 8;
+    crc[at] ^= 0xff;
+    let mut corrupt_header = tar_block(b"tool/notes.txt", b'0', 6, |_| {});
+    corrupt_header[0] ^= 0x01;
+    let text = "text that is not a tar stream\n".repeat(40);
+    let size = |field: &[u8; 12]| {
+        let field = *field;
+        archive(move |tar| {
+            tar.block(
+                tar_block(b"tool/notes.txt", b'0', 6, |block| {
+                    block[124..136].copy_from_slice(&field);
+                }),
+                b"clean\n",
+            )
+        })
+    };
+    let cases: Vec<(Vec<u8>, String)> = vec![
+        (cut, corrupt.clone()),
+        (crc, corrupt.clone()),
+        (b"\x1f\x8b\x08\x00\xff\xfe\x00".to_vec(), corrupt),
+        (
+            gzip(text.as_bytes()),
+            unreadable("the tar header of member 1 is corrupt"),
+        ),
+        (
+            archive(|tar| tar.block(corrupt_header, b"clean\n")),
+            unreadable("the tar header of member 2 is corrupt"),
+        ),
+        (
+            archive(|tar| {
+                tar.block(
+                    tar_block(b"tool/notes.txt", b'0', 6, |block| block[257..265].fill(0)),
+                    b"clean\n",
+                )
+            }),
+            unreadable("the tar header of member 2 is neither ustar nor GNU"),
+        ),
+        (
+            size(b"0000000000x\0"),
+            unreadable("the size of member 2 is not an octal number"),
+        ),
+        (
+            size(&[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6]),
+            unreadable("the size of member 2 is not an octal number"),
+        ),
+        (
+            gzip(
+                &Tar::default()
+                    .dir("tool/")
+                    .raw(&tar_block(b"tool/notes.txt", b'0', 4096, |_| {}))
+                    .raw(b"clean\n")
+                    .0,
+            ),
+            unreadable("member 2 is cut short"),
+        ),
+        (
+            gzip(
+                &Tar::default()
+                    .dir("tool/")
+                    .file("tool/notes.txt", b"clean\n")
+                    .0,
+            ),
+            unreadable("the tar stream has no end marker"),
+        ),
+        (
+            gzip(&Tar::default().dir("tool/").raw(&[0; 512]).0),
+            unreadable("the tar stream has no end marker"),
+        ),
+        (
+            gzip(&Tar::default().dir("tool/").raw(&[0; 1024]).raw(b"x").0),
+            unreadable("data follows the tar end marker"),
+        ),
+        (
+            archive(|tar| tar.long_name(&[b'a'; 4097])),
+            unreadable("the GNU long name of member 2 is longer than 4096 bytes"),
+        ),
+        (
+            archive(|tar| {
+                tar.long_name(b"tool/a")
+                    .long_name(b"tool/b")
+                    .file("x", b"clean\n")
+            }),
+            unreadable("the GNU long name of member 2 names no member"),
+        ),
+        (
+            archive(|tar| tar.long_name(b"tool/a")),
+            unreadable("the GNU long name of member 2 names no member"),
+        ),
+    ];
+    for (bytes, message) in cases {
+        refused_with(&upload_archive(&bytes), &message, "");
+    }
+}
+
+#[test]
+fn release_archive_with_data_after_the_gzip_stream_is_refused() {
+    let clean = gzip(&release_tar().end());
+    let follows =
+        format!("{ARCHIVE} is a gzip archive the scan cannot read: data follows the gzip stream");
+    for tail in [&clean[..], b"\0", b"trailing text\n"] {
+        let mut bytes = clean.clone();
+        bytes.extend_from_slice(tail);
+        refused_with(&upload_archive(&bytes), &follows, "");
+    }
+}
+
+/// A gzip stream of `header`, then `mebibytes` MiB of 0xff bytes, then the end marker. Each
+/// part is compressed on its own into byte-aligned deflate blocks, so the test compresses one
+/// mebibyte and repeats it.
+fn gzip_bomb(header: [u8; 512], mebibytes: usize) -> Vec<u8> {
+    use flate2::{Compress, Compression, Crc, FlushCompress};
+    fn deflate(input: &[u8], flush: FlushCompress) -> Vec<u8> {
+        let mut compress = Compress::new(Compression::fast(), false);
+        let mut out = Vec::with_capacity(input.len() + 1024);
+        compress.compress_vec(input, &mut out, flush).unwrap();
+        assert_eq!(compress.total_in() as usize, input.len());
+        out
+    }
+    let chunk = vec![0xffu8; 1024 * 1024];
+    let block = deflate(&chunk, FlushCompress::Full);
+    let end = [0u8; 1024];
+    let mut crc = Crc::new();
+    let mut bytes = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    bytes.extend(deflate(&header, FlushCompress::Full));
+    crc.update(&header);
+    for _ in 0..mebibytes {
+        bytes.extend_from_slice(&block);
+        crc.update(&chunk);
+    }
+    bytes.extend(deflate(&end, FlushCompress::Finish));
+    crc.update(&end);
+    bytes.extend(crc.sum().to_le_bytes());
+    bytes.extend(crc.amount().to_le_bytes());
+    bytes
+}
+
+#[test]
+fn release_archive_unpacking_over_the_read_bound_is_refused() {
+    // 129 MiB of bytes that are not UTF-8 in one member, from well under a mebibyte of gzip.
+    let bytes = gzip_bomb(
+        tar_block(b"tool/blob", b'0', 129 * 1024 * 1024, |_| {}),
+        129,
+    );
+    assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
+    refused_with(
+        &upload_archive(&bytes),
+        &format!(
+            "{ARCHIVE} is a gzip archive the scan cannot read: it unpacks to more than 128 MiB, \
+             the most the scan reads"
+        ),
+        "",
+    );
+}
+
+#[test]
+fn release_archive_with_more_members_than_the_bound_is_refused() {
+    let directories = |count: usize| {
+        let mut tar = Tar::default();
+        for i in 0..count {
+            tar = tar.dir(&format!("d{i:05}/"));
+        }
+        gzip(&tar.end())
+    };
+    scan_passed(&upload_archive(&directories(10_000)));
+    refused_with(
+        &upload_archive(&directories(10_001)),
+        &format!(
+            "{ARCHIVE} is a gzip archive the scan cannot read: it holds more than 10000 members, \
+             the most the scan reads"
+        ),
+        "",
     );
 }
