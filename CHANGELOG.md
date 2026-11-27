@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.31 — 2026-11-27
 
 - `gh -- run download` no longer refuses a download directory under the home directory. The
   value of `--dir` or `-D`, or a whole `--dir=<path>`, is the local directory `gh` writes the
