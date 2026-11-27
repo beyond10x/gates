@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- `gh -- release create` and `gh -- release upload` admit a gzip-compressed tar asset. Since
+  0.1.32 such an asset was refused with "argument N, the asset it names, is neither an ELF
+  executable nor UTF-8 text, so it cannot be scanned", so no release whose assets are archives
+  could be published through the bot. An asset whose content starts with the gzip magic bytes,
+  whatever its name, is now unpacked in memory, never on disk, and admitted when every member
+  passes: each regular file is scanned as an asset is (an ELF executable as `scan-artifact` scans
+  it, any other file as UTF-8 text with the private rules and the pinned secret scanner), a
+  directory carries nothing, and every member name, the gzip header's file name and its comment
+  are scanned with every rule. Nothing in the archive is executed.
+- Refused, naming the argument and the member: a member that is neither an ELF executable nor
+  UTF-8 text (a nested archive included); a hard or symbolic link, a device, a FIFO, a PAX or
+  other extension header and any other entry that is not a regular file or a directory; a
+  directory that carries data; a member name that is empty, not UTF-8 text, absolute or has a
+  `..` component; a corrupt or cut gzip stream or tar stream (checksum, magic, a size that is
+  not an octal number, a cut member, a missing end marker, data after it); data after the one
+  gzip member; a gzip extra field; an archive that unpacks to more than 128 MiB, counted while
+  reading, so a gzip bomb stops at the bound; and more than 10,000 members. GNU long names and
+  POSIX ustar prefixes are read as the name; a long name over 4,096 bytes or one that names no
+  member is refused.
+- The text members of one asset go through the secret scanner in one run; each executable
+  member is scanned as `scan-artifact` scans one. `scan-artifact` itself still reads one
+  executable.
+
 ## 0.1.32 — 2026-11-27
 
 - `gh -- release create` and `gh -- release upload` no longer refuse an asset path under the

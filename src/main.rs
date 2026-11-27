@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use b10x_gates::{
-    artifact,
+    archive, artifact,
     delivery::{self, Github},
     evidence::{self, Receipt},
     git::{Git, Unit},
@@ -965,38 +965,144 @@ fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) 
     let metadata = fs::metadata(&resolved).map_err(|_| anyhow::anyhow!("{what}, unreadable"))?;
     ensure!(metadata.is_file(), "{what}, is not a regular file");
     let bytes = read_asset(&resolved, &what)?;
-    let mut scanner = Gitleaks {
-        binary: match &args.gitleaks {
-            Some(path) => path.clone(),
-            None => policy::root()?.join("bin/gitleaks"),
-        },
-    };
-    if bytes.starts_with(b"\x7fELF") {
-        artifact::validate(
-            &resolved,
-            &Policy::load(&policy_file(args.policy.as_deref())?)?,
-            &mut scanner,
-        )
-        .map_err(|error| anyhow::anyhow!("{what}: {error}"))?;
-        return Ok(());
+    let unpacked;
+    let mut files = Files::default();
+    if archive::is_gzip(&bytes) {
+        unpacked = archive::unpack(&bytes, MAX_ASSET_BYTES)
+            .map_err(|error| anyhow::anyhow!("{what}, {error}"))?;
+        admit_archive(matchers, &what, &unpacked, &mut files)?;
+    } else {
+        files.admit(matchers, what, &bytes)?;
     }
-    ensure!(
-        std::str::from_utf8(&bytes).is_ok(),
-        "{what}, is neither an ELF executable nor UTF-8 text, so it cannot be scanned"
-    );
-    refuse(matchers, &format!("{what},"), &bytes)?;
-    // The same secret scanner that committed files and ELF assets go through.
-    let secrets = scanner.scan(&[Unit {
-        location: "release:asset".into(),
-        bytes,
-        workflow: false,
-        inherited: None,
-    }])?;
-    ensure!(
-        secrets.is_empty(),
-        "{what}, breaks secrets rule; private details remain local"
-    );
+    files.scan(args)
+}
+
+/// Admit the members of a gzip-compressed tar asset. Every name and every type is judged
+/// before any content, so these refusals cost no scanner run: the gzip header's file name and
+/// comment and each member's name are scanned with every rule, and a member is a directory
+/// without data or a regular file inside the archive. Each regular file is then admitted as an
+/// asset is.
+fn admit_archive<'a>(
+    matchers: &scan::Matchers,
+    what: &str,
+    archive: &'a archive::Archive,
+    files: &mut Files<'a>,
+) -> Result<()> {
+    if let Some(name) = &archive.file_name {
+        refuse(
+            matchers,
+            &format!("{what}, the gzip header's file name,"),
+            name,
+        )?;
+    }
+    if let Some(comment) = &archive.comment {
+        refuse(
+            matchers,
+            &format!("{what}, the gzip header's comment,"),
+            comment,
+        )?;
+    }
+    let mut named = Vec::with_capacity(archive.members.len());
+    for (i, member) in archive.members.iter().enumerate() {
+        let k = i + 1;
+        ensure!(
+            !member.name.is_empty(),
+            "{what}, member {k}, has an empty name"
+        );
+        let name = std::str::from_utf8(&member.name).map_err(|_| {
+            anyhow::anyhow!("{what}, member {k}, has a name that is not UTF-8 text")
+        })?;
+        refuse(
+            matchers,
+            &format!("{what}, the name of member {k},"),
+            name.as_bytes(),
+        )?;
+        // Named only once the name broke no rule.
+        let member_what = format!("{what}, member {k} `{name}`");
+        ensure!(
+            !member.escapes(),
+            "{member_what}, is an absolute path or has a `..` component"
+        );
+        if member.is_directory() {
+            ensure!(
+                member.data.is_empty(),
+                "{member_what}, is a directory that carries data"
+            );
+        } else {
+            ensure!(
+                member.is_file(),
+                "{member_what}, is {}, not a regular file or a directory",
+                member.kind_name()
+            );
+            named.push((member_what, &archive.data[member.data.clone()]));
+        }
+    }
+    for (member_what, bytes) in named {
+        files.admit(matchers, member_what, bytes)?;
+    }
     Ok(())
+}
+
+/// The files of one asset that passed the private rules, waiting for the scanners: an asset,
+/// or the regular files of an archive asset.
+#[derive(Default)]
+struct Files<'a> {
+    executables: Vec<(String, &'a [u8])>,
+    texts: Vec<(String, &'a [u8])>,
+}
+
+impl<'a> Files<'a> {
+    /// An ELF executable waits for the scan `scan-artifact` makes; any other file must be
+    /// UTF-8 text that breaks no private rule, and waits for the secret scanner.
+    fn admit(&mut self, matchers: &scan::Matchers, what: String, bytes: &'a [u8]) -> Result<()> {
+        if bytes.starts_with(b"\x7fELF") {
+            self.executables.push((what, bytes));
+            return Ok(());
+        }
+        ensure!(
+            std::str::from_utf8(bytes).is_ok(),
+            "{what}, is neither an ELF executable nor UTF-8 text, so it cannot be scanned"
+        );
+        refuse(matchers, &format!("{what},"), bytes)?;
+        self.texts.push((what, bytes));
+        Ok(())
+    }
+
+    /// Each executable as `scan-artifact` scans it, then every text in one run of the same
+    /// secret scanner that committed files go through.
+    fn scan(self, args: &Args) -> Result<()> {
+        let mut scanner = Gitleaks {
+            binary: match &args.gitleaks {
+                Some(path) => path.clone(),
+                None => policy::root()?.join("bin/gitleaks"),
+            },
+        };
+        if !self.executables.is_empty() {
+            let policy = Policy::load(&policy_file(args.policy.as_deref())?)?;
+            for (what, bytes) in &self.executables {
+                artifact::validate_bytes(bytes, &policy, &mut scanner)
+                    .map_err(|error| anyhow::anyhow!("{what}: {error}"))?;
+            }
+        }
+        if self.texts.is_empty() {
+            return Ok(());
+        }
+        let units: Vec<Unit> = self
+            .texts
+            .iter()
+            .map(|(_, bytes)| Unit {
+                location: "release:asset".into(),
+                bytes: bytes.to_vec(),
+                workflow: false,
+                inherited: None,
+            })
+            .collect();
+        if let Some(secret) = scanner.scan(&units)?.first() {
+            let what = &self.texts[secret.unit].0;
+            bail!("{what}, breaks secrets rule; private details remain local");
+        }
+        Ok(())
+    }
 }
 
 /// The largest asset the scan reads, the bound `scan-artifact` reads an executable with.

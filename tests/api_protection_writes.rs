@@ -2281,7 +2281,7 @@ fn release_archive_with_data_after_the_gzip_stream_is_refused() {
 
 /// A gzip stream of `header`, then `mebibytes` MiB of 0xff bytes, then the end marker. Each
 /// part is compressed on its own into byte-aligned deflate blocks, so the test compresses one
-/// mebibyte and repeats it.
+/// mebibyte and repeats it, and checksums one mebibyte and combines it.
 fn gzip_bomb(header: [u8; 512], mebibytes: usize) -> Vec<u8> {
     use flate2::{Compress, Compression, Crc, FlushCompress};
     fn deflate(input: &[u8], flush: FlushCompress) -> Vec<u8> {
@@ -2293,6 +2293,8 @@ fn gzip_bomb(header: [u8; 512], mebibytes: usize) -> Vec<u8> {
     }
     let chunk = vec![0xffu8; 1024 * 1024];
     let block = deflate(&chunk, FlushCompress::Full);
+    let mut chunk_crc = Crc::new();
+    chunk_crc.update(&chunk);
     let end = [0u8; 1024];
     let mut crc = Crc::new();
     let mut bytes = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
@@ -2300,7 +2302,7 @@ fn gzip_bomb(header: [u8; 512], mebibytes: usize) -> Vec<u8> {
     crc.update(&header);
     for _ in 0..mebibytes {
         bytes.extend_from_slice(&block);
-        crc.update(&chunk);
+        crc.combine(&chunk_crc);
     }
     bytes.extend(deflate(&end, FlushCompress::Finish));
     crc.update(&end);
@@ -2311,20 +2313,43 @@ fn gzip_bomb(header: [u8; 512], mebibytes: usize) -> Vec<u8> {
 
 #[test]
 fn release_archive_unpacking_over_the_read_bound_is_refused() {
+    let over = format!(
+        "{ARCHIVE} is a gzip archive the scan cannot read: it unpacks to more than 128 MiB, the \
+         most the scan reads"
+    );
     // 129 MiB of bytes that are not UTF-8 in one member, from well under a mebibyte of gzip.
     let bytes = gzip_bomb(
         tar_block(b"tool/blob", b'0', 129 * 1024 * 1024, |_| {}),
         129,
     );
     assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
-    refused_with(
-        &upload_archive(&bytes),
-        &format!(
-            "{ARCHIVE} is a gzip archive the scan cannot read: it unpacks to more than 128 MiB, \
-             the most the scan reads"
-        ),
-        "",
+    refused_with(&upload_archive(&bytes), &over, "");
+    // 2 GiB from about 2 MiB of gzip, under a 1 GiB address-space limit: the read stops at
+    // the bound. A reader that unpacks first and measures after runs out of memory instead.
+    let bomb = gzip_bomb(
+        tar_block(b"tool/blob", b'0', 2048 * 1024 * 1024, |_| {}),
+        2048,
     );
+    let sandbox = Sandbox::new().with_policy();
+    let dir = home_dir();
+    let asset = put(&dir, &format!("{TOP}.tar.gz"), &bomb);
+    let inner = sandbox.command();
+    let mut command = Command::new("/usr/bin/prlimit");
+    command
+        .arg(format!("--as={}", 1024 * 1024 * 1024))
+        .arg(inner.get_program())
+        .current_dir(sandbox.path());
+    for (key, value) in inner.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    command
+        .arg("--repo")
+        .arg(sandbox.path())
+        .args(["gh", "--", "release", "upload", "v1", &asset]);
+    refused_with(&sandbox.run(command), &over, "");
 }
 
 #[test]
