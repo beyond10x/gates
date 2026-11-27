@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.32 — 2026-11-27
+
+- `gh -- release create` and `gh -- release upload` no longer refuse an asset path under the
+  home directory. Before, `gh -- release create <tag> --notes-file <file> <a path under the home
+  directory>` was refused with "argument N breaks 1 private rule(s): line 1 personal-paths", so
+  the release process could not publish its binary and `SHA256SUMS` through the bot. An asset is
+  every positional word after the tag, `<path>` or `<path>#<label>`; `gh` sends the file's
+  content and its base name or the label, never the directory. The argument's text is scanned
+  with every rule but `personal-paths`; the base name and the label with every rule, so a home
+  directory in either is still refused.
+- The asset's content is now scanned, read against `--repo` as `gh` reads it: an ELF executable
+  as `scan-artifact` scans it, any other file as UTF-8 text with the private rules and the pinned
+  secret scanner. A file that is neither, a path that is not a regular file (a FIFO, a device, a
+  directory; a symbolic link is followed as `gh` follows it), a file over 128 MiB, a file that
+  cannot be read, and a file pattern (`*`, `?`, `[`, `\`) are refused. Before, an asset at a
+  relative path was uploaded unscanned.
+- Words are read as `gh` reads them: an option that takes a value takes the next word (the tag
+  and every option value are scanned as text as before), attached values and boolean options
+  take none, and after `--` every word is positional. An option of `release create` or `release
+  upload` that the scan does not know admits no asset and refuses the command. Every other
+  command, `release view`, `release download` and `release new` included, is unchanged.
+
 ## 0.1.31 — 2026-11-27
 
 - `gh -- run download` no longer refuses a download directory under the home directory. The
