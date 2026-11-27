@@ -1649,3 +1649,71 @@ fn home_paths_stay_refused_for_every_other_release_verb_and_command() {
         scan_refused(&gh_scanned(args), argument, &["personal-paths"]);
     }
 }
+
+// Security review of the admission (review/release-asset-paths).
+
+#[test]
+fn release_asset_that_is_a_fifo_is_refused_without_blocking() {
+    // `fs::read` of a FIFO waits for a writer that never comes. A path that is not a regular
+    // file is refused before it is read, so the command ends.
+    let sandbox = Sandbox::new().with_policy();
+    let dir = home_dir();
+    let fifo = dir.path().join("asset.fifo");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let fifo = fifo.to_str().unwrap().to_owned();
+    let mut command = sandbox.command();
+    command
+        .arg("--repo")
+        .arg(sandbox.path())
+        .args(["gh", "--", "release", "upload", "v1", &fifo])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("a FIFO named as a release asset blocked the scan for 10 s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    refused_with(
+        &Run {
+            ok: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        "argument 4",
+        "",
+    );
+}
+
+#[test]
+fn release_text_asset_carrying_a_secret_is_refused() {
+    // An ELF asset goes through the secret scanner; a text asset only through the private
+    // rules, so a credential in a text file under the home directory is admitted.
+    scanner_set();
+    let dir = home_dir();
+    let token = format!("{}{}", "ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let line = format!("token = '{token}'\n");
+    let binary = put(&dir, "tool", &elf64(b"\x90\x90", line.as_bytes()));
+    let text = put(&dir, "settings.env", line.as_bytes());
+    refused_with(
+        &gh_scanned(&["release", "upload", "v1", &binary]),
+        "argument 4, the asset it names: artifact breaks secrets rule",
+        &token,
+    );
+    refused_with(
+        &gh_scanned(&["release", "upload", "v1", &text]),
+        "argument 4, the asset it names",
+        &token,
+    );
+}
