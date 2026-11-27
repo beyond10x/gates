@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.33 — 2026-11-27
 
 - `gh -- release create` and `gh -- release upload` admit a gzip-compressed tar asset. Since
   0.1.32 such an asset was refused with "argument N, the asset it names, is neither an ELF
