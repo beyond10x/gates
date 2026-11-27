@@ -312,8 +312,19 @@ fn execute(args: Args) -> Result<()> {
         }
         let matchers = matchers(args.policy.as_deref())?;
         let local = local_directories(command);
+        // An option the asset scan does not know admits no asset: every word is scanned as
+        // text as before, and the command is refused after that scan.
+        let (assets, unknown) = match release_assets(command) {
+            Ok(assets) => (assets, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let mut previous: Option<&str> = None;
         for (i, argument) in command.iter().enumerate() {
+            if assets.contains(&i) {
+                scan_asset(&args, &matchers, i, argument)?;
+                previous = Some(argument);
+                continue;
+            }
             let named = previous.is_some_and(|p| FILE_OPTIONS.contains(&p));
             // `gh` resolves a relative path against its own working directory, which is
             // `--repo`. Read it the same way, or a relative notes file is unreadable here
@@ -346,6 +357,9 @@ fn execute(args: Args) -> Result<()> {
                 &broken,
             )?;
             previous = Some(argument);
+        }
+        if let Some(error) = unknown {
+            return Err(error);
         }
         return Github::bot()?.gh(&args.repo, command);
     }
@@ -800,14 +814,185 @@ fn local_directories(command: &[String]) -> Vec<usize> {
     found
 }
 
+/// The positions of the asset arguments of `gh release create` and `gh release upload`:
+/// every positional word after the first, which is the tag. Only when `release create` or
+/// `release upload` are the first two words. Words are read as `gh` (pflag) reads them: an
+/// option that takes a value takes the next word whatever it starts with, unless the value
+/// is attached (`--title=v`, `-tv`, `-t=v`); a boolean option takes none; after `--` every
+/// word is positional. An option not known here is refused: how `gh` reads the word after
+/// it cannot be told, so neither can which words are assets.
+fn release_assets(command: &[String]) -> Result<Vec<usize>> {
+    /// Long options with a value, long boolean options, short options with a value, short
+    /// boolean options: `gh release create --help` and `gh release upload --help`.
+    type Options = (
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static str,
+        &'static str,
+    );
+    const CREATE: Options = (
+        &[
+            "notes",
+            "notes-file",
+            "title",
+            "target",
+            "repo",
+            "discussion-category",
+            "notes-start-tag",
+        ],
+        &[
+            "draft",
+            "prerelease",
+            "verify-tag",
+            "generate-notes",
+            "latest",
+            "notes-from-tag",
+            "fail-on-no-commits",
+            "help",
+        ],
+        "nFtR",
+        "dph",
+    );
+    const UPLOAD: Options = (&["repo"], &["clobber", "help"], "R", "h");
+    if command.first().is_none_or(|word| word != "release") {
+        return Ok(Vec::new());
+    }
+    let Some((verb, (valued, flags, short_valued, short_flags))) =
+        command.get(1).and_then(|verb| match verb.as_str() {
+            "create" => Some(("create", CREATE)),
+            "upload" => Some(("upload", UPLOAD)),
+            _ => None,
+        })
+    else {
+        return Ok(Vec::new());
+    };
+    let unknown = |i: usize| {
+        anyhow::anyhow!(
+            "argument {} is an option the asset scan does not know; `gh release {verb}` may \
+             read the next word as its value or as an asset, so it is not judged",
+            i + 1
+        )
+    };
+    let mut assets = Vec::new();
+    let (mut positional, mut options, mut i) = (0usize, true, 2);
+    while let Some(word) = command.get(i) {
+        if options && word == "--" {
+            options = false;
+        } else if let Some(long) = word.strip_prefix("--").filter(|_| options) {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, false), |(n, _)| (n, true));
+            if valued.contains(&name) {
+                if !attached {
+                    i += 1;
+                }
+            } else if !flags.contains(&name) {
+                return Err(unknown(i));
+            }
+        } else if let Some(mut rest) = word
+            .strip_prefix('-')
+            .filter(|rest| options && !rest.is_empty())
+        {
+            while let Some(short) = rest.chars().next() {
+                let after = &rest[short.len_utf8()..];
+                let takes_value = short_valued.contains(short);
+                if !takes_value && !short_flags.contains(short) {
+                    return Err(unknown(i));
+                }
+                if after.starts_with('=') {
+                    break;
+                }
+                if takes_value {
+                    if after.is_empty() {
+                        i += 1;
+                    }
+                    break;
+                }
+                rest = after;
+            }
+        } else {
+            if positional > 0 {
+                assets.push(i);
+            }
+            positional += 1;
+        }
+        i += 1;
+    }
+    Ok(assets)
+}
+
+/// Scan what `gh release create|upload` publishes of one asset argument, `<path>` or
+/// `<path>#<label>`: the file's content, and its base name or the label. The directory part
+/// is sent nowhere, so `personal-paths` does not apply to the argument's text while every
+/// other rule does; the base name and the label are scanned in full on their own. The file
+/// is read where `gh` reads it, against `--repo`. An ELF executable is scanned as
+/// `scan-artifact` scans it, any other file as UTF-8 text; a file that is neither is refused.
+fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) -> Result<()> {
+    let n = i + 1;
+    let mut broken = matchers.text(argument.as_bytes());
+    broken.retain(|(_, rule)| *rule != "personal-paths");
+    refuse_broken(&format!("argument {n}"), &broken)?;
+    // `gh` splits at the first `#` after the first byte.
+    let (file, label) = match argument.find('#') {
+        Some(at) if at > 0 => (&argument[..at], Some(&argument[at + 1..])),
+        _ => (argument, None),
+    };
+    let path = std::path::Path::new(file);
+    let name = path
+        .file_name()
+        .map_or(file.as_bytes(), |name| name.as_encoded_bytes());
+    refuse(matchers, &format!("argument {n}, the asset's name,"), name)?;
+    if let Some(label) = label {
+        refuse(
+            matchers,
+            &format!("argument {n}, the asset's label,"),
+            label.as_bytes(),
+        )?;
+    }
+    // `gh` uploads every file a pattern matches; the scan reads one file.
+    ensure!(
+        !file.contains(['*', '?', '[', '\\']),
+        "argument {n} is a file pattern; name each file, so the scan reads what `gh` uploads"
+    );
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        args.repo.join(path)
+    };
+    let what = format!("argument {n}, the asset it names");
+    let bytes = fs::read(&resolved).map_err(|_| anyhow::anyhow!("{what}, unreadable"))?;
+    if bytes.starts_with(b"\x7fELF") {
+        let scanner = match &args.gitleaks {
+            Some(path) => path.clone(),
+            None => policy::root()?.join("bin/gitleaks"),
+        };
+        artifact::validate(
+            &resolved,
+            &Policy::load(&policy_file(args.policy.as_deref())?)?,
+            &mut Gitleaks { binary: scanner },
+        )
+        .map_err(|error| anyhow::anyhow!("{what}: {error}"))?;
+        return Ok(());
+    }
+    ensure!(
+        std::str::from_utf8(&bytes).is_ok(),
+        "{what}, is neither an ELF executable nor UTF-8 text, so it cannot be scanned"
+    );
+    refuse(matchers, &format!("{what},"), &bytes)
+}
+
+/// The trusted policy file: `--policy`, or `policy.json` under the configuration root.
+fn policy_file(path: Option<&std::path::Path>) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(policy::root()?.join("policy.json")),
+    }
+}
+
 /// The private rules alone, for the verbs that publish rather than commit. A missing
 /// policy is a refusal, never an unscanned send.
 fn matchers(path: Option<&std::path::Path>) -> Result<scan::Matchers> {
-    let path = match path {
-        Some(path) => path.to_path_buf(),
-        None => policy::root()?.join("policy.json"),
-    };
-    scan::Matchers::build(&Policy::load(&path)?)
+    scan::Matchers::build(&Policy::load(&policy_file(path)?)?)
 }
 
 /// GitHub's own message for a refused `api` request, once the private-rule matchers

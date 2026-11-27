@@ -39,12 +39,17 @@ impl Sandbox {
 
     /// A synthetic policy, owner-only, so a case that is not refused passes the
     /// private-rule scan and reaches the token step.
-    fn with_policy(mut self) -> Self {
+    fn with_policy(self) -> Self {
+        self.with_literals(&[&["synthetic", "restricted", "identifier"].join("-")])
+    }
+
+    /// As `with_policy`, with these literals as the private rules.
+    fn with_literals(mut self, literals: &[&str]) -> Self {
         let path = self.dir.path().join("policy.json");
         let policy = Policy {
             version: 1,
             nonce: "synthetic-policy-nonce-for-local-test-1234".into(),
-            forbidden_literals: vec![["synthetic", "restricted", "identifier"].join("-")],
+            forbidden_literals: literals.iter().map(|v| v.to_string()).collect(),
             forbidden_patterns: vec![],
             allow_patterns: vec![],
             repositories: BTreeMap::new(),
@@ -964,7 +969,11 @@ fn literal() -> String {
 
 /// `b10x-gates gh -- <args>` under the synthetic policy.
 fn gh_scanned(args: &[&str]) -> Run {
-    let sandbox = Sandbox::new().with_policy();
+    gh_in(&Sandbox::new().with_policy(), args)
+}
+
+/// `b10x-gates gh -- <args>` in `sandbox`, with the sandbox as `--repo`.
+fn gh_in(sandbox: &Sandbox, args: &[&str]) -> Run {
     let mut command = sandbox.command();
     command
         .arg("--repo")
@@ -1153,4 +1162,490 @@ fn run_download_directory_that_is_not_utf8_never_reaches_the_token_step() {
     let run = sandbox.run(command);
     assert!(!run.ok, "{}", run.stderr);
     assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
+}
+
+// `gh -- release create|upload <tag> <asset>...`: an asset argument is `<path>` or
+// `<path>#<label>`. `gh` sends the file's content and its base name or the label, and never the
+// directory part of the path. So `personal-paths` does not apply to the argument's text while
+// every other rule does, the base name and the label are scanned in full on their own, and the
+// content is scanned: an ELF executable the way `scan-artifact` scans it, any other file as
+// UTF-8 text. Nothing else changes: the tag and every option value are scanned as text, and no
+// other verb or command is admitted.
+
+/// A directory under the home directory, removed on drop. `personal-paths` matches its path:
+/// `release_tag_and_option_values_are_scanned_as_text` refuses it as text.
+fn home_dir() -> tempfile::TempDir {
+    let home = std::env::var_os("HOME").expect("HOME names the home directory");
+    tempfile::Builder::new()
+        .prefix("gates-release-asset-")
+        .tempdir_in(home)
+        .unwrap()
+}
+
+/// A file `name` holding `bytes` in `dir`, as the absolute path `gh` is given.
+fn put(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+    let path = dir.path().join(name);
+    fs::write(&path, bytes).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// Refused with `message` before the token step, without showing `hidden`.
+fn refused_with(run: &Run, message: &str, hidden: &str) {
+    assert!(!run.ok, "{}", run.stderr);
+    assert!(run.stderr.contains(message), "{message}: {}", run.stderr);
+    assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
+    assert!(
+        hidden.is_empty() || !run.stderr.contains(hidden),
+        "{}",
+        run.stderr
+    );
+}
+
+/// The binary asset cases run the pinned scanner, as `scan-artifact` does; they never skip.
+fn scanner_set() {
+    assert!(
+        std::env::var_os("B10X_GATES_GITLEAKS").is_some(),
+        "set B10X_GATES_GITLEAKS to the pinned scanner; this test must not skip"
+    );
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn elf_section(
+    bytes: &mut [u8],
+    at: usize,
+    name: u32,
+    kind: u32,
+    flags: u64,
+    from: usize,
+    size: usize,
+) {
+    put_u32(bytes, at, name);
+    put_u32(bytes, at + 4, kind);
+    put_u64(bytes, at + 8, flags);
+    put_u64(bytes, at + 24, from as u64);
+    put_u64(bytes, at + 32, size as u64);
+    put_u64(bytes, at + 48, 1);
+}
+
+/// A minimal ELF64 little-endian executable with one executable and one data section, built as
+/// `tests/artifact.rs` builds it.
+fn elf64(text: &[u8], data: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 64;
+    const SECTION: usize = 64;
+    const NAMES: &[u8] = b"\0.text\0.data\0.bss\0.shstrtab\0";
+    let text_at = HEADER;
+    let data_at = text_at + text.len();
+    let names_at = data_at + data.len();
+    let sections_at = (names_at + NAMES.len() + 7) & !7;
+    let mut bytes = vec![0u8; sections_at + 5 * SECTION];
+    bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    put_u16(&mut bytes, 16, 2);
+    put_u16(&mut bytes, 18, 62);
+    put_u32(&mut bytes, 20, 1);
+    put_u64(&mut bytes, 40, sections_at as u64);
+    put_u16(&mut bytes, 52, HEADER as u16);
+    put_u16(&mut bytes, 58, SECTION as u16);
+    put_u16(&mut bytes, 60, 5);
+    put_u16(&mut bytes, 62, 4);
+    bytes[text_at..data_at].copy_from_slice(text);
+    bytes[data_at..names_at].copy_from_slice(data);
+    bytes[names_at..names_at + NAMES.len()].copy_from_slice(NAMES);
+    elf_section(
+        &mut bytes,
+        sections_at + SECTION,
+        1,
+        1,
+        0x6,
+        text_at,
+        text.len(),
+    );
+    elf_section(
+        &mut bytes,
+        sections_at + 2 * SECTION,
+        7,
+        1,
+        0x3,
+        data_at,
+        data.len(),
+    );
+    elf_section(
+        &mut bytes,
+        sections_at + 3 * SECTION,
+        13,
+        8,
+        0x3,
+        names_at,
+        128,
+    );
+    elf_section(
+        &mut bytes,
+        sections_at + 4 * SECTION,
+        18,
+        3,
+        0,
+        names_at,
+        NAMES.len(),
+    );
+    bytes
+}
+
+#[test]
+fn release_assets_under_the_home_directory_pass_the_scan() {
+    scanner_set();
+    let dir = home_dir();
+    let notes = put(&dir, "release-notes.md", b"Fixes.\n");
+    let sums = put(&dir, "SHA256SUMS", b"0123abcd  b10x-gates-linux-x86_64\n");
+    let binary = put(
+        &dir,
+        "b10x-gates-linux-x86_64",
+        &elf64(b"\x90\x90", b"safe release metadata\n"),
+    );
+    let labelled = format!("{sums}#Checksums (SHA-256)");
+    for args in [
+        // The release process's own command.
+        &[
+            "release",
+            "create",
+            "0.1.32",
+            "-R",
+            "o/r",
+            "--verify-tag",
+            "--title",
+            "0.1.32",
+            "--notes-file",
+            &notes,
+            &binary,
+            &sums,
+        ][..],
+        &["release", "create", "v1", &labelled],
+        &["release", "create", "v1", &sums, &binary],
+        &[
+            "release",
+            "create",
+            "-d",
+            "-p",
+            "--latest=false",
+            "--generate-notes",
+            "--title=0.1.32",
+            "v1",
+            &binary,
+        ],
+        &["release", "create", "-dpt", "T", "v1", &sums],
+        &["release", "create", "-tT", "v1", &sums],
+        &[
+            "release",
+            "create",
+            "v1",
+            "--draft=false",
+            "--notes",
+            "n",
+            "--target",
+            "main",
+            "--discussion-category",
+            "c",
+            "--notes-start-tag",
+            "v0",
+            "--notes-from-tag",
+            "--fail-on-no-commits",
+            "--prerelease",
+            &sums,
+        ],
+        &[
+            "release",
+            "upload",
+            "v1",
+            &binary,
+            &sums,
+            "--clobber",
+            "-R",
+            "o/r",
+        ],
+        &["release", "upload", "v1", &labelled],
+        &["release", "upload", "--repo=o/r", "v1", &sums],
+        // After `--` every word is positional: the tag first, then assets.
+        &["release", "create", "v1", "--", &sums],
+        &["release", "upload", "--", "v1", &sums],
+        // `--` as the value of `--title` does not end the options.
+        &["release", "create", "v1", "--title", "--", &sums],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn release_tag_and_option_values_are_scanned_as_text() {
+    // Each value is the path of a clean file under the home directory: read as an asset it
+    // would pass.
+    let dir = home_dir();
+    let clean = put(&dir, "clean.txt", b"clean\n");
+    let title = format!("--title={clean}");
+    let repo = format!("--repo={clean}");
+    let attached = format!("-t={clean}");
+    for (args, argument) in [
+        (&["release", "create", &clean][..], 3),
+        (&["release", "create", &clean, &clean], 3),
+        (&["release", "upload", &clean, &clean], 3),
+        (&["release", "create", "v1", "--title", &clean], 5),
+        (&["release", "create", "v1", "-t", &clean], 5),
+        (&["release", "create", "v1", &title], 4),
+        (&["release", "create", "v1", &attached], 4),
+        (&["release", "create", "v1", "-dt", &clean], 5),
+        (&["release", "create", "v1", "--notes", &clean], 5),
+        (&["release", "create", "v1", "-n", &clean], 5),
+        // `-F` is scanned as before: its value as text.
+        (&["release", "create", "v1", "-F", &clean], 5),
+        (&["release", "create", "v1", "--target", &clean], 5),
+        (
+            &["release", "create", "v1", "--discussion-category", &clean],
+            5,
+        ),
+        (&["release", "create", "v1", "--notes-start-tag", &clean], 5),
+        (&["release", "create", "v1", "--repo", &clean], 5),
+        (&["release", "create", "v1", "-R", &clean], 5),
+        (&["release", "create", "v1", &repo], 4),
+        (&["release", "upload", "v1", "-R", &clean], 5),
+        (&["release", "upload", "v1", "--repo", &clean], 5),
+        (&["release", "upload", "v1", &repo], 4),
+        // A valued option takes the next word even when it is an option; the path after it
+        // is then the tag.
+        (&["release", "create", "--title", "--draft", &clean], 5),
+        (&["release", "upload", "-R", "--clobber", &clean], 5),
+        // After `--` the first positional is the tag.
+        (&["release", "create", "--", &clean, &clean], 4),
+    ] {
+        scan_refused(&gh_scanned(args), argument, &["personal-paths"]);
+    }
+}
+
+#[test]
+fn release_notes_file_content_is_still_scanned() {
+    let dir = home_dir();
+    let literal = literal();
+    let notes = put(&dir, "notes.md", format!("Fixes.\n{literal}\n").as_bytes());
+    let sums = put(&dir, "SHA256SUMS", b"clean\n");
+    refused_with(
+        &gh_scanned(&["release", "create", "v1", "--notes-file", &notes, &sums]),
+        "argument 5, the file it names, breaks 1 private rule(s): line 2 private-identifiers;",
+        &literal,
+    );
+}
+
+#[test]
+fn release_asset_name_or_label_breaking_a_rule_is_refused() {
+    let dir = home_dir();
+    let literal = literal();
+    let sums = put(&dir, "SHA256SUMS", b"clean\n");
+    let private_name = put(&dir, &format!("{literal}.txt"), b"clean\n");
+    // A base name may hold a home directory in another system's spelling.
+    let home_name = put(
+        &dir,
+        &["c:", "users", "fixture-person"].join("\\"),
+        b"clean\n",
+    );
+    let private_label = format!("{sums}#{literal}");
+    let home_label = format!("{sums}#{}/x", home());
+    for (args, message) in [
+        (
+            ["release", "create", "v1", &private_name],
+            "argument 4 breaks 1 private rule(s): line 1 private-identifiers;",
+        ),
+        (
+            ["release", "upload", "v1", &private_label],
+            "argument 4 breaks 1 private rule(s): line 1 private-identifiers;",
+        ),
+        (
+            ["release", "create", "v1", &home_name],
+            "argument 4, the asset's name, breaks 1 private rule(s): line 1 personal-paths;",
+        ),
+        (
+            ["release", "upload", "v1", &home_label],
+            "argument 4, the asset's label, breaks 1 private rule(s): line 1 personal-paths;",
+        ),
+    ] {
+        refused_with(&gh_scanned(&args), message, &literal);
+    }
+}
+
+#[test]
+fn release_asset_content_breaking_a_rule_is_refused() {
+    scanner_set();
+    let sandbox = Sandbox::new().with_policy();
+    let dir = home_dir();
+    let literal = literal();
+    let text = put(&dir, "notes.txt", format!("clean\n{literal}\n").as_bytes());
+    let home_text = put(&dir, "paths.txt", format!("{}/x\n", home()).as_bytes());
+    let binary = put(&dir, "tool", &elf64(b"\x90\x90", literal.as_bytes()));
+    let opaque = put(&dir, "archive.gz", b"\x1f\x8b\x08\x00\xff\xfe\x00");
+    for (args, message) in [
+        (
+            vec!["release", "create", "v1", &text],
+            "argument 4, the asset it names, breaks 1 private rule(s): line 2 private-identifiers;",
+        ),
+        (
+            vec!["release", "upload", "v1", &home_text],
+            "argument 4, the asset it names, breaks 1 private rule(s): line 1 personal-paths;",
+        ),
+        (
+            vec!["release", "upload", "v1", &binary],
+            "argument 4, the asset it names: artifact breaks ",
+        ),
+        (
+            vec!["release", "create", "v1", &opaque],
+            "argument 4, the asset it names, is neither an ELF executable nor UTF-8 text",
+        ),
+        (
+            vec!["release", "create", "v1", "--", &text],
+            "argument 5, the asset it names, breaks 1 private rule(s): line 2 private-identifiers;",
+        ),
+        (
+            vec!["release", "upload", "--", "v1", &text],
+            "argument 5, the asset it names, breaks 1 private rule(s): line 2 private-identifiers;",
+        ),
+    ] {
+        refused_with(&gh_in(&sandbox, &args), message, &literal);
+    }
+}
+
+#[test]
+fn relative_release_asset_is_read_against_the_repo() {
+    // `gh` runs in `--repo`; the working directory of `b10x-gates` holds a clean file of the
+    // same name.
+    let sandbox = Sandbox::new().with_policy();
+    let repo = sandbox.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("asset.txt"), format!("{}\n", literal())).unwrap();
+    sandbox.file("asset.txt", b"clean\n");
+    let mut command = sandbox.command();
+    command
+        .arg("--repo")
+        .arg(&repo)
+        .args(["gh", "--", "release", "upload", "v1", "asset.txt"]);
+    refused_with(
+        &sandbox.run(command),
+        "argument 4, the asset it names, breaks 1 private rule(s): line 1 private-identifiers;",
+        &literal(),
+    );
+}
+
+#[test]
+fn release_binary_asset_is_scanned_as_scan_artifact_scans_it() {
+    scanner_set();
+    // A three-byte literal inside instruction bytes: the text rules find it in the file's
+    // bytes; `scan-artifact` reads printable runs of four bytes or more there, so it does not.
+    let short = "%&%";
+    let sandbox = Sandbox::new().with_literals(&[short]);
+    let dir = home_dir();
+    let binary = put(
+        &dir,
+        "tool",
+        &elf64(b"\x90%&%\x90", b"safe release metadata\n"),
+    );
+    scan_passed(&gh_in(&sandbox, &["release", "create", "v1", &binary]));
+    scan_passed(&gh_in(&sandbox, &["release", "upload", "v1", &binary]));
+    // The same file read by the text rules, as a notes file, is refused.
+    refused_with(
+        &gh_in(
+            &sandbox,
+            &["release", "create", "v1", "--notes-file", &binary],
+        ),
+        "argument 5, the file it names, breaks 1 private rule(s)",
+        short,
+    );
+    // In a data section the literal is refused by the artifact scan too.
+    let data = put(
+        &dir,
+        "data-tool",
+        &elf64(b"\x90\x90", b"safe %&% metadata\n"),
+    );
+    refused_with(
+        &gh_in(&sandbox, &["release", "upload", "v1", &data]),
+        "argument 4, the asset it names: artifact breaks ",
+        short,
+    );
+}
+
+#[test]
+fn release_asset_that_cannot_be_read_is_refused() {
+    let dir = home_dir();
+    put(&dir, "a.txt", b"clean\n");
+    let missing = dir.path().join("missing.txt").to_str().unwrap().to_owned();
+    let directory = dir.path().to_str().unwrap().to_owned();
+    let pattern = format!("{directory}/*.txt");
+    for (args, message) in [
+        (
+            vec!["release", "create", "v1", &missing],
+            "argument 4, the asset it names, unreadable",
+        ),
+        (
+            vec!["release", "upload", "v1", &directory],
+            "argument 4, the asset it names, unreadable",
+        ),
+        (
+            vec!["release", "upload", "v1", &pattern],
+            "argument 4 is a file pattern",
+        ),
+        // After `--`, `--title` is an asset and not the option.
+        (
+            vec!["release", "create", "v1", "--", "--title"],
+            "argument 5, the asset it names, unreadable",
+        ),
+    ] {
+        refused_with(&gh_scanned(&args), message, "");
+    }
+}
+
+#[test]
+fn release_option_the_asset_scan_does_not_know_is_refused() {
+    // A relative asset whose content would break a rule: with an unknown option no word is
+    // read as an asset, the text scan passes, and the command is still refused.
+    let sums = "SHA256SUMS";
+    for (args, argument) in [
+        (["release", "create", "v1", "--unknown", sums], 4),
+        (["release", "create", "v1", "-x", sums], 4),
+        (["release", "create", "v1", "-dx", sums], 4),
+        (["release", "upload", "v1", "--title", sums], 4),
+        (["release", "upload", "v1", "-d", sums], 4),
+    ] {
+        let sandbox = Sandbox::new().with_policy();
+        sandbox.file(sums, format!("{}\n", literal()).as_bytes());
+        refused_with(
+            &gh_in(&sandbox, &args),
+            &format!("argument {argument} is an option the asset scan does not know"),
+            "",
+        );
+    }
+}
+
+#[test]
+fn home_paths_stay_refused_for_every_other_release_verb_and_command() {
+    let dir = home_dir();
+    let clean = put(&dir, "clean.txt", b"clean\n");
+    for (args, argument) in [
+        (&["release", "view", &clean][..], 3),
+        (&["release", "delete", &clean], 3),
+        (&["release", "download", "v1", "--dir", &clean], 5),
+        (&["release", "edit", "v1", "--title", &clean], 5),
+        (&["release", "delete-asset", "v1", &clean], 4),
+        (&["release", "new", "v1", &clean], 4),
+        (&["Release", "create", "v1", &clean], 4),
+        (&["release", "Create", "v1", &clean], 4),
+        (&["release", "release", "create", "v1", &clean], 5),
+        (&["-R", "o/r", "release", "create", "v1", &clean], 6),
+        (&["--", "release", "upload", "v1", &clean], 5),
+        (&["run", "download", "1", &clean], 4),
+        (&["pr", "create", "--title", &clean], 4),
+    ] {
+        scan_refused(&gh_scanned(args), argument, &["personal-paths"]);
+    }
 }
