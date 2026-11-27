@@ -39,9 +39,17 @@ pub struct Report {
 
 /// Read, parse, and scan a supported release executable without executing it.
 pub fn validate(path: &Path, policy: &Policy, scanner: &mut dyn SecretScanner) -> Result<Report> {
-    let bytes = read_bounded(path)?;
-    let sha256 = digest(&bytes);
-    let (privacy, meaningful, sections) = extract(&bytes)?;
+    validate_bytes(&read_bounded(path)?, policy, scanner)
+}
+
+/// As `validate`, for an executable already read, such as a member of a release archive.
+pub fn validate_bytes(
+    bytes: &[u8],
+    policy: &Policy,
+    scanner: &mut dyn SecretScanner,
+) -> Result<Report> {
+    let sha256 = digest(bytes);
+    let (privacy, meaningful, sections) = extract(bytes)?;
     ensure!(
         !meaningful.is_empty(),
         "artifact carries no meaningful embedded text"
