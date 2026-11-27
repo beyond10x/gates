@@ -474,6 +474,47 @@ impl Drop for Objects {
     }
 }
 
+/// The entries of `tree` that differ from `old`, in path order, each with the entry it
+/// replaced. `units` reads the blobs of exactly these, and `blobs` lists the same set for
+/// `supply`, so what is fetched and what is read cannot drift apart.
+fn changes<'a>(
+    tree: &'a BTreeMap<String, (String, String)>,
+    old: &'a BTreeMap<String, (String, String)>,
+) -> impl Iterator<
+    Item = (
+        &'a String,
+        &'a (String, String),
+        Option<&'a (String, String)>,
+    ),
+> {
+    tree.iter()
+        .filter(move |(path, entry)| old.get(*path) != Some(*entry))
+        .map(move |(path, entry)| (path, entry, old.get(path)))
+}
+
+/// Every blob `units` reads for `tree` against `old`: each changed file and the blob it
+/// replaced.
+fn blobs(
+    tree: &BTreeMap<String, (String, String)>,
+    old: &BTreeMap<String, (String, String)>,
+) -> BTreeSet<String> {
+    changes(tree, old)
+        .flat_map(|(_, (_, oid), previous)| {
+            std::iter::once(oid.clone()).chain(previous.map(|(_, old)| old.clone()))
+        })
+        .collect()
+}
+
+/// The first parent a raw commit object names, if it names one.
+fn first_parent(raw: &[u8]) -> Result<Option<&str>> {
+    Ok(raw
+        .split(|v| *v == b'\n')
+        .take_while(|v| !v.is_empty())
+        .find_map(|line| line.strip_prefix(b"parent "))
+        .map(std::str::from_utf8)
+        .transpose()?)
+}
+
 #[derive(Clone)]
 pub struct Git {
     pub root: PathBuf,
@@ -825,11 +866,7 @@ impl Git {
         old: &BTreeMap<String, (String, String)>,
     ) -> Result<Vec<UnitRef>> {
         let mut units = Vec::new();
-        for (path, (mode, oid)) in tree {
-            if old.get(path) == Some(&(mode.clone(), oid.clone())) {
-                continue;
-            }
-            let previous = old.get(path);
+        for (path, (_, oid), previous) in changes(tree, old) {
             units.push(UnitRef::from(Unit {
                 location: format!("filename:{path}"),
                 bytes: path.as_bytes().to_vec(),
@@ -915,7 +952,6 @@ impl Git {
         commits.retain(|v| !v.is_empty());
         let mut units = Vec::new();
         let mut spans = Vec::with_capacity(commits.len());
-        let mut objects = Objects::open(self)?;
         let held: BTreeMap<&str, &[UnitRef]> = known
             .into_iter()
             .flat_map(|k| {
@@ -926,6 +962,24 @@ impl Git {
                     .map(|(commit, span)| (commit.as_str(), &k.units.entries[span.clone()]))
             })
             .collect();
+        // A partial clone holds no blob it has not read yet. Every blob the loop below reads
+        // is listed first, from the commits and trees alone, and fetched in one request, so
+        // the build reads the candidate a full clone reads, in one try.
+        let promisors = self.promisors()?;
+        if !promisors.is_empty() {
+            let mut wanted = BTreeSet::new();
+            for commit in commits.iter().filter(|c| !held.contains_key(c.as_str())) {
+                ensure!(is_oid(commit), "invalid commit coordinate");
+                let raw = self.read(&["cat-file", "commit", commit])?;
+                let old = match first_parent(&raw)? {
+                    Some(p) => self.tree(p)?,
+                    None => BTreeMap::new(),
+                };
+                wanted.append(&mut blobs(&self.tree(commit)?, &old));
+            }
+            self.supply(&promisors, wanted)?;
+        }
+        let mut objects = Objects::open(self)?;
         for commit in &commits {
             ensure!(is_oid(commit), "invalid commit coordinate");
             let start = units.len();
@@ -939,13 +993,7 @@ impl Git {
             // reachable candidate commit, including merged side branches.
             verify_automation_author(&raw)
                 .with_context(|| format!("commit {commit} has inadmissible authorship"))?;
-            let parent = raw
-                .split(|v| *v == b'\n')
-                .take_while(|v| !v.is_empty())
-                .find_map(|line| line.strip_prefix(b"parent "))
-                .map(std::str::from_utf8)
-                .transpose()?;
-            let old = match parent {
+            let old = match first_parent(&raw)? {
                 Some(p) => self.tree(p)?,
                 None => BTreeMap::new(),
             };
@@ -1055,6 +1103,7 @@ impl Git {
                 .context("non-UTF-8 index path refused")?;
             tree.insert(path, (header[0].into(), header[1].into()));
         }
+        self.supply(&self.promisors()?, blobs(&tree, &old))?;
         Ok(Units {
             git: self.clone(),
             entries: Self::units(&mut Objects::open(self)?, &tree, &old)?,
@@ -1062,14 +1111,200 @@ impl Git {
     }
 
     pub fn historical(&self, baseline: &str) -> Result<Units> {
+        let tree = self.tree(baseline)?;
+        let none = BTreeMap::new();
+        self.supply(&self.promisors()?, blobs(&tree, &none))?;
         Ok(Units {
             git: self.clone(),
-            entries: Self::units(
-                &mut Objects::open(self)?,
-                &self.tree(baseline)?,
-                &BTreeMap::new(),
-            )?,
+            entries: Self::units(&mut Objects::open(self)?, &tree, &none)?,
         })
+    }
+
+    /// The promisor remotes of a partial clone, in the order Git asks them for an object it
+    /// lacks: the one `extensions.partialClone` names, then each with `remote.<name>.promisor`
+    /// true. Empty for a clone that is not partial.
+    fn promisors(&self) -> Result<Vec<String>> {
+        let mut remotes = Vec::new();
+        let named = self
+            .command()
+            .args(["config", "--get", "extensions.partialclone"])
+            .stderr(Stdio::null())
+            .output()
+            .context("Git plumbing failed")?;
+        match named.status.code() {
+            Some(0) => remotes.extend(
+                String::from_utf8(named.stdout)
+                    .context("promisor remote name is not UTF-8")?
+                    .lines()
+                    .map(str::to_owned),
+            ),
+            Some(1) => {}
+            _ => bail!("Git config failed reading the partial clone's promisor remote"),
+        }
+        let args = [
+            "config",
+            "--null",
+            "--type=bool",
+            "--get-regexp",
+            r"^remote\..+\.promisor$",
+        ];
+        let flagged = self
+            .command()
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .context("Git plumbing failed")?;
+        let listed = match flagged.status.code() {
+            Some(0) => flagged.stdout,
+            Some(1) => Vec::new(),
+            _ => bail!("Git config failed reading the promisor remotes"),
+        };
+        // `remote.<name>.promisor\n<true|false>\0` per key.
+        for record in listed.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let record =
+                std::str::from_utf8(record).context("promisor remote name is not UTF-8")?;
+            let (key, value) = record
+                .split_once('\n')
+                .context("Git config answered without a value")?;
+            let name = key
+                .strip_prefix("remote.")
+                .and_then(|key| key.strip_suffix(".promisor"))
+                .context("Git config answered another key")?;
+            if value == "true" {
+                remotes.push(name.to_owned());
+            }
+        }
+        remotes.retain(|name| !name.is_empty());
+        let mut seen = BTreeSet::new();
+        remotes.retain(|name| seen.insert(name.clone()));
+        Ok(remotes)
+    }
+
+    /// The objects of `wanted` the local store does not hold, asked without a lazy fetch.
+    fn absent(&self, wanted: &BTreeSet<String>) -> Result<Vec<String>> {
+        let mut child = self
+            .command()
+            .args(["cat-file", "--batch-check=%(objectname)"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Git cat-file could not start")?;
+        let mut input = child
+            .stdin
+            .take()
+            .context("Git cat-file input unavailable")?;
+        let output = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                for oid in wanted {
+                    writeln!(input, "{oid}")?;
+                }
+                input.flush()
+            });
+            let output = child.wait_with_output();
+            let written = writer.join();
+            (output, written)
+        });
+        let (output, written) = output;
+        let output = output.context("Git cat-file failed")?;
+        ensure!(
+            output.status.success() && matches!(written, Ok(Ok(()))),
+            "Git cat-file failed"
+        );
+        let mut absent = Vec::new();
+        let mut answers = output.stdout.split(|b| *b == b'\n');
+        for oid in wanted {
+            let answer = answers.next().context("Git cat-file ended early")?;
+            if answer == format!("{oid} missing").as_bytes() {
+                absent.push(oid.clone());
+            } else {
+                ensure!(
+                    answer == oid.as_bytes(),
+                    "Git cat-file answered out of order"
+                );
+            }
+        }
+        Ok(absent)
+    }
+
+    /// Fetch `oids` from the promisor remote `remote` in one request, as Git's own lazy fetch
+    /// asks for them: no negotiation, no tags, no ref or `FETCH_HEAD` written, no submodule
+    /// and no maintenance run, and no prompt for a credential. Nothing is checked out; the
+    /// objects arrive as a pack Git has hashed. The name follows `--`, so it is never read as
+    /// an option.
+    fn fetch_objects(&self, remote: &str, oids: &[String]) -> Result<std::process::ExitStatus> {
+        let mut child = self
+            .command()
+            .args([
+                "-c",
+                "fetch.negotiationAlgorithm=noop",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+                "--no-auto-maintenance",
+                "--no-write-commit-graph",
+                "--filter=blob:none",
+                "--stdin",
+                "--",
+                remote,
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .context("Git fetch could not start")?;
+        let mut input = child.stdin.take().context("Git fetch input unavailable")?;
+        let written = oids
+            .iter()
+            .try_for_each(|oid| writeln!(input, "{oid}"))
+            .and_then(|()| input.flush());
+        drop(input);
+        let status = child.wait().context("Git fetch failed")?;
+        written.context("Git fetch input refused")?;
+        Ok(status)
+    }
+
+    /// In a partial clone, fetch every object of `wanted` the local store lacks from its
+    /// promisor remotes, one request a remote, before anything reads them. The reads themselves
+    /// never fetch (`command`). An object still absent afterwards refuses, so nothing is read
+    /// as a full clone would not read it. With no promisor remote nothing runs here, and an
+    /// absent object refuses where it is read, as before.
+    fn supply(&self, promisors: &[String], wanted: BTreeSet<String>) -> Result<()> {
+        if promisors.is_empty() || wanted.is_empty() {
+            return Ok(());
+        }
+        let mut absent = self.absent(&wanted)?;
+        let mut failed = None;
+        for remote in promisors {
+            if absent.is_empty() {
+                break;
+            }
+            let status = self.fetch_objects(remote, &absent)?;
+            if !status.success() {
+                failed = Some(status);
+            }
+            absent = self.absent(&absent.into_iter().collect())?;
+        }
+        let Some(first) = absent.first() else {
+            return Ok(());
+        };
+        let fetched = failed.map_or_else(String::new, |status| {
+            let exit = status
+                .code()
+                .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
+            format!(" (the fetch ended with {exit}; Git's message is above)")
+        });
+        let more = match absent.len() - 1 {
+            0 => String::new(),
+            n => format!(" and {n} more object(s) this check reads"),
+        };
+        bail!(
+            "Git fetch from the promisor remote did not supply object {first}{more}{fetched}: it \
+             is not in the local object store of this partial clone; make the remote reachable \
+             and retry"
+        )
     }
 
     pub fn verify_bot(&self, commits: &[String]) -> Result<()> {

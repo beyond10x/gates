@@ -24,6 +24,19 @@
 - The text members of one asset go through the secret scanner in one run; each executable
   member is scanned as `scan-artifact` scans one. `scan-artifact` itself still reads one
   executable.
+- A bot push, `check`, `publish`, the pre-commit scan and `audit` work in one try from a partial
+  clone (`git clone --filter=blob:none`, a promisor remote). Before, each try refused "object
+  <id> is not in the local object store; run `git fetch origin` and retry", one object per try:
+  every Git read runs without a lazy fetch, and `git fetch` does not bring a blob the clone left
+  out. The blobs a check reads, each changed file and the blob it replaced, are now listed from
+  the commits and trees first, and those the store lacks are fetched from the promisor remote in
+  one request (`fetch.negotiationAlgorithm=noop`, `--filter=blob:none`, ids on standard input),
+  as Git's own lazy fetch asks for them. The reads still never fetch, nothing is checked out, and
+  the remote's name follows `--`.
+- Refused, in a partial clone, where it passed before: a predecessor blob the promisor remote
+  cannot supply. Before, it was read as absent, so the whole changed file was answerable. A blob
+  still absent after the fetch refuses, naming it. A clone without a promisor remote runs no
+  fetch and refuses an absent object as before.
 
 ## 0.1.32 — 2026-11-27
 
