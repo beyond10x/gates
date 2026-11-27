@@ -11,7 +11,9 @@
   with every rule but `personal-paths`; the base name and the label with every rule, so a home
   directory in either is still refused.
 - The asset's content is now scanned, read against `--repo` as `gh` reads it: an ELF executable
-  as `scan-artifact` scans it, any other file as UTF-8 text. A file that is neither, a file that
+  as `scan-artifact` scans it, any other file as UTF-8 text with the private rules and the pinned
+  secret scanner. A file that is neither, a path that is not a regular file (a FIFO, a device, a
+  directory; a symbolic link is followed as `gh` follows it), a file over 128 MiB, a file that
   cannot be read, and a file pattern (`*`, `?`, `[`, `\`) are refused. Before, an asset at a
   relative path was uploaded unscanned.
 - Words are read as `gh` reads them: an option that takes a value takes the next word (the tag

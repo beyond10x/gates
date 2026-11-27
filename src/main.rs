@@ -960,16 +960,22 @@ fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) 
         args.repo.join(path)
     };
     let what = format!("argument {n}, the asset it names");
-    let bytes = fs::read(&resolved).map_err(|_| anyhow::anyhow!("{what}, unreadable"))?;
-    if bytes.starts_with(b"\x7fELF") {
-        let scanner = match &args.gitleaks {
+    // Checked before the file is opened: opening a FIFO for reading waits for a writer. A
+    // symbolic link is followed, as `gh` follows it.
+    let metadata = fs::metadata(&resolved).map_err(|_| anyhow::anyhow!("{what}, unreadable"))?;
+    ensure!(metadata.is_file(), "{what}, is not a regular file");
+    let bytes = read_asset(&resolved, &what)?;
+    let mut scanner = Gitleaks {
+        binary: match &args.gitleaks {
             Some(path) => path.clone(),
             None => policy::root()?.join("bin/gitleaks"),
-        };
+        },
+    };
+    if bytes.starts_with(b"\x7fELF") {
         artifact::validate(
             &resolved,
             &Policy::load(&policy_file(args.policy.as_deref())?)?,
-            &mut Gitleaks { binary: scanner },
+            &mut scanner,
         )
         .map_err(|error| anyhow::anyhow!("{what}: {error}"))?;
         return Ok(());
@@ -978,7 +984,40 @@ fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) 
         std::str::from_utf8(&bytes).is_ok(),
         "{what}, is neither an ELF executable nor UTF-8 text, so it cannot be scanned"
     );
-    refuse(matchers, &format!("{what},"), &bytes)
+    refuse(matchers, &format!("{what},"), &bytes)?;
+    // The same secret scanner that committed files and ELF assets go through.
+    let secrets = scanner.scan(&[Unit {
+        location: "release:asset".into(),
+        bytes,
+        workflow: false,
+        inherited: None,
+    }])?;
+    ensure!(
+        secrets.is_empty(),
+        "{what}, breaks secrets rule; private details remain local"
+    );
+    Ok(())
+}
+
+/// The largest asset the scan reads, the bound `scan-artifact` reads an executable with.
+const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Read an asset, refusing it when it is larger than `MAX_ASSET_BYTES`.
+fn read_asset(path: &std::path::Path, what: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let unreadable = || anyhow::anyhow!("{what}, unreadable");
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|_| unreadable())?
+        .take(MAX_ASSET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unreadable())?;
+    ensure!(
+        bytes.len() as u64 <= MAX_ASSET_BYTES,
+        "{what}, is larger than {} MiB, the most the scan reads",
+        MAX_ASSET_BYTES / (1024 * 1024)
+    );
+    Ok(bytes)
 }
 
 /// The trusted policy file: `--policy`, or `policy.json` under the configuration root.

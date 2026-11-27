@@ -1300,8 +1300,18 @@ fn elf64(text: &[u8], data: &[u8]) -> Vec<u8> {
     bytes
 }
 
-#[test]
-fn release_assets_under_the_home_directory_pass_the_scan() {
+/// Clean assets under the home directory: notes, checksums, an executable and the checksums
+/// with a label. Every asset costs one run of the pinned scanner, so the passing cases are
+/// split over a few tests that run in parallel.
+struct Assets {
+    _dir: tempfile::TempDir,
+    notes: String,
+    sums: String,
+    binary: String,
+    labelled: String,
+}
+
+fn clean_assets() -> Assets {
     scanner_set();
     let dir = home_dir();
     let notes = put(&dir, "release-notes.md", b"Fixes.\n");
@@ -1312,6 +1322,18 @@ fn release_assets_under_the_home_directory_pass_the_scan() {
         &elf64(b"\x90\x90", b"safe release metadata\n"),
     );
     let labelled = format!("{sums}#Checksums (SHA-256)");
+    Assets {
+        _dir: dir,
+        notes,
+        sums,
+        binary,
+        labelled,
+    }
+}
+
+#[test]
+fn release_assets_under_the_home_directory_pass_the_scan() {
+    let a = clean_assets();
     for args in [
         // The release process's own command.
         &[
@@ -1324,12 +1346,21 @@ fn release_assets_under_the_home_directory_pass_the_scan() {
             "--title",
             "0.1.32",
             "--notes-file",
-            &notes,
-            &binary,
-            &sums,
+            &a.notes,
+            &a.binary,
+            &a.sums,
         ][..],
-        &["release", "create", "v1", &labelled],
-        &["release", "create", "v1", &sums, &binary],
+        &["release", "create", "v1", &a.labelled],
+        &["release", "upload", "v1", &a.labelled],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn release_create_options_take_their_values_as_gh_reads_them() {
+    let a = clean_assets();
+    for args in [
         &[
             "release",
             "create",
@@ -1339,10 +1370,10 @@ fn release_assets_under_the_home_directory_pass_the_scan() {
             "--generate-notes",
             "--title=0.1.32",
             "v1",
-            &binary,
-        ],
-        &["release", "create", "-dpt", "T", "v1", &sums],
-        &["release", "create", "-tT", "v1", &sums],
+            &a.binary,
+        ][..],
+        &["release", "create", "-dpt", "T", "v1", &a.sums],
+        &["release", "create", "-tT", "v1", &a.sums],
         &[
             "release",
             "create",
@@ -1359,28 +1390,53 @@ fn release_assets_under_the_home_directory_pass_the_scan() {
             "--notes-from-tag",
             "--fail-on-no-commits",
             "--prerelease",
-            &sums,
+            &a.sums,
         ],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn release_upload_options_take_their_values_as_gh_reads_them() {
+    let a = clean_assets();
+    for args in [
         &[
             "release",
             "upload",
             "v1",
-            &binary,
-            &sums,
+            &a.binary,
+            &a.sums,
             "--clobber",
             "-R",
             "o/r",
-        ],
-        &["release", "upload", "v1", &labelled],
-        &["release", "upload", "--repo=o/r", "v1", &sums],
-        // After `--` every word is positional: the tag first, then assets.
-        &["release", "create", "v1", "--", &sums],
-        &["release", "upload", "--", "v1", &sums],
-        // `--` as the value of `--title` does not end the options.
-        &["release", "create", "v1", "--title", "--", &sums],
+        ][..],
+        &["release", "upload", "--repo=o/r", "v1", &a.sums],
     ] {
         scan_passed(&gh_scanned(args));
     }
+}
+
+#[test]
+fn release_words_after_the_end_of_options_are_positional() {
+    let a = clean_assets();
+    for args in [
+        // After `--` every word is positional: the tag first, then assets.
+        &["release", "create", "v1", "--", &a.sums][..],
+        &["release", "upload", "--", "v1", &a.sums],
+        // `--` as the value of `--title` does not end the options.
+        &["release", "create", "v1", "--title", "--", &a.sums],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn release_create_takes_several_assets() {
+    let a = clean_assets();
+    scan_passed(&gh_scanned(&[
+        "release", "create", "v1", &a.sums, &a.binary,
+    ]));
 }
 
 #[test]
@@ -1589,7 +1645,7 @@ fn release_asset_that_cannot_be_read_is_refused() {
         ),
         (
             vec!["release", "upload", "v1", &directory],
-            "argument 4, the asset it names, unreadable",
+            "argument 4, the asset it names, is not a regular file",
         ),
         (
             vec!["release", "upload", "v1", &pattern],
@@ -1603,6 +1659,39 @@ fn release_asset_that_cannot_be_read_is_refused() {
     ] {
         refused_with(&gh_scanned(&args), message, "");
     }
+}
+
+#[test]
+fn release_asset_over_the_read_bound_is_refused() {
+    // Sparse: one byte over 128 MiB without the disk space.
+    let dir = home_dir();
+    let large = dir.path().join("large.txt");
+    fs::File::create(&large)
+        .unwrap()
+        .set_len(128 * 1024 * 1024 + 1)
+        .unwrap();
+    refused_with(
+        &gh_scanned(&["release", "upload", "v1", large.to_str().unwrap()]),
+        "argument 4, the asset it names, is larger than 128 MiB",
+        "",
+    );
+}
+
+#[test]
+fn release_asset_behind_a_symbolic_link_is_read_as_gh_reads_it() {
+    scanner_set();
+    let dir = home_dir();
+    let target = put(&dir, "SHA256SUMS", b"clean\n");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link = link.to_str().unwrap().to_owned();
+    scan_passed(&gh_scanned(&["release", "upload", "v1", &link]));
+    fs::write(&target, format!("{}\n", literal())).unwrap();
+    refused_with(
+        &gh_scanned(&["release", "upload", "v1", &link]),
+        "argument 4, the asset it names, breaks 1 private rule(s)",
+        &literal(),
+    );
 }
 
 #[test]
