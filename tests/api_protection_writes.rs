@@ -1071,3 +1071,106 @@ fn run_download_dir_is_still_refused_for_every_other_rule() {
         scan_refused(&gh_scanned(args), argument, &["private-identifiers"]);
     }
 }
+
+// Security review of the `run download` admission: a word is admitted only where `gh`
+// (cobra and pflag) reads it as the download directory. pflag gives a valued option the next
+// word whatever it starts with, `-x=v` and `-xv` attach a value, and `--` ends the options.
+
+#[test]
+fn run_download_admits_no_word_gh_reads_as_anything_but_the_directory() {
+    let home = home();
+    let attached = ["-n=--dir", "-n--dir", "--repo=-D", "-RD", "-p=-D"];
+    let mut cases: Vec<(Vec<&str>, usize)> = vec![
+        // The word after `--dir` is its value even when it is an option; the home path
+        // after it is then the run id `gh` puts in the request URL.
+        (vec!["run", "download", "--dir", "--dir", &home], 5),
+        (vec!["run", "download", "-D", "-D", &home], 5),
+        (vec!["run", "download", "--dir", "-D", &home], 5),
+        (vec!["run", "download", "--dir", "-R", &home], 5),
+        (vec!["run", "download", "--dir", "--name", &home], 5),
+        (vec!["run", "download", "--dir", "--", &home], 5),
+        // `--dir` or `-D` as the value of every other valued option of `run download`.
+        (vec!["run", "download", "-R", "-D", &home], 5),
+        (vec!["run", "download", "--repo", "--dir", &home], 5),
+        (vec!["run", "download", "-p", "--dir", &home], 5),
+        (vec!["run", "download", "--pattern", "-D", &home], 5),
+        // Not `run download` as the first two words.
+        (vec!["--", "run", "download", "--dir", &home], 5),
+        (vec!["run", "run", "download", "--dir", &home], 5),
+        (vec!["--help", "run", "download", "--dir", &home], 5),
+        (vec!["Run", "download", "--dir", &home], 4),
+        (vec!["run", "download ", "--dir", &home], 4),
+    ];
+    // A value attached to another option: the home path after it is the run id.
+    for word in &attached {
+        cases.push((vec!["run", "download", word, &home], 4));
+    }
+    for (args, argument) in cases {
+        scan_refused(&gh_scanned(&args), argument, &["personal-paths"]);
+    }
+}
+
+#[test]
+fn run_download_directory_values_that_stay_local_pass_the_scan() {
+    let home = home();
+    let a = format!("{home}/a");
+    let b = format!("{home}/b");
+    let lines = format!("{a}\n{b}");
+    for args in [
+        // Several directories: `gh` keeps the last; every one is a local path.
+        &["run", "download", "1", "--dir", &a, "-D", &b][..],
+        &["run", "download", "1", "--dir", ""],
+        &["run", "download", "1", "--dir="],
+        &["run", "download", "1", "--dir", &lines],
+        &["run", "download", "1", "--dir", "-n"],
+    ] {
+        scan_passed(&gh_scanned(args));
+    }
+}
+
+#[test]
+fn run_download_directory_breaking_another_rule_on_a_later_line_is_refused() {
+    let value = format!("{}/a\n{}", home(), literal());
+    let run = gh_scanned(&["run", "download", "1", "--dir", &value]);
+    let named = "argument 5 breaks 1 private rule(s): line 2 private-identifiers;";
+    assert!(!run.ok, "{}", run.stderr);
+    assert!(run.stderr.contains(named), "{named}: {}", run.stderr);
+    assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
+}
+
+#[test]
+fn run_download_directory_that_is_not_utf8_never_reaches_the_token_step() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let mut value = b"\xff".to_vec();
+    value.extend_from_slice(home().as_bytes());
+    let sandbox = Sandbox::new().with_policy();
+    let mut command = sandbox.command();
+    command
+        .arg("--repo")
+        .arg(sandbox.path())
+        .args(["gh", "--", "run", "download", "1", "--dir"])
+        .arg(OsStr::from_bytes(&value));
+    let run = sandbox.run(command);
+    assert!(!run.ok, "{}", run.stderr);
+    assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
+}
+
+/// Found in this review, before the `run download` admission (the file-option branch is
+/// unchanged by it): a word after `--input`, `--body-file` or `--notes-file` is read as a
+/// file and only its content is scanned, even when `gh` takes that option word as the value
+/// of the option before it. `gh api -p --input <path>` gives `--preview` the value `--input`
+/// and requests `<path>` as the endpoint, so the path, a home directory here, goes into the
+/// request URL.
+#[test]
+fn a_path_gh_takes_for_the_endpoint_after_a_file_option_word_is_scanned_as_text() {
+    let sandbox = Sandbox::new().with_policy();
+    let relative = ["d", "", "home", "fixture-person", "f"].join("/");
+    fs::create_dir_all(sandbox.path().join("d/home/fixture-person")).unwrap();
+    sandbox.file("d/home/fixture-person/f", b"{}\n");
+    let mut command = sandbox.command();
+    command
+        .arg("--repo")
+        .arg(sandbox.path())
+        .args(["gh", "--", "api", "-p", "--input", &relative]);
+    scan_refused(&sandbox.run(command), 4, &["personal-paths"]);
+}
