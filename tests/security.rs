@@ -2741,3 +2741,302 @@ fn review_blob_bytes_that_look_like_batch_protocol_survive_the_stream_exactly() 
     assert_eq!(link.len(), 1);
     assert_eq!(link[0].bytes, b"a-decoy");
 }
+
+// A partial clone: `git clone --filter=blob:none` leaves every blob out and names its origin a
+// promisor remote that supplies them on demand. The gate's reads never fetch by themselves, so
+// the candidate build fetches what it reads first, in one request.
+
+/// Git in `root` as the fixture's `git`, but without a lazy fetch, so no fixture step fetches
+/// a blob that a test then expects the gate to fetch.
+fn local_git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_AUTHOR_NAME", BOT_NAME)
+        .env("GIT_AUTHOR_EMAIL", BOT_EMAIL)
+        .env("GIT_COMMITTER_NAME", BOT_NAME)
+        .env("GIT_COMMITTER_EMAIL", BOT_EMAIL)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Git fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+/// Whether the store at `root` holds `oid`, asked without a lazy fetch.
+fn held(root: &Path, oid: &str) -> bool {
+    Command::new("git")
+        .current_dir(root)
+        .args(["cat-file", "-e", oid])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// A `--filter=blob:none --no-checkout` clone of the fixture's repository over `file://`. The
+/// fixture's repository is its promisor remote `origin` and hands over any object asked for.
+fn partial_clone(f: &Fixture) -> TempDir {
+    for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+        git(f.dir.path(), &["config", key, "true"]);
+    }
+    let clone = tempfile::tempdir().unwrap();
+    local_git(
+        clone.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", f.dir.path().display()),
+            ".",
+        ],
+    );
+    clone
+}
+
+/// The index of `root` set to HEAD with `path` set to `bytes`, by plumbing that reads no blob
+/// and writes no work-tree file.
+fn stage_without_checkout(root: &Path, path: &str, bytes: &[u8]) {
+    let input = root.join(".git/fixture-input");
+    fs::write(&input, bytes).unwrap();
+    let blob = local_git(root, &["hash-object", "-w", "--", ".git/fixture-input"]);
+    fs::remove_file(input).unwrap();
+    local_git(root, &["read-tree", "HEAD"]);
+    local_git(
+        root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{path}"),
+        ],
+    );
+}
+
+/// A commit on HEAD of `root` that sets `path` to `bytes`, made as `stage_without_checkout`
+/// stages it.
+fn commit_without_checkout(root: &Path, path: &str, bytes: &[u8], message: &str) -> String {
+    stage_without_checkout(root, path, bytes);
+    let tree = local_git(root, &["write-tree", "--missing-ok"]);
+    let commit = local_git(root, &["commit-tree", &tree, "-p", "HEAD", "-m", message]);
+    local_git(root, &["update-ref", "HEAD", &commit]);
+    commit
+}
+
+/// The entries of the clone's work tree: none, as long as nothing is checked out.
+fn work_tree(root: &Path) -> Vec<String> {
+    let mut entries: Vec<String> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".git")
+        .collect();
+    entries.sort();
+    entries
+}
+
+const README_ORIGIN: &[u8] = b"initial safe bytes\nsecond line from origin\n";
+const README_LOCAL: &[u8] = b"initial safe bytes\nsecond line from origin\nthird line local\n";
+
+#[test]
+fn a_partial_clone_supplies_every_blob_of_the_outgoing_range_in_one_try() {
+    // Reported: each bot push from such a clone refused "object <id> is not in the local object
+    // store", one object per try, and `git fetch` did not bring it.
+    let f = Fixture::new();
+    let origin_readme = f.commit("readme", README_ORIGIN, "origin edits readme");
+    let origin_doc = f.commit("docs/guide.md", b"origin guide\n", "origin adds a guide");
+    let clone = partial_clone(&f);
+    let root = clone.path();
+    let old = local_git(root, &["rev-parse", &format!("{origin_readme}:readme")]);
+    let doc = local_git(root, &["rev-parse", &format!("{origin_doc}:docs/guide.md")]);
+    assert!(
+        !held(root, &old) && !held(root, &doc),
+        "fixture clone must lack the origin's blobs"
+    );
+    let local = commit_without_checkout(root, "readme", README_LOCAL, "local edits readme");
+    let packs = || {
+        fs::read_dir(root.join(".git/objects/pack"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("pack".as_ref()))
+            .count()
+    };
+    let before = packs();
+
+    let candidate = Git::new(root)
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &local, &[])
+        .unwrap_or_else(|error| panic!("one try must admit the build: {error:#}"));
+    assert_eq!(
+        candidate.binding.commits,
+        [origin_readme, origin_doc, local.clone()]
+    );
+    assert!(
+        held(root, &old) && held(root, &doc),
+        "the blobs the build read must now be held"
+    );
+    assert_eq!(packs(), before + 1, "the blobs arrive in one fetch");
+    let units = candidate.units.read_all().unwrap();
+    let readme: Vec<&Unit> = units
+        .iter()
+        .filter(|u| u.location == "file:readme")
+        .collect();
+    assert_eq!(readme.len(), 2);
+    assert_eq!(readme[1].bytes, README_LOCAL);
+    assert_eq!(
+        readme[1].inherited.as_deref(),
+        Some(README_ORIGIN),
+        "the local edit inherits from the fetched predecessor"
+    );
+    assert!(
+        work_tree(root).is_empty(),
+        "candidate files were checked out: {:?}",
+        work_tree(root)
+    );
+}
+
+#[test]
+fn a_partial_clone_supplies_the_blobs_of_the_index_and_of_the_baseline_audit() {
+    // The other two reads of a store: the pre-commit scan of the index against HEAD, and the
+    // audit of the baseline tree.
+    let f = Fixture::new();
+    let origin_readme = f.commit("readme", README_ORIGIN, "origin edits readme");
+    let clone = partial_clone(&f);
+    let root = clone.path();
+    let old = local_git(root, &["rev-parse", &format!("{origin_readme}:readme")]);
+    let first = local_git(root, &["rev-parse", &format!("{}:readme", f.baseline)]);
+    assert!(
+        !held(root, &old) && !held(root, &first),
+        "fixture clone must lack the origin's blobs"
+    );
+    stage_without_checkout(root, "readme", README_LOCAL);
+    let git = Git::new(root).unwrap();
+
+    let staged = git.staged().unwrap().read_all().unwrap();
+    let readme: Vec<&Unit> = staged
+        .iter()
+        .filter(|u| u.location == "file:readme")
+        .collect();
+    assert_eq!(readme.len(), 1);
+    assert_eq!(readme[0].bytes, README_LOCAL);
+    assert_eq!(
+        readme[0].inherited.as_deref(),
+        Some(README_ORIGIN),
+        "the staged edit inherits from the fetched predecessor"
+    );
+
+    let audit = git
+        .historical(&f.baseline)
+        .unwrap_or_else(|error| panic!("the audit must read the baseline: {error:#}"))
+        .read_all()
+        .unwrap();
+    let readme: Vec<&Unit> = audit
+        .iter()
+        .filter(|u| u.location == "file:readme")
+        .collect();
+    assert_eq!(readme.len(), 1);
+    assert_eq!(readme[0].bytes, b"initial safe bytes\n");
+    assert!(
+        work_tree(root).is_empty(),
+        "candidate files were checked out"
+    );
+}
+
+#[test]
+fn a_partial_clone_whose_remote_cannot_supply_a_blob_refuses() {
+    // The predecessor alone is absent: the commit that wrote it is the baseline, outside the
+    // range. A build that read on without it would make the whole file answerable and pass
+    // silently with a scan a full clone does not run; it must refuse, naming the object.
+    let mut f = Fixture::new();
+    let origin_readme = f.commit("readme", README_ORIGIN, "origin edits readme");
+    f.policy.repositories.get_mut(REPOSITORY).unwrap().baseline = origin_readme.clone();
+    let clone = partial_clone(&f);
+    let root = clone.path();
+    let old = local_git(root, &["rev-parse", &format!("{origin_readme}:readme")]);
+    let local = commit_without_checkout(root, "readme", README_LOCAL, "local edits readme");
+    let gone = root.join(".git/no-such-remote");
+    local_git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("file://{}", gone.display()),
+        ],
+    );
+    let error = Git::new(root)
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &local, &[])
+        .err()
+        .expect("an absent predecessor the remote cannot supply must refuse");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(&old) && error.contains("not in the local object store"),
+        "{error}"
+    );
+    assert!(!held(root, &old), "fixture: the blob stays absent");
+}
+
+#[test]
+fn a_clone_without_a_promisor_remote_fetches_nothing() {
+    // The same blobless store, with its remote no longer a promisor: a clone that is not
+    // partial is read as before, so the gate fetches nothing and refuses the absent object.
+    let f = Fixture::new();
+    let origin_readme = f.commit("readme", README_ORIGIN, "origin edits readme");
+    let clone = partial_clone(&f);
+    let root = clone.path();
+    for key in ["remote.origin.promisor", "remote.origin.partialclonefilter"] {
+        local_git(root, &["config", "--unset", key]);
+    }
+    let old = local_git(root, &["rev-parse", &format!("{origin_readme}:readme")]);
+    let local = commit_without_checkout(root, "readme", README_LOCAL, "local edits readme");
+    let error = Git::new(root)
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &local, &[])
+        .err()
+        .expect("an absent object in a clone that is not partial must refuse");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("not in the local object store") && error.contains("git fetch origin"),
+        "{error}"
+    );
+    assert!(
+        !held(root, &old),
+        "the gate fetched from a remote that is no promisor"
+    );
+}
+
+#[test]
+fn a_promisor_remote_name_is_never_read_as_a_fetch_option() {
+    // A remote name is the repository's configuration, handed to `git fetch` as its argument.
+    // One that starts with `--upload-pack=` must stay a name, never become the command Git runs
+    // to serve the fetch.
+    let f = Fixture::new();
+    let origin_readme = f.commit("readme", README_ORIGIN, "origin edits readme");
+    let clone = partial_clone(&f);
+    let root = clone.path();
+    let marker = root.join(".git/upload-pack-ran");
+    local_git(root, &["config", "--unset", "remote.origin.promisor"]);
+    let name = format!("--upload-pack=touch {}", marker.display());
+    local_git(
+        root,
+        &["config", &format!("remote.{name}.promisor"), "true"],
+    );
+    let old = local_git(root, &["rev-parse", &format!("{origin_readme}:readme")]);
+    let local = commit_without_checkout(root, "readme", README_LOCAL, "local edits readme");
+    let error = Git::new(root)
+        .unwrap()
+        .candidate(&f.policy, REPOSITORY, &local, &[])
+        .err()
+        .expect("a promisor remote that is no remote supplies nothing");
+    assert!(format!("{error:#}").contains(&old), "{error:#}");
+    assert!(!marker.exists(), "a remote name ran as `--upload-pack`");
+}
