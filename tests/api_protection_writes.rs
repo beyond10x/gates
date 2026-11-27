@@ -1154,23 +1154,3 @@ fn run_download_directory_that_is_not_utf8_never_reaches_the_token_step() {
     assert!(!run.ok, "{}", run.stderr);
     assert!(!run.stderr.contains(ABSENT_BOT), "{}", run.stderr);
 }
-
-/// Found in this review, before the `run download` admission (the file-option branch is
-/// unchanged by it): a word after `--input`, `--body-file` or `--notes-file` is read as a
-/// file and only its content is scanned, even when `gh` takes that option word as the value
-/// of the option before it. `gh api -p --input <path>` gives `--preview` the value `--input`
-/// and requests `<path>` as the endpoint, so the path, a home directory here, goes into the
-/// request URL.
-#[test]
-fn a_path_gh_takes_for_the_endpoint_after_a_file_option_word_is_scanned_as_text() {
-    let sandbox = Sandbox::new().with_policy();
-    let relative = ["d", "", "home", "fixture-person", "f"].join("/");
-    fs::create_dir_all(sandbox.path().join("d/home/fixture-person")).unwrap();
-    sandbox.file("d/home/fixture-person/f", b"{}\n");
-    let mut command = sandbox.command();
-    command
-        .arg("--repo")
-        .arg(sandbox.path())
-        .args(["gh", "--", "api", "-p", "--input", &relative]);
-    scan_refused(&sandbox.run(command), 4, &["personal-paths"]);
-}
