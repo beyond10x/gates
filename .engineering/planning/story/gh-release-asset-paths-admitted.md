@@ -2,14 +2,15 @@
 format: aep.planning-md/3
 id: story:gh-release-asset-paths-admitted
 kind: story
-status: active
+status: implemented
 title: gh release create and upload admit local asset paths and scan the assets
 relations:
 - derived_from: story:public-shared-gates
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-27T13:27:09Z", actor: "human:operator", revision: 2}
 - {from: "proposed", to: "active", at: "2026-11-27T13:27:09Z", actor: "human:operator", revision: 3}
+- {from: "active", to: "implemented", at: "2026-11-27T13:58:11Z", actor: "human:operator", revision: 4, decided_on: {"recorded":{"test_result":2,"review_outcome":1}}}
 ---
 ## Problem
 

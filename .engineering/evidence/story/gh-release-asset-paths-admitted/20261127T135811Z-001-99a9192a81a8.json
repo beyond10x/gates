@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-27T13:58:11Z",
+  "actor": "human:operator",
+  "artifact": "story:gh-release-asset-paths-admitted",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo run --locked -- gate exit 0 at 574d075: 810 passed, 0 failed, 21 ignored; api_protection_writes 134 passed",
+    "reference": "review red tests 96b0f07 (FIFO, secret in a text asset) green after the fix"
+  }
+}
