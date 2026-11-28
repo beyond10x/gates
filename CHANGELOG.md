@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.34 — 2026-11-28
 
 - `gh -- release create`, `gh -- release upload` and `scan-artifact` read Mach-O and PE
   executables. Before, a macOS or Windows build was refused with "argument N, the asset it
