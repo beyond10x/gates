@@ -247,6 +247,29 @@ pub const S_IFIFO: u32 = 0o010_000;
 pub const STORED: u16 = 0;
 pub const DEFLATED: u16 = 8;
 
+/// The NTFS extra field 7-Zip writes: one record of ID 0x000a, 32 bytes long: four reserved
+/// zero bytes, then attribute tag 0x0001 of 24 bytes, the modification, access and creation
+/// times as FILETIMEs.
+pub fn ntfs_extra(times: [u64; 3]) -> Vec<u8> {
+    let mut extra = Vec::with_capacity(36);
+    extra.extend(0x000au16.to_le_bytes());
+    extra.extend(32u16.to_le_bytes());
+    extra.extend(0u32.to_le_bytes());
+    extra.extend(0x0001u16.to_le_bytes());
+    extra.extend(24u16.to_le_bytes());
+    for time in times {
+        extra.extend(time.to_le_bytes());
+    }
+    extra
+}
+
+/// FILETIMEs of a build, in 100 ns ticks since 1601.
+pub const FILETIMES: [u64; 3] = [
+    0x01db_3f4e_7a2c_8000,
+    0x01db_3f4e_7a2c_8000,
+    0x01db_3f4e_7a2c_8000,
+];
+
 /// One zip entry. `central` and `local` change the header each copy is written from, so a
 /// case can make them disagree; `crc` and `size` replace the computed values in both.
 #[derive(Clone)]
@@ -268,6 +291,10 @@ pub struct ZipEntry {
     pub local_size: Option<u32>,
     /// Bytes written before the local header, which no zip structure describes.
     pub before: Vec<u8>,
+    /// The local header's extra field, when it differs from the central one.
+    pub local_extra: Option<Vec<u8>>,
+    /// The external attributes, when a case sets them itself.
+    pub external: Option<u32>,
 }
 
 impl ZipEntry {
@@ -289,6 +316,8 @@ impl ZipEntry {
             local_crc: None,
             local_size: None,
             before: Vec::new(),
+            local_extra: None,
+            external: None,
         }
     }
 
@@ -304,6 +333,17 @@ impl ZipEntry {
             mode: S_IFDIR | 0o755,
             ..Self::stored(name, b"")
         }
+    }
+
+    /// As 7-Zip writes an entry: an NTFS extra field of `times` in the central directory and
+    /// none in the local header, DOS attributes and no unix mode.
+    pub fn seven_zip(mut self, times: [u64; 3]) -> Self {
+        let directory = self.name.ends_with(b"/");
+        self.extra = ntfs_extra(times);
+        self.local_extra = Some(Vec::new());
+        self.mode = 0;
+        self.external = Some(if directory { 0x10 } else { 0x20 });
+        self
     }
 
     pub fn with(mut self, edit: impl FnOnce(&mut Self)) -> Self {
@@ -376,9 +416,10 @@ impl Zip {
             bytes.extend((packed.len() as u32).to_le_bytes());
             bytes.extend(entry.local_size.unwrap_or(size).to_le_bytes());
             bytes.extend((local_name.len() as u16).to_le_bytes());
-            bytes.extend((entry.extra.len() as u16).to_le_bytes());
+            let local_extra = entry.local_extra.as_ref().unwrap_or(&entry.extra);
+            bytes.extend((local_extra.len() as u16).to_le_bytes());
             bytes.extend(local_name);
-            bytes.extend(&entry.extra);
+            bytes.extend(local_extra);
             bytes.extend(&packed);
 
             central.extend(0x0201_4b50u32.to_le_bytes());
@@ -400,7 +441,12 @@ impl Zip {
             } else {
                 0
             };
-            central.extend(((entry.mode << 16) | dos).to_le_bytes());
+            central.extend(
+                entry
+                    .external
+                    .unwrap_or((entry.mode << 16) | dos)
+                    .to_le_bytes(),
+            );
             central.extend(offset.to_le_bytes());
             central.extend(&entry.name);
             central.extend(&entry.extra);

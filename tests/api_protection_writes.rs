@@ -12,8 +12,8 @@ mod formats;
 
 use b10x_gates::policy::Policy;
 use formats::{
-    CPU_X86_64, DEFLATED, MH_EXECUTE, S_IFCHR, S_IFIFO, S_IFLNK, Zip, ZipEntry, macho_fat, macho64,
-    macho64_with, pe,
+    CPU_X86_64, DEFLATED, FILETIMES, MH_EXECUTE, S_IFCHR, S_IFIFO, S_IFLNK, Zip, ZipEntry,
+    macho_fat, macho64, macho64_with, ntfs_extra, pe,
 };
 use std::{
     collections::BTreeMap,
@@ -2992,4 +2992,178 @@ fn release_zip_entries_of_regular_files_without_unix_mode_pass_the_scan() {
         )
         .build();
     scan_passed(&upload_zip(&bytes));
+}
+
+// 7-Zip writes one NTFS extra field (ID 0x000a: four reserved zero bytes, attribute tag 0x0001
+// of 24 bytes holding three FILETIMEs) into each central directory entry and none into the
+// local headers. That one layout is read, in the central directory and in a local header that
+// repeats it, and its bytes are scanned with every rule; any other extra field stays refused.
+
+/// A Windows release archive as 7-Zip packs one: a stored directory entry, the executable
+/// deflated, a licence and a README.
+fn seven_zip_release() -> Zip {
+    Zip::default()
+        .entry(ZipEntry::dir(&format!("{WIN}/")).seven_zip(FILETIMES))
+        .entry(
+            ZipEntry::file(
+                &format!("{WIN}/tool.exe"),
+                &pe(true, b"\x90\x90", b"safe release metadata\n"),
+            )
+            .seven_zip(FILETIMES),
+        )
+        .entry(
+            ZipEntry::file(&format!("{WIN}/LICENSE"), b"Apache License\nVersion 2.0\n")
+                .seven_zip(FILETIMES),
+        )
+        .entry(
+            ZipEntry::file(
+                &format!("{WIN}/README.md"),
+                b"# tool\n\nRun `tool --help`.\n",
+            )
+            .seven_zip(FILETIMES),
+        )
+}
+
+/// The 7-Zip NTFS extra field, changed by `edit`.
+fn ntfs_with(edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut extra = ntfs_extra(FILETIMES);
+    edit(&mut extra);
+    extra
+}
+
+/// A 7-Zip archive of the top directory and one README whose extra fields `edit` sets.
+fn seven_zip_member(edit: impl FnOnce(&mut ZipEntry)) -> Vec<u8> {
+    Zip::default()
+        .entry(ZipEntry::dir(&format!("{WIN}/")).seven_zip(FILETIMES))
+        .entry(
+            ZipEntry::file(&format!("{WIN}/README.md"), b"# tool\n")
+                .seven_zip(FILETIMES)
+                .with(edit),
+        )
+        .build()
+}
+
+#[test]
+fn release_zip_packed_by_7_zip_passes_the_scan() {
+    scanner_set();
+    scan_passed(&upload_zip(&seven_zip_release().build()));
+    // A local header may repeat the central extra field byte for byte.
+    let mut repeated = seven_zip_release();
+    for entry in &mut repeated.entries {
+        entry.local_extra = None;
+    }
+    scan_passed(&upload_zip(&repeated.build()));
+}
+
+#[test]
+fn release_zip_extra_field_other_than_7_zip_ntfs_is_refused() {
+    let carries = unreadable_zip("member 2 carries an extra field, which the scan does not read");
+    let local =
+        unreadable_zip("the local header of member 2 does not match its central directory entry");
+    let unknown_id = ntfs_with(|extra| extra[..2].copy_from_slice(&0x5455u16.to_le_bytes()));
+    let cases: Vec<(&str, Vec<u8>, &String)> = vec![
+        (
+            "attribute size 32",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| extra[10..12].copy_from_slice(&32u16.to_le_bytes()))
+            }),
+            &carries,
+        ),
+        (
+            "record of 36 bytes",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| {
+                    extra[2..4].copy_from_slice(&36u16.to_le_bytes());
+                    extra.extend([0; 4]);
+                })
+            }),
+            &carries,
+        ),
+        (
+            "record cut to 28 bytes",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| {
+                    extra[2..4].copy_from_slice(&28u16.to_le_bytes());
+                    extra.truncate(32);
+                })
+            }),
+            &carries,
+        ),
+        (
+            "reserved bytes set",
+            seven_zip_member(|entry| entry.extra = ntfs_with(|extra| extra[4] = 1)),
+            &carries,
+        ),
+        (
+            "attribute tag 2",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| extra[8..10].copy_from_slice(&2u16.to_le_bytes()))
+            }),
+            &carries,
+        ),
+        (
+            "a second NTFS record",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| extra.extend(ntfs_extra(FILETIMES)))
+            }),
+            &carries,
+        ),
+        (
+            "an unknown record after the NTFS record",
+            seven_zip_member(|entry| {
+                entry.extra = ntfs_with(|extra| extra.extend(b"UT\x05\x00\x03\x00\x60\x7b\x5b"))
+            }),
+            &carries,
+        ),
+        (
+            "an unknown ID with the NTFS layout",
+            seven_zip_member(|entry| entry.extra = unknown_id.clone()),
+            &carries,
+        ),
+        (
+            "an unknown ID in the local header only",
+            seven_zip_member(|entry| entry.local_extra = Some(unknown_id.clone())),
+            &local,
+        ),
+        (
+            "other times in the local header",
+            seven_zip_member(|entry| entry.local_extra = Some(ntfs_extra([1, 2, 3]))),
+            &local,
+        ),
+        (
+            "an NTFS record in the local header only",
+            seven_zip_member(|entry| {
+                entry.extra = Vec::new();
+                entry.local_extra = Some(ntfs_extra(FILETIMES));
+            }),
+            &local,
+        ),
+    ];
+    for (case, bytes, message) in cases {
+        let run = upload_zip(&bytes);
+        assert!(
+            run.stderr.contains(message.as_str()),
+            "{case}: {}",
+            run.stderr
+        );
+        refused_with(&run, message, "");
+    }
+}
+
+#[test]
+fn release_zip_extra_field_breaking_a_rule_is_refused() {
+    // A literal in the 24 bytes of FILETIMEs of a well-formed NTFS record.
+    let literal = ["zz", "extra", "fixture1"].join("-");
+    let sandbox = Sandbox::new().with_literals(&[&literal]);
+    let dir = home_dir();
+    let bytes = seven_zip_member(|entry| {
+        entry.extra =
+            ntfs_with(|extra| extra[12..12 + literal.len()].copy_from_slice(literal.as_bytes()));
+    });
+    let asset = put(&dir, &format!("{WIN}.zip"), &bytes);
+    refused_with(
+        &gh_in(&sandbox, &["release", "upload", "v1", &asset]),
+        &format!("{ARCHIVE} the extra field of member 2, breaks 1 private rule(s)"),
+        &literal,
+    );
 }
