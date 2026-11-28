@@ -18,17 +18,21 @@
   as an executable; a file the parser cannot read, a Java class say, is refused. A Mach-O
   object file, a 32-bit or big-endian Mach-O file, a COFF object and a PE file that is not an
   image are refused.
-- A zip asset is admitted like a gzip-compressed tar asset: unpacked in memory, never on disk,
-  each regular file scanned as an asset is, a directory carrying nothing, and every member
-  name, member comment and the archive comment scanned with every rule. Refused, naming the
-  argument and the member: an encrypted member, a compression method other than stored or
-  deflate, an extra field, a data descriptor or another general purpose flag, a local header
-  that disagrees with its central directory entry, a size or CRC-32 that does not match, a
-  corrupt deflate stream or data after it, bytes no zip structure describes (a prefix, a gap,
-  overlapping members), a missing or ambiguous end record, a zip64 or multi-disk archive, a
-  symbolic link, device, FIFO or other entry by its unix mode, a name with a backslash, a name
-  and a type that disagree, more than 128 MiB unpacked, counted while reading, and more than
-  10,000 members.
+- A zip asset, as `zip -X` or 7-Zip packs one, is admitted like a gzip-compressed tar asset:
+  unpacked in memory, never on disk, each regular file scanned as an asset is, a directory
+  carrying nothing, and every member name, member comment, extra field and the archive comment
+  scanned with every rule. The one extra field read is the NTFS record 7-Zip writes into each
+  central directory entry: ID 0x000a, 32 bytes, four reserved zero bytes, attribute tag 0x0001
+  of 24 bytes (three FILETIMEs); a local header carries none or the same one. Refused, naming
+  the argument and the member: an encrypted member, a compression method other than stored or
+  deflate, any other extra field (another ID, another NTFS layout, nonzero reserved bytes, a
+  second record), a data descriptor or another general purpose flag, a local header that
+  disagrees with its central directory entry (its extra field included), a size or CRC-32
+  that does not match, a corrupt deflate stream or data after it, bytes no zip structure
+  describes (a prefix, a gap, overlapping members), a missing or ambiguous end record, a zip64
+  or multi-disk archive, a symbolic link, device, FIFO or other entry by its unix mode, a name
+  with a backslash, a name and a type that disagree, more than 128 MiB unpacked, counted while
+  reading, and more than 10,000 members.
 
 ## 0.1.33 — 2026-11-27
 

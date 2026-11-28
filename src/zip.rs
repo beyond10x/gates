@@ -1,15 +1,16 @@
 //! Read a zip archive in memory, for the scan of a release asset.
 //!
 //! Nothing is written to disk and nothing is executed. The reader is deliberately narrow and
-//! fails closed: the archive `zip -X` writes and little else. One end of central directory
-//! record, found at exactly one place; one disk; no zip64; no encryption; no extra fields and no
-//! data descriptors; members stored or deflated; every local header agreeing with its central
-//! directory entry; every byte of the file part of a local header and its data, the central
-//! directory or the end record, so no member overlaps another; each member's size and CRC-32
-//! checked; at most `max_bytes` unpacked, counted while reading; and at most
-//! `archive::MAX_MEMBERS` members. A member's type comes from the unix mode of its external
-//! attributes, or, without one, from a trailing `/`. What a member is and what it holds is the
-//! caller's to judge, as for a tar archive.
+//! fails closed: the archive `zip -X` or 7-Zip writes and little else. One end of central
+//! directory record, found at exactly one place; one disk; no zip64; no encryption; no data
+//! descriptors; no extra field but the NTFS record 7-Zip writes, whose bytes go to the private
+//! rules; members stored or deflated; every local header agreeing with its central directory
+//! entry and carrying no extra field or the same one; every byte of the file part of a local
+//! header and its data, the central directory or the end record, so no member overlaps
+//! another; each member's size and CRC-32 checked; at most `max_bytes` unpacked, counted while
+//! reading; and at most `archive::MAX_MEMBERS` members. A member's type comes from the unix
+//! mode of its external attributes, or, without one, from a trailing `/`. What a member is and
+//! what it holds is the caller's to judge, as for a tar archive.
 
 use crate::archive::{Archive, MAX_MEMBERS, Member};
 use anyhow::{Result, anyhow};
@@ -27,6 +28,8 @@ const ENCRYPTED: u16 = 0x0001 | 0x0040 | 0x2000;
 const KNOWN_FLAGS: u16 = 0x0002 | 0x0004 | 0x0800;
 const STORED: u16 = 0;
 const DEFLATED: u16 = 8;
+/// The length of the data of the NTFS extra field record.
+const NTFS: usize = 32;
 
 /// A zip archive, known by the signature of its first local header, or of its end record
 /// when it holds no member.
@@ -36,6 +39,18 @@ pub fn is_zip(bytes: &[u8]) -> bool {
 
 fn unreadable(reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("is a zip archive the scan cannot read: {reason}")
+}
+
+/// The one extra field read: an NTFS record (ID 0x000a) as 7-Zip writes it, 32 bytes long, of
+/// four reserved zero bytes and attribute tag 0x0001 holding 24 bytes, three FILETIMEs. Any other
+/// layout, ID or second record is refused.
+fn is_ntfs(extra: &[u8]) -> bool {
+    extra.len() == 4 + NTFS
+        && u16_at(extra, 0) == 0x000a
+        && usize::from(u16_at(extra, 2)) == NTFS
+        && u32_at(extra, 4) == 0
+        && u16_at(extra, 8) == 0x0001
+        && u16_at(extra, 10) == 24
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -57,6 +72,7 @@ struct Entry {
     name: Vec<u8>,
     kind: u8,
     local: usize,
+    extra: Vec<u8>,
 }
 
 /// Unpack `bytes` in memory. An error completes a sentence whose subject is the asset.
@@ -127,7 +143,8 @@ pub fn unpack(bytes: &[u8], max_bytes: u64) -> Result<Archive> {
                 "member {k} uses compression method {method}, which the scan does not read"
             )));
         }
-        if extra_length != 0 {
+        let extra = bytes[name_at + name_length..comment_at].to_vec();
+        if !extra.is_empty() && !is_ntfs(&extra) {
             return Err(unreadable(format_args!(
                 "member {k} carries an extra field, which the scan does not read"
             )));
@@ -158,6 +175,9 @@ pub fn unpack(bytes: &[u8], max_bytes: u64) -> Result<Archive> {
             0o010_000 => b'6',
             _ => b'?',
         };
+        if !extra.is_empty() {
+            notes.push((format!("the extra field of member {k}"), extra.clone()));
+        }
         if comment_length > 0 {
             notes.push((
                 format!("the comment of member {k}"),
@@ -174,6 +194,7 @@ pub fn unpack(bytes: &[u8], max_bytes: u64) -> Result<Archive> {
             name,
             kind,
             local: local as usize,
+            extra,
         });
         at = next;
     }
@@ -207,12 +228,17 @@ pub fn unpack(bytes: &[u8], max_bytes: u64) -> Result<Archive> {
                 "the local header of member {k} does not match its central directory entry"
             )));
         }
-        if u16_at(bytes, at + 28) != 0 {
+        // A local header carries no extra field, or the one of its central directory entry.
+        let extra_at = at + LOCAL + entry.name.len();
+        let extra_length = usize::from(u16_at(bytes, at + 28));
+        if extra_length != 0
+            && bytes.get(extra_at..extra_at + extra_length) != Some(&entry.extra[..])
+        {
             return Err(unreadable(format_args!(
-                "member {k} carries an extra field, which the scan does not read"
+                "the local header of member {k} does not match its central directory entry"
             )));
         }
-        let start = at + LOCAL + entry.name.len();
+        let start = extra_at + extra_length;
         let stop = start + entry.packed as usize;
         if stop > central_at {
             return Err(unreadable(format_args!("member {k} is cut short")));
