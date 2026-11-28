@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- `gh -- release create`, `gh -- release upload` and `scan-artifact` read Mach-O and PE
+  executables. Before, a macOS or Windows build was refused with "argument N, the asset it
+  names, is neither an ELF executable nor UTF-8 text, so it cannot be scanned", as an asset and
+  as a member of an archive asset. A thin 64-bit little-endian Mach-O executable or dynamic
+  library, a Mach-O universal file whose every slice is one, and a PE32+ or PE32 image
+  (executable or DLL) are now validated as an ELF executable is: at most 128 MiB, at most 4,096
+  sections, every segment, section and slice in range, no two overlapping, and no compressed
+  or encrypted section. Every byte of the non-executable sections and the printable runs of
+  four bytes or more of the whole file (for a universal file, the bytes outside its slices
+  too) go to the private rules, `personal-paths` included, without any exemption; their
+  printable runs go to the pinned secret scanner. `scan-artifact` reports the format it read
+  (`elf64-little-endian`, `macho64-little-endian`, `macho-universal`, `pe32+` or `pe32`).
+- A file starting with the ELF, Mach-O (`0xcafebabe` included) or MS-DOS magic number is read
+  as an executable; a file the parser cannot read, a Java class say, is refused. A Mach-O
+  object file, a 32-bit or big-endian Mach-O file, a COFF object and a PE file that is not an
+  image are refused.
+- A zip asset is admitted like a gzip-compressed tar asset: unpacked in memory, never on disk,
+  each regular file scanned as an asset is, a directory carrying nothing, and every member
+  name, member comment and the archive comment scanned with every rule. Refused, naming the
+  argument and the member: an encrypted member, a compression method other than stored or
+  deflate, an extra field, a data descriptor or another general purpose flag, a local header
+  that disagrees with its central directory entry, a size or CRC-32 that does not match, a
+  corrupt deflate stream or data after it, bytes no zip structure describes (a prefix, a gap,
+  overlapping members), a missing or ambiguous end record, a zip64 or multi-disk archive, a
+  symbolic link, device, FIFO or other entry by its unix mode, a name with a backslash, a name
+  and a type that disagree, more than 128 MiB unpacked, counted while reading, and more than
+  10,000 members.
+
 ## 0.1.33 — 2026-11-27
 
 - `gh -- release create` and `gh -- release upload` admit a gzip-compressed tar asset. Since

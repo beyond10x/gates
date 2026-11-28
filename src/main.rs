@@ -7,7 +7,7 @@ use b10x_gates::{
     hooks,
     policy::{self, Policy},
     scan::{self, Gitleaks, SecretFinding, SecretScanner},
-    secret_env,
+    secret_env, zip,
 };
 use clap::{Parser, Subcommand};
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -438,7 +438,8 @@ fn execute(args: Args) -> Result<()> {
             },
         )?;
         println!(
-            "artifact valid; format=elf64-little-endian; sha256={}; input_bytes={}; privacy_bytes={}; extracted_bytes={}; sections={}; scanner_invocations=1",
+            "artifact valid; format={}; sha256={}; input_bytes={}; privacy_bytes={}; extracted_bytes={}; sections={}; scanner_invocations=1",
+            report.format,
             report.sha256,
             report.input_bytes,
             report.privacy_bytes,
@@ -925,8 +926,9 @@ fn release_assets(command: &[String]) -> Result<Vec<usize>> {
 /// `<path>#<label>`: the file's content, and its base name or the label. The directory part
 /// is sent nowhere, so `personal-paths` does not apply to the argument's text while every
 /// other rule does; the base name and the label are scanned in full on their own. The file
-/// is read where `gh` reads it, against `--repo`. An ELF executable is scanned as
-/// `scan-artifact` scans it, any other file as UTF-8 text; a file that is neither is refused.
+/// is read where `gh` reads it, against `--repo`. An ELF, Mach-O or PE executable is scanned
+/// as `scan-artifact` scans it, a gzip-compressed tar or a zip archive member by member, any
+/// other file as UTF-8 text; a file that is none of these is refused.
 fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) -> Result<()> {
     let n = i + 1;
     let mut broken = matchers.text(argument.as_bytes());
@@ -967,9 +969,13 @@ fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) 
     let bytes = read_asset(&resolved, &what)?;
     let unpacked;
     let mut files = Files::default();
-    if archive::is_gzip(&bytes) {
-        unpacked = archive::unpack(&bytes, MAX_ASSET_BYTES)
-            .map_err(|error| anyhow::anyhow!("{what}, {error}"))?;
+    if archive::is_gzip(&bytes) || zip::is_zip(&bytes) {
+        unpacked = if archive::is_gzip(&bytes) {
+            archive::unpack(&bytes, MAX_ASSET_BYTES)
+        } else {
+            zip::unpack(&bytes, MAX_ASSET_BYTES)
+        }
+        .map_err(|error| anyhow::anyhow!("{what}, {error}"))?;
         admit_archive(matchers, &what, &unpacked, &mut files)?;
     } else {
         files.admit(matchers, what, &bytes)?;
@@ -977,30 +983,19 @@ fn scan_asset(args: &Args, matchers: &scan::Matchers, i: usize, argument: &str) 
     files.scan(args)
 }
 
-/// Admit the members of a gzip-compressed tar asset. Every name and every type is judged
-/// before any content, so these refusals cost no scanner run: the gzip header's file name and
-/// comment and each member's name are scanned with every rule, and a member is a directory
-/// without data or a regular file inside the archive. Each regular file is then admitted as an
-/// asset is.
+/// Admit the members of a gzip-compressed tar or a zip asset. Every name and every type is
+/// judged before any content, so these refusals cost no scanner run: the gzip header's file
+/// name and comment, the comments of a zip archive and each member's name are scanned with
+/// every rule, and a member is a directory without data or a regular file inside the archive.
+/// Each regular file is then admitted as an asset is.
 fn admit_archive<'a>(
     matchers: &scan::Matchers,
     what: &str,
     archive: &'a archive::Archive,
     files: &mut Files<'a>,
 ) -> Result<()> {
-    if let Some(name) = &archive.file_name {
-        refuse(
-            matchers,
-            &format!("{what}, the gzip header's file name,"),
-            name,
-        )?;
-    }
-    if let Some(comment) = &archive.comment {
-        refuse(
-            matchers,
-            &format!("{what}, the gzip header's comment,"),
-            comment,
-        )?;
+    for (note, bytes) in &archive.notes {
+        refuse(matchers, &format!("{what}, {note},"), bytes)?;
     }
     let mut named = Vec::with_capacity(archive.members.len());
     for (i, member) in archive.members.iter().enumerate() {
@@ -1052,16 +1047,18 @@ struct Files<'a> {
 }
 
 impl<'a> Files<'a> {
-    /// An ELF executable waits for the scan `scan-artifact` makes; any other file must be
-    /// UTF-8 text that breaks no private rule, and waits for the secret scanner.
+    /// An ELF, Mach-O or PE executable, known by its magic number, waits for the scan
+    /// `scan-artifact` makes, which refuses what its parser cannot read; any other file must
+    /// be UTF-8 text that breaks no private rule, and waits for the secret scanner.
     fn admit(&mut self, matchers: &scan::Matchers, what: String, bytes: &'a [u8]) -> Result<()> {
-        if bytes.starts_with(b"\x7fELF") {
+        if artifact::is_executable(bytes) {
             self.executables.push((what, bytes));
             return Ok(());
         }
         ensure!(
             std::str::from_utf8(bytes).is_ok(),
-            "{what}, is neither an ELF executable nor UTF-8 text, so it cannot be scanned"
+            "{what}, is neither an ELF, Mach-O or PE executable nor UTF-8 text, so it cannot be \
+             scanned"
         );
         refuse(matchers, &format!("{what},"), bytes)?;
         self.texts.push((what, bytes));
