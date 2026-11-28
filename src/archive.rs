@@ -22,15 +22,17 @@ pub fn is_gzip(bytes: &[u8]) -> bool {
 
 /// An archive, unpacked in memory.
 pub struct Archive {
-    /// The file name and the comment of the gzip header, which are published with it.
-    pub file_name: Option<Vec<u8>>,
-    pub comment: Option<Vec<u8>>,
-    /// The unpacked tar stream; each member's data is a range of it.
+    /// Text published with the archive besides its members, such as the file name and the
+    /// comment of a gzip header or the comments of a zip archive: what each is, and its bytes.
+    pub notes: Vec<(String, Vec<u8>)>,
+    /// The unpacked tar stream, or the unpacked members of a zip archive one after another;
+    /// each member's data is a range of it.
     pub data: Vec<u8>,
     pub members: Vec<Member>,
 }
 
-/// One tar member: its whole name, its type flag and the range of its data.
+/// One member: its whole name, its tar type flag (a zip member's type is given as one) and
+/// the range of its data.
 pub struct Member {
     pub name: Vec<u8>,
     pub kind: u8,
@@ -89,16 +91,20 @@ pub fn unpack(bytes: &[u8], max_bytes: u64) -> Result<Archive> {
         header.extra().is_none(),
         "carries a gzip extra field, which the scan does not read"
     );
-    let file_name = header.filename().map(<[u8]>::to_vec);
-    let comment = header.comment().map(<[u8]>::to_vec);
+    let notes = [
+        ("the gzip header's file name", header.filename()),
+        ("the gzip header's comment", header.comment()),
+    ]
+    .into_iter()
+    .filter_map(|(what, bytes)| Some((what.to_owned(), bytes?.to_vec())))
+    .collect();
     // `MultiGzDecoder` and `gzip -d` read on into a second member; this reader does not.
     if !decoder.into_inner().is_empty() {
         return Err(unreadable("data follows the gzip stream"));
     }
     let members = members(&data)?;
     Ok(Archive {
-        file_name,
-        comment,
+        notes,
         data,
         members,
     })

@@ -413,7 +413,9 @@ commands:
       - {name: private_rules, type: Integer}
       - {name: secrets, type: Integer}
     outcomes:
-      # Anything but a bounded, well-formed ELF64 little-endian ET_EXEC or ET_DYN.
+      # Anything but a bounded, well-formed ELF64 little-endian ET_EXEC or ET_DYN, thin
+      # 64-bit little-endian Mach-O MH_EXECUTE or MH_DYLIB, Mach-O universal file of those,
+      # or PE32+ or PE32 image.
       - name: format-unsupported
         when: format_supported == false
         error: gates.delivery.ArtifactFormatUnsupported
