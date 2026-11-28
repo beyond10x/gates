@@ -7,7 +7,14 @@
 //! can run and nothing reaches GitHub. A refusal that names neither the absent bot
 //! configuration nor `policy.json` came before the token step and before the policy was
 //! read; an error naming the absent bot configuration reached the token step.
+#[path = "support/formats.rs"]
+mod formats;
+
 use b10x_gates::policy::Policy;
+use formats::{
+    CPU_X86_64, DEFLATED, MH_EXECUTE, S_IFCHR, S_IFIFO, S_IFLNK, Zip, ZipEntry, macho_fat, macho64,
+    macho64_with, pe,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -1558,7 +1565,7 @@ fn release_asset_content_breaking_a_rule_is_refused() {
         ),
         (
             vec!["release", "create", "v1", &opaque],
-            "argument 4, the asset it names, is neither an ELF executable nor UTF-8 text",
+            "argument 4, the asset it names, is neither an ELF, Mach-O or PE executable nor UTF-8 text",
         ),
         (
             vec!["release", "create", "v1", "--", &text],
@@ -2072,8 +2079,8 @@ fn release_archive_member_neither_elf_nor_text_is_refused() {
         refused_with(
             &upload_archive(&archive(|tar| tar.file(&format!("{TOP}/{name}"), data))),
             &format!(
-                "{ARCHIVE} member 2 `{TOP}/{name}`, is neither an ELF executable nor UTF-8 \
-                 text, so it cannot be scanned"
+                "{ARCHIVE} member 2 `{TOP}/{name}`, is neither an ELF, Mach-O or PE executable \
+                 nor UTF-8 text, so it cannot be scanned"
             ),
             "",
         );
@@ -2370,4 +2377,619 @@ fn release_archive_with_more_members_than_the_bound_is_refused() {
         ),
         "",
     );
+}
+
+// A Mach-O executable (thin or universal) and a PE executable are scanned as `scan-artifact`
+// scans an ELF executable, with every private rule and the pinned secret scanner; no rule is
+// exempted for them. A zip asset is unpacked in memory like a gzip-compressed tar asset and
+// admitted member by member. The fixtures are written byte by byte in `support/formats.rs`.
+
+/// A universal file of an arm64 slice and an x86-64 slice built from `text` and `data`.
+fn fat(text: &[u8], data: &[u8]) -> Vec<u8> {
+    macho_fat(
+        &[
+            macho64(b"\x90\x90", b"safe release metadata\n"),
+            macho64_with(MH_EXECUTE, CPU_X86_64, text, data, None),
+        ],
+        b"",
+    )
+}
+
+fn pe64(text: &[u8], data: &[u8]) -> Vec<u8> {
+    pe(true, text, data)
+}
+
+fn pe32(text: &[u8], data: &[u8]) -> Vec<u8> {
+    pe(false, text, data)
+}
+
+type Build = fn(&[u8], &[u8]) -> Vec<u8>;
+
+/// Each executable format beside ELF, with a release asset name it would carry.
+const EXECUTABLES: [(&str, Build); 4] = [
+    ("tool-1.0.0-aarch64-apple-darwin", macho64),
+    ("tool-1.0.0-universal-apple-darwin", fat),
+    ("tool-1.0.0-x86_64-pc-windows-msvc.exe", pe64),
+    ("tool-1.0.0-i686-pc-windows-msvc.exe", pe32),
+];
+
+#[test]
+fn release_macho_and_pe_assets_pass_the_scan() {
+    scanner_set();
+    let dir = home_dir();
+    for (name, build) in EXECUTABLES {
+        let asset = put(&dir, name, &build(b"\x90\x90", b"safe release metadata\n"));
+        scan_passed(&gh_scanned(&["release", "upload", "v1", &asset]));
+    }
+}
+
+#[test]
+fn release_archive_holding_a_macho_executable_passes_the_scan() {
+    scanner_set();
+    let top = "tool-1.0.0-aarch64-apple-darwin";
+    let bytes = gzip(
+        &Tar::default()
+            .dir(&format!("{top}/"))
+            .file(
+                &format!("{top}/tool"),
+                &macho64(b"\x90\x90", b"safe release metadata\n"),
+            )
+            .file(&format!("{top}/README.md"), b"# tool\n")
+            .end(),
+    );
+    scan_passed(&upload_archive(&bytes));
+}
+
+#[test]
+fn release_macho_and_pe_assets_breaking_a_rule_are_refused() {
+    scanner_set();
+    let sandbox = Sandbox::new().with_policy();
+    let dir = home_dir();
+    let literal = literal();
+    let token = format!("{}{}", "ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let secret = format!("token = '{token}'\n");
+    let runner = ["", "Users", "runner", "work", "tool", "src", "main.rs"].join("/");
+    for (name, build) in EXECUTABLES {
+        // A runner's home directory is a personal path like any other: no exemption.
+        for (data, rule, hidden) in [
+            (literal.as_bytes(), "private-identifiers", &literal[..]),
+            (runner.as_bytes(), "personal-paths", &runner[..]),
+            (secret.as_bytes(), "secrets rule", &token[..]),
+        ] {
+            let asset = put(&dir, name, &build(b"\x90\x90", data));
+            let run = gh_in(&sandbox, &["release", "upload", "v1", &asset]);
+            refused_with(
+                &run,
+                "argument 4, the asset it names: artifact breaks ",
+                hidden,
+            );
+            assert!(run.stderr.contains(rule), "{name}: {}", run.stderr);
+        }
+    }
+}
+
+#[test]
+fn release_asset_of_an_unknown_binary_format_is_refused() {
+    let dir = home_dir();
+    let mut java = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x34];
+    java.extend_from_slice(&[0u8; 64]);
+    let mut dos = vec![0u8; 128];
+    dos[..2].copy_from_slice(b"MZ");
+    let mut coff = vec![0x64, 0x86, 0x01, 0x00];
+    coff.extend_from_slice(&[0u8; 60]);
+    for (name, bytes, message) in [
+        (
+            "blob.bin",
+            b"\x00\xff\xfe\x00".to_vec(),
+            "argument 4, the asset it names, is neither an ELF, Mach-O or PE executable nor \
+             UTF-8 text, so it cannot be scanned",
+        ),
+        (
+            "tool.o",
+            coff,
+            "argument 4, the asset it names, is neither an ELF, Mach-O or PE executable nor \
+             UTF-8 text, so it cannot be scanned",
+        ),
+        (
+            "Tool.class",
+            java,
+            "argument 4, the asset it names: artifact format",
+        ),
+        (
+            "tool.com",
+            dos,
+            "argument 4, the asset it names: artifact format",
+        ),
+    ] {
+        let asset = put(&dir, name, &bytes);
+        refused_with(
+            &gh_scanned(&["release", "upload", "v1", &asset]),
+            message,
+            "",
+        );
+    }
+}
+
+/// The top directory of the zip release archives here.
+const WIN: &str = "tool-1.0.0-x86_64-pc-windows-msvc";
+
+/// A zip release archive as `zip -q -X -r` packs one: a directory holding a README, a
+/// licence stored without compression, and the executable.
+fn release_zip() -> Zip {
+    Zip::default()
+        .dir(&format!("{WIN}/"))
+        .file(
+            &format!("{WIN}/README.md"),
+            b"# tool\n\nRun `tool --help`.\n",
+        )
+        .entry(ZipEntry::stored(
+            &format!("{WIN}/LICENSE"),
+            b"Apache License\nVersion 2.0\n",
+        ))
+        .file(
+            &format!("{WIN}/tool.exe"),
+            &pe(true, b"\x90\x90", b"safe release metadata\n"),
+        )
+}
+
+/// A zip archive of the top directory, then whatever `members` adds.
+fn zip(members: impl FnOnce(Zip) -> Zip) -> Vec<u8> {
+    members(Zip::default().dir(&format!("{WIN}/"))).build()
+}
+
+/// `gh -- release upload v1 <archive>` with the zip archive under the home directory.
+fn upload_zip(bytes: &[u8]) -> Run {
+    let dir = home_dir();
+    let asset = put(&dir, &format!("{WIN}.zip"), bytes);
+    gh_scanned(&["release", "upload", "v1", &asset])
+}
+
+fn unreadable_zip(reason: &str) -> String {
+    format!("{ARCHIVE} is a zip archive the scan cannot read: {reason}")
+}
+
+#[test]
+fn release_zip_of_files_and_directories_passes_the_scan() {
+    scanner_set();
+    let dir = home_dir();
+    let bytes = release_zip().build();
+    let named = put(&dir, &format!("{WIN}.zip"), &bytes);
+    scan_passed(&gh_scanned(&["release", "upload", "v1", &named]));
+    // Known by its content: the same archive under another name.
+    let unnamed = put(&dir, "tool.bin", &bytes);
+    scan_passed(&gh_scanned(&["release", "upload", "v1", &unnamed]));
+}
+
+#[test]
+fn release_zip_member_breaking_a_rule_is_refused() {
+    scanner_set();
+    let literal = literal();
+    let text = format!("clean\n{literal}\n");
+    let token = format!("{}{}", "ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let secret = format!("token = '{token}'\n");
+    let cases: Vec<(Vec<u8>, String)> = vec![
+        (
+            zip(|zip| zip.file(&format!("{WIN}/README.md"), text.as_bytes())),
+            format!(
+                "{ARCHIVE} member 2 `{WIN}/README.md`, breaks 1 private rule(s): line 2 \
+                 private-identifiers;"
+            ),
+        ),
+        (
+            zip(|zip| {
+                zip.file(
+                    &format!("{WIN}/tool.exe"),
+                    &pe(true, b"\x90\x90", literal.as_bytes()),
+                )
+            }),
+            format!("{ARCHIVE} member 2 `{WIN}/tool.exe`: artifact breaks "),
+        ),
+        (
+            zip(|zip| {
+                zip.file(
+                    &format!("{WIN}/tool.exe"),
+                    &pe(true, b"\x90\x90", secret.as_bytes()),
+                )
+            }),
+            format!("{ARCHIVE} member 2 `{WIN}/tool.exe`: artifact breaks secrets rule"),
+        ),
+        (
+            zip(|zip| zip.file(&format!("{WIN}/settings.env"), secret.as_bytes())),
+            format!("{ARCHIVE} member 2 `{WIN}/settings.env`, breaks secrets rule"),
+        ),
+        (
+            zip(|zip| zip.file(&format!("{WIN}/{literal}.txt"), b"clean\n")),
+            format!(
+                "{ARCHIVE} the name of member 2, breaks 1 private rule(s): line 1 \
+                 private-identifiers;"
+            ),
+        ),
+        (
+            zip(|zip| zip.dir(&format!("{WIN}/{literal}/"))),
+            format!("{ARCHIVE} the name of member 2, breaks 1 private rule(s)"),
+        ),
+        (
+            zip(|zip| zip.file(&format!("{}/notes.txt", home()), b"clean\n")),
+            format!(
+                "{ARCHIVE} the name of member 2, breaks 1 private rule(s): line 1 personal-paths;"
+            ),
+        ),
+        (
+            {
+                let mut zip = release_zip();
+                zip.comment = literal.as_bytes().to_vec();
+                zip.build()
+            },
+            format!("{ARCHIVE} the zip archive's comment, breaks 1 private rule(s)"),
+        ),
+        (
+            zip(|zip| {
+                zip.entry(
+                    ZipEntry::file(&format!("{WIN}/notes.txt"), b"clean\n")
+                        .with(|entry| entry.comment = literal.as_bytes().to_vec()),
+                )
+            }),
+            format!("{ARCHIVE} the comment of member 2, breaks 1 private rule(s)"),
+        ),
+    ];
+    for (bytes, message) in cases {
+        let run = upload_zip(&bytes);
+        refused_with(&run, &message, &literal);
+        assert!(!run.stderr.contains(&token), "{}", run.stderr);
+    }
+}
+
+#[test]
+fn release_zip_member_neither_executable_nor_text_is_refused() {
+    let nested = release_zip().build();
+    for (name, data) in [
+        ("blob.bin", &b"\x00\xff\xfe\x00"[..]),
+        ("nested.zip", &nested[..]),
+    ] {
+        refused_with(
+            &upload_zip(&zip(|zip| zip.file(&format!("{WIN}/{name}"), data))),
+            &format!(
+                "{ARCHIVE} member 2 `{WIN}/{name}`, is neither an ELF, Mach-O or PE executable \
+                 nor UTF-8 text, so it cannot be scanned"
+            ),
+            "",
+        );
+    }
+}
+
+#[test]
+fn release_zip_entry_that_is_not_a_file_or_directory_is_refused() {
+    for (mode, what) in [
+        (S_IFLNK | 0o777, "a symbolic link"),
+        (S_IFCHR | 0o644, "a character device"),
+        (S_IFIFO | 0o644, "a FIFO"),
+    ] {
+        refused_with(
+            &upload_zip(&zip(|zip| {
+                zip.entry(
+                    ZipEntry::stored(&format!("{WIN}/entry"), b"target")
+                        .with(|entry| entry.mode = mode),
+                )
+            })),
+            &format!(
+                "{ARCHIVE} member 2 `{WIN}/entry`, is {what}, not a regular file or a directory"
+            ),
+            "",
+        );
+    }
+    refused_with(
+        &upload_zip(&zip(|zip| {
+            zip.entry(ZipEntry::dir(&format!("{WIN}/data/")).with(|entry| {
+                entry.data = b"clean\n".to_vec();
+            }))
+        })),
+        &format!("{ARCHIVE} member 2 `{WIN}/data/`, is a directory that carries data"),
+        "",
+    );
+    for entry in [
+        ZipEntry::file(&format!("{WIN}/file/"), b""),
+        ZipEntry::dir(&format!("{WIN}/dir")),
+    ] {
+        refused_with(
+            &upload_zip(&zip(|zip| zip.entry(entry))),
+            &unreadable_zip("the name and the type of member 2 disagree"),
+            "",
+        );
+    }
+}
+
+#[test]
+fn release_zip_member_name_leaving_the_archive_is_refused() {
+    for name in ["/etc/tool", "../tool", "a/../../tool", "..", "a/.."] {
+        refused_with(
+            &upload_zip(&zip(|zip| zip.file(name, b"clean\n"))),
+            &format!("{ARCHIVE} member 2 `{name}`, is an absolute path or has a `..` component"),
+            "",
+        );
+    }
+    refused_with(
+        &upload_zip(&zip(|zip| zip.file("..\\tool", b"clean\n"))),
+        &unreadable_zip("the name of member 2 has a backslash"),
+        "",
+    );
+    refused_with(
+        &upload_zip(&zip(|zip| zip.file("", b"clean\n"))),
+        &format!("{ARCHIVE} member 2, has an empty name"),
+        "",
+    );
+    refused_with(
+        &upload_zip(&zip(|zip| {
+            zip.entry(ZipEntry::file("tool", b"clean\n").with(|entry| {
+                entry.name = b"tool\xff".to_vec();
+            }))
+        })),
+        &format!("{ARCHIVE} member 2, has a name that is not UTF-8 text"),
+        "",
+    );
+}
+
+#[test]
+fn release_zip_that_cannot_be_read_is_refused() {
+    let clean = release_zip().build();
+    let notes = || ZipEntry::file(&format!("{WIN}/notes.txt"), b"clean\n");
+    let member = |edit: fn(&mut ZipEntry)| zip(|zip| zip.entry(notes().with(edit)));
+    let end = clean.len() - 22;
+    let field = |offset: usize, value: &[u8]| {
+        let mut bytes = clean.clone();
+        bytes[end + offset..end + offset + value.len()].copy_from_slice(value);
+        bytes
+    };
+    let mut second_end = release_zip();
+    second_end.comment = clean[end..].to_vec();
+    second_end.comment[20..22].copy_from_slice(&0u16.to_le_bytes());
+    let gap = zip(|zip| {
+        zip.entry(notes().with(|entry| entry.before = b"bytes between members".to_vec()))
+    });
+    let mut trailing = clean.clone();
+    trailing.extend_from_slice(b"trailing text\n");
+    let cases: Vec<(Vec<u8>, String)> = vec![
+        (
+            member(|entry| entry.flags = 0x0001),
+            unreadable_zip("member 2 is encrypted"),
+        ),
+        (
+            member(|entry| entry.flags = 0x0041),
+            unreadable_zip("member 2 is encrypted"),
+        ),
+        (
+            member(|entry| entry.flags = 0x0008),
+            unreadable_zip("member 2 sets general purpose flags the scan does not read"),
+        ),
+        (
+            member(|entry| entry.method = 12),
+            unreadable_zip("member 2 uses compression method 12, which the scan does not read"),
+        ),
+        (
+            member(|entry| entry.method = 99),
+            unreadable_zip("member 2 uses compression method 99, which the scan does not read"),
+        ),
+        (
+            member(|entry| entry.crc = Some(0x1234_5678)),
+            unreadable_zip("the CRC-32 of member 2 does not match its data"),
+        ),
+        (
+            member(|entry| entry.local_name = Some(b"tool-1.0.0/other.txt".to_vec())),
+            unreadable_zip(
+                "the local header of member 2 does not match its central directory entry",
+            ),
+        ),
+        (
+            member(|entry| entry.local_method = Some(0)),
+            unreadable_zip(
+                "the local header of member 2 does not match its central directory entry",
+            ),
+        ),
+        (
+            member(|entry| entry.local_crc = Some(0)),
+            unreadable_zip(
+                "the local header of member 2 does not match its central directory entry",
+            ),
+        ),
+        (
+            member(|entry| entry.local_size = Some(5)),
+            unreadable_zip(
+                "the local header of member 2 does not match its central directory entry",
+            ),
+        ),
+        (
+            member(|entry| entry.extra = b"UT\x05\x00\x03\x00\x60\x7b\x5b".to_vec()),
+            unreadable_zip("member 2 carries an extra field, which the scan does not read"),
+        ),
+        (
+            member(|entry| {
+                entry.method = 0;
+                entry.size = Some(5);
+            }),
+            unreadable_zip("member 2 unpacks to a size other than its declared size"),
+        ),
+        (
+            member(|entry| entry.size = Some(5)),
+            unreadable_zip("member 2 unpacks to a size other than its declared size"),
+        ),
+        (
+            member(|entry| entry.packed = Some(b"\xff\xff\xff\xff".to_vec())),
+            unreadable_zip("the deflate stream of member 2 is corrupt or cut short"),
+        ),
+        (
+            member(|entry| {
+                // A complete stored deflate block of the data, then one more byte.
+                let mut packed = vec![0x01, 0x06, 0x00, 0xf9, 0xff];
+                packed.extend_from_slice(b"clean\n");
+                packed.push(0);
+                entry.packed = Some(packed);
+            }),
+            unreadable_zip("data follows the deflate stream of member 2"),
+        ),
+        (
+            gap,
+            unreadable_zip("the members overlap or leave bytes no zip structure describes"),
+        ),
+        (
+            trailing,
+            unreadable_zip("the end of central directory record is missing or ambiguous"),
+        ),
+        (
+            clean[..clean.len() - 1].to_vec(),
+            unreadable_zip("the end of central directory record is missing or ambiguous"),
+        ),
+        (
+            second_end.build(),
+            unreadable_zip("the end of central directory record is missing or ambiguous"),
+        ),
+        (
+            b"PK\x03\x04 not a zip archive".to_vec(),
+            unreadable_zip("the end of central directory record is missing or ambiguous"),
+        ),
+        (
+            field(4, &1u16.to_le_bytes()),
+            unreadable_zip("it spans several disks"),
+        ),
+        (
+            field(6, &1u16.to_le_bytes()),
+            unreadable_zip("it spans several disks"),
+        ),
+        (
+            field(8, &3u16.to_le_bytes()),
+            unreadable_zip("it spans several disks"),
+        ),
+        (
+            field(8, &[0xff, 0xff]),
+            unreadable_zip("it is a zip64 archive"),
+        ),
+        (
+            field(16, &[0xff, 0xff, 0xff, 0xff]),
+            unreadable_zip("it is a zip64 archive"),
+        ),
+        (
+            {
+                let mut bytes = field(8, &3u16.to_le_bytes());
+                bytes[end + 10..end + 12].copy_from_slice(&3u16.to_le_bytes());
+                bytes
+            },
+            unreadable_zip("the central directory does not match the end record"),
+        ),
+    ];
+    for (bytes, message) in cases {
+        refused_with(&upload_zip(&bytes), &message, "");
+    }
+    // An archive behind a prefix, a self-extracting one say, is not read as a zip archive.
+    let mut prefixed = b"#!/bin/sh\nexit 0\n".to_vec();
+    prefixed.extend_from_slice(&clean);
+    refused_with(
+        &upload_zip(&prefixed),
+        &format!("{ARCHIVE} is neither an ELF, Mach-O or PE executable nor UTF-8 text"),
+        "",
+    );
+    // Two central entries naming the same local header: the second member's bytes are the
+    // first's.
+    let mut twice = Zip::default()
+        .file("a.txt", b"clean\n")
+        .file("b.txt", b"clean\n")
+        .build();
+    let central =
+        u32::from_le_bytes(twice[twice.len() - 6..twice.len() - 2].try_into().unwrap()) as usize;
+    let second = central + 46 + "a.txt".len();
+    twice[second + 42..second + 46].copy_from_slice(&0u32.to_le_bytes());
+    twice[second + 46..second + 51].copy_from_slice(b"a.txt");
+    refused_with(
+        &upload_zip(&twice),
+        &unreadable_zip("the members overlap or leave bytes no zip structure describes"),
+        "",
+    );
+}
+
+/// A deflate stream of `mebibytes` MiB of 0xff bytes and the CRC-32 of those bytes: one
+/// mebibyte is compressed into a byte-aligned block and repeated.
+fn deflate_bomb(mebibytes: usize) -> (Vec<u8>, u32) {
+    use flate2::{Compress, Compression, Crc, FlushCompress};
+    let chunk = vec![0xffu8; 1024 * 1024];
+    let mut compress = Compress::new(Compression::fast(), false);
+    let mut block = Vec::with_capacity(chunk.len());
+    compress
+        .compress_vec(&chunk, &mut block, FlushCompress::Full)
+        .unwrap();
+    assert_eq!(compress.total_in() as usize, chunk.len());
+    let mut chunk_crc = Crc::new();
+    chunk_crc.update(&chunk);
+    let mut crc = Crc::new();
+    let mut bytes = Vec::new();
+    for _ in 0..mebibytes {
+        bytes.extend_from_slice(&block);
+        crc.combine(&chunk_crc);
+    }
+    let mut finish = Compress::new(Compression::fast(), false);
+    let mut last = Vec::with_capacity(64);
+    finish
+        .compress_vec(&[], &mut last, FlushCompress::Finish)
+        .unwrap();
+    bytes.extend(last);
+    (bytes, crc.sum())
+}
+
+#[test]
+fn release_zip_unpacking_over_the_read_bound_is_refused() {
+    let over = unreadable_zip("it unpacks to more than 128 MiB, the most the scan reads");
+    let mib = 1024 * 1024;
+    let bomb = |name: &str, mebibytes: usize, declared: u32| {
+        let (packed, crc) = deflate_bomb(mebibytes);
+        ZipEntry::file(name, b"").with(|entry| {
+            entry.method = DEFLATED;
+            entry.packed = Some(packed);
+            entry.crc = Some(crc);
+            entry.size = Some(declared);
+        })
+    };
+    // 129 MiB in one member, declared.
+    let one = zip(|zip| zip.entry(bomb("blob", 129, 129 * mib as u32)));
+    assert!(one.len() < mib, "{}", one.len());
+    refused_with(&upload_zip(&one), &over, "");
+    // 65 MiB in each of two members: neither alone is over the bound, both are.
+    let two = zip(|zip| {
+        zip.entry(bomb("a", 65, 65 * mib as u32))
+            .entry(bomb("b", 65, 65 * mib as u32))
+    });
+    refused_with(&upload_zip(&two), &over, "");
+    // 129 MiB declared as six bytes: the read stops after the declared size.
+    let lying = zip(|zip| zip.entry(bomb("blob", 129, 6)));
+    refused_with(
+        &upload_zip(&lying),
+        &unreadable_zip("member 2 unpacks to a size other than its declared size"),
+        "",
+    );
+}
+
+#[test]
+fn release_zip_with_more_members_than_the_bound_is_refused() {
+    let directories = |count: usize| {
+        let mut zip = Zip::default();
+        for i in 0..count {
+            zip = zip.dir(&format!("d{i:05}/"));
+        }
+        zip.build()
+    };
+    scan_passed(&upload_zip(&directories(10_000)));
+    refused_with(
+        &upload_zip(&directories(10_001)),
+        &unreadable_zip("it holds more than 10000 members, the most the scan reads"),
+        "",
+    );
+}
+
+#[test]
+fn release_zip_entries_of_regular_files_without_unix_mode_pass_the_scan() {
+    // A zip written on another system carries no unix mode: a name ending in `/` is a
+    // directory, any other a regular file.
+    scanner_set();
+    let bytes = Zip::default()
+        .entry(ZipEntry::dir(&format!("{WIN}/")).with(|entry| entry.mode = 0))
+        .entry(
+            ZipEntry::file(&format!("{WIN}/README.md"), b"# tool\n").with(|entry| entry.mode = 0),
+        )
+        .build();
+    scan_passed(&upload_zip(&bytes));
 }
